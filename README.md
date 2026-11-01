@@ -93,14 +93,19 @@ This project empowers developers to build scalable, observable infrastructure mo
         └── core/           # Shared models (CTDPayload) and publisher interfaces
 ~~~
 
-<br>
 
-----
+---
 
-<div align="center">
+// Built by
 
-Made with ♥️ by
+```go
+package drewvlabs // Drew Vandagriff — Indie Systems & RISC-V Research
 
-![DREW-V Labs](.github/images/drewv-labs-github-banner.png)
-
-</div>
+var Ethos = [5]string{
+	"Simplicity in Architecture",
+	"Efficiency in Engineering",
+	"Purity in Science",
+	"Audacity in Art",
+	"Life in Logic",
+}
+```
