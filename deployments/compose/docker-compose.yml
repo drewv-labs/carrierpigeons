@@ -13,7 +13,7 @@ services:
     image: postgres:16-alpine
     container_name: pigeon-db
     environment:
-      POSTGRES_USER: drewv
+      POSTGRES_USER: pigeonuser
       POSTGRES_PASSWORD: ctd_password
       POSTGRES_DB: edge_ledger
     ports:

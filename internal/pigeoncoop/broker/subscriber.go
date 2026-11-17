@@ -3,7 +3,9 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
@@ -27,18 +29,24 @@ func NewSubscriber(brokerURL string, ledger Ledger) (*Subscriber, error) {
 
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(brokerURL)
-	opts.SetClientID("pigeoncoop-ledger-injector")
-	opts.SetDefaultPublishHandler(sub.handleMessage)
+	opts.SetClientID(fmt.Sprintf("pigeoncoop-ledger-injector-%d", os.Getpid()))
 	opts.SetAutoReconnect(true)
+	opts.SetConnectRetry(true)
+	opts.SetConnectRetryInterval(5 * time.Second)
+	opts.SetMaxReconnectInterval(15 * time.Second)
 
 	opts.OnConnect = func(client mqtt.Client) {
-		// 1. Subscribe to the telemetry firehose
-		client.Subscribe("drewv/ctd/v1/#", 1, nil)
+		// 1. Subscribe to the canonical CTD telemetry firehose
+		if tok := client.Subscribe(core.DefaultTelemetryWildcard, 1, sub.handleMessage); tok.Wait() && tok.Error() != nil {
+			log.Printf("[Broker] Failed to subscribe to %s: %v", core.DefaultTelemetryWildcard, tok.Error())
+		}
 
-		// 2. Subscribe to the registry state changes with the specific Ntfy handler
-		client.Subscribe("drewv/ctd/v1/registry/+/status", 1, sub.handleRegistryUpdate)
+		// 2. Subscribe to LWT / node presence state changes
+		if tok := client.Subscribe(core.RegistryWildcard, 1, sub.handleRegistryUpdate); tok.Wait() && tok.Error() != nil {
+			log.Printf("[Broker] Failed to subscribe to %s: %v", core.RegistryWildcard, tok.Error())
+		}
 
-		log.Println("Subscribed to MQTT wildcard & registry topics")
+		log.Printf("Subscribed to MQTT telemetry (%s) & registry (%s)", core.DefaultTelemetryWildcard, core.RegistryWildcard)
 	}
 
 	client := mqtt.NewClient(opts)
@@ -50,28 +58,29 @@ func NewSubscriber(brokerURL string, ledger Ledger) (*Subscriber, error) {
 	return sub, nil
 }
 
-// handleMessage unmarshals the incoming JSON and passes it to the Ledger.
-func (s *Subscriber) handleMessage(client mqtt.Client, msg mqtt.Message) {
+// handleMessage unmarshals incoming CTD JSON envelopes and persists them to the Ledger.
+func (s *Subscriber) handleMessage(_ mqtt.Client, msg mqtt.Message) {
 	var event core.CTDPayload
 
 	if err := json.Unmarshal(msg.Payload(), &event); err != nil {
-		log.Printf("ERROR: Malformed CTD payload dropped: %v", err)
+		log.Printf("ERROR: Malformed CTD payload on %s dropped: %v", msg.Topic(), err)
 		return
 	}
 
-	// 5-second timeout for the database insert
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := s.ledger.InsertEvent(ctx, &event); err != nil {
-		log.Printf("DB INSERT ERROR for %s: %v", event.NodeID, err)
+		log.Printf("DB INSERT ERROR for %s/%s: %v", event.NodeID, event.Component, err)
 		return
 	}
 
-	log.Printf("[LEDGER INJECT] %s/%s -> PostgreSQL Insert Success", event.NodeID, event.Component)
+	log.Printf("[LEDGER INJECT] %s/%s/%s -> PostgreSQL Insert Success", event.Pillar, event.NodeID, event.Component)
 }
 
 // Disconnect cleanly closes the network socket.
 func (s *Subscriber) Disconnect() {
-	s.client.Disconnect(250)
+	if s.client != nil {
+		s.client.Disconnect(250)
+	}
 }

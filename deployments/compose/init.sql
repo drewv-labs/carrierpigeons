@@ -1,21 +1,42 @@
+-- CarrierPigeons CTD Ledger Schema (PostgreSQL 16+ / 18+)
+-- Aligned with pkg/adapters/db/PostgresStore.EnsureSchema
+
 CREATE TABLE IF NOT EXISTS telemetric_ledger (
-	id SERIAL PRIMARY KEY,
-	node_id VARCHAR(255) NOT NULL,
-	node_group TEXT NOT NULL,
-	session_id VARCHAR(255) NOT NULL,
-	event_timestamp TIMESTAMPTZ NOT NULL,
-	component VARCHAR(255) NOT NULL,
-	status VARCHAR(50) NOT NULL,
-	metrics JSONB,
-	ingested_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+	id BIGSERIAL PRIMARY KEY,
+	node_id TEXT NOT NULL,
+	pillar TEXT NOT NULL DEFAULT 'observer',
+	component TEXT NOT NULL,
+	status TEXT NOT NULL,
+	event_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+	params JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
--- Index for time-series queries (e.g., "show me the last hour of telemetry")
-CREATE INDEX idx_ledger_timestamp ON telemetric_ledger (event_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_pillar ON telemetric_ledger (pillar);
+CREATE INDEX IF NOT EXISTS idx_ledger_metrics_gin ON telemetric_ledger USING GIN (metrics);
 
--- Index for filtering by specific edge nodes or hardware components
-CREATE INDEX idx_ledger_node_component ON telemetric_ledger (node_id, component, event_timestamp DESC);
+CREATE TABLE IF NOT EXISTS ctd_artifacts (
+	id TEXT PRIMARY KEY,
+	kind TEXT NOT NULL,
+	node_id TEXT,
+	meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
--- GIN (Generalized Inverted Index) allows lightning-fast queries inside the JSONB metrics
--- e.g., SELECT * FROM telemetric_ledger WHERE metrics->>'temperature_c' > '45';
-CREATE INDEX idx_ledger_metrics ON telemetric_ledger USING GIN (metrics);
+CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON ctd_artifacts (kind);
+
+CREATE TABLE IF NOT EXISTS ctd_traces (
+	id BIGSERIAL PRIMARY KEY,
+	source_id TEXT NOT NULL,
+	verb TEXT NOT NULL,
+	target_id TEXT NOT NULL,
+	node_id TEXT,
+	run_id TEXT,
+	meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+	event_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_traces_source ON ctd_traces (source_id);
+CREATE INDEX IF NOT EXISTS idx_traces_target ON ctd_traces (target_id);

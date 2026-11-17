@@ -57,10 +57,10 @@ This project empowers developers to build scalable, observable infrastructure mo
 
 |      | Component       | Details                                                                                                                                                                                                                                                                 |
 | :--- | :-------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🚀   | **Pigeoneer Edge Agent**| **Hardware-Agnostic Collectors:** Auto-detects and independently polls Nvidia, AMD, Apple, and Intel GPUs. **AI Accelerator Support:** Dedicated Hailo, Google Coral, & Apple ANE NPU support featuring PCIe device isolation and array scaling. **State Awareness:** Event-driven heartbeat architecture utilizing MQTT Last Will and Testament (LWT) registries.
-| 🏰   | **PigeonCoop Ingestion**| **Robust Storage:** PostgreSQL (pgxpool) powered CTD Ledger persistence with automated, zero-touch DDL schema migrations at startup. **Event Watchdog:** Native Ntfy integration for instant webhook alerts on offline or degraded hardware nodes.
-| 🧠   | **Observability & AI** | **PigeonMCP Sidecar:** Standalone Model Context Protocol (MCP) server enabling tools like Ollama, Claude, ChatGPT, and more query the CDT Ledger natively. **PigeonCommand:** Interactive CLI/TUI for live diagnostics and dynamic cluster configuration. **Topological Context:** Native <code>NodeGroup</code> tagging to group correlated hardware failures for AI-assisted **PigeonCare+** incident triage.
-| ⚙️   | **Architecture**  | **Modular Go Monorepo:** Structured using standard <code>cmd/</code>, <code>internal/</code>, and <code>pkg/</code> layouts. **Zero-Friction Deployment:** Compiles to static binaries with no CGO dependencies, enabling trivial cross-compilation for RISC-V, ARM, and x86 architectures. |
+| 🚀   | **Pigeoneer Edge Agent**| **Hardware-Agnostic Collectors:** Auto-detects and independently polls Nvidia, AMD, Apple, and Intel GPUs alongside Linux/OpenWrt/macOS/Windows host and network telemetry. **AI Accelerator Support:** Dedicated Hailo, Google Coral, & Apple ANE NPU support featuring PCIe device isolation and array scaling. **State Awareness:** Event-driven heartbeat architecture utilizing MQTT Last Will and Testament (LWT) registries.
+| 🏰   | **PigeonCoop Ingestion**| **Robust Storage:** PostgreSQL (`pgxpool`) powered CTD Ledger, Artifact, and Trace DAG persistence (`pkg/adapters/db`) with automated, zero-touch DDL schema migrations at startup. **Event Watchdog:** Native Ntfy integration for instant webhook alerts on offline or degraded hardware nodes.
+| 🧠   | **Observability & AI** | **PigeonMCP Sidecar:** Standalone Model Context Protocol (MCP) server enabling tools like Ollama, Claude, ChatGPT, and more to query the CTD Ledger and Artifact Lineage DAG natively. **PigeonCommand:** Interactive CLI/TUI (`pigeons`) for live diagnostics, runner dispatch, and **PigeonCare+** AI-assisted incident triage.
+| ⚙️   | **Architecture**  | **Modular Go Monorepo:** Structured using standard `cmd/`, `internal/`, and `pkg/` layouts. **Zero-Friction Deployment:** Compiles to static binaries with `CGO_ENABLED=0`, enabling clean cross-compilation for RISC-V (`riscv64`), ARM (`arm64`), and x86 (`amd64`) architectures. |
 
 <br>
 
@@ -75,22 +75,28 @@ This project empowers developers to build scalable, observable infrastructure mo
 ~~~sh
 └── /
     ├── cmd/
-    │   ├── pigeoncoop/   # The ingestion/ledger engine
-    │   ├── pigeoneer/    # The edge telemetry agent
-    │   ├── pigeonmcp/    # The Model Context Protocol sidecar
+    │   ├── pigeoncoop/   # The CTD ingestion & ledger engine
+    │   ├── pigeoneer/    # The edge telemetry & runner agent
+    │   ├── pigeonmcp/    # The Model Context Protocol (MCP) sidecar
     │   └── pigeons/      # The PigeonCommand CLI/TUI orchestrator
+    ├── deployments/
+    │   ├── compose/      # Local Docker Compose stack (Mosquitto, PostgreSQL, Ntfy)
+    │   └── install-pigeoneer.sh
     ├── internal/
     │   ├── pigeoncoop/
-    │   │   ├── broker/     # MQTT subscriber, event watchdog, and LWT registry logic
-    │   │   ├── ledger/     # PostgreSQL connection pool and query wrappers
-    │   │   └── migrations/ # Automated schema deployment
+    │   │   └── broker/     # MQTT subscriber, event watchdog, and LWT Ntfy registry
     │   ├── pigeoneer/
-    │   │   ├── collectors/ # Hardware sensors (Nvidia, AMD, Intel, Hailo, RPi5)
-    │   │   └── relay/      # MQTT publisher and LWT instantiation
+    │   │   ├── collectors/ # Platform & accelerator sensors (Linux, OpenWrt, macOS, Windows, GPU, NPU)
+    │   │   ├── relay/      # FIFO offline spooler, MQTT publisher, LWT, and runner dispatcher
+    │   │   └── runners/    # Built-in remote execution workloads (benchmark)
     │   └── pigeons/
-    │       └── cli/        # Cobra command definitions and Bubble Tea TUI
+    │       ├── adapters/   # Multi-provider LLM & SQL tool adapters (Ollama, Claude, OpenAI, vLLM, llama.cpp)
+    │       ├── cli/        # Cobra CLI subcommands (ps, list, node, coop, runner)
+    │       └── tui/        # Bubble Tea PigeonCare+ interactive triage agent
     └── pkg/
-        └── core/           # Shared models (CTDPayload) and publisher interfaces
+        ├── adapters/db/    # BaseDB storage contract & PostgresStore (Ledger, Artifacts, Traces)
+        ├── core/           # Canonical CTDPayload (Observer, Runner, Tracer), topics, and interfaces
+        └── runner/         # Extensible remote Runner registry and control envelope
 ~~~
 
 

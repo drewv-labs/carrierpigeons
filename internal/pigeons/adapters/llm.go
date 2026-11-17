@@ -1,13 +1,14 @@
-// File: pkg/adapters/llm/llm.go (or internal/pigeons/adapters/llm.go during transition)
+// File: internal/pigeons/adapters/llm.go
 package adapters
 
 import (
 	"context"
+	"strings"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
 )
 
-// Tool schemas mapped to the OpenAI/Ollama specification
+// Tool schemas mapped to the OpenAI/Ollama specification.
 type ToolCallFunction struct {
 	Name      string         `json:"name"`
 	Arguments map[string]any `json:"arguments"`
@@ -39,26 +40,37 @@ type LLMConfig struct {
 	Store    db.BaseDB
 }
 
-// NewLLMAdapter routes the configuration to the correct silicon backend.
+func sendToken(ctx context.Context, ch chan<- string, token string) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- token:
+		return true
+	}
+}
+
+// NewLLMAdapter routes the configuration to the configured inference backend.
 func NewLLMAdapter(cfg LLMConfig) BaseLLM {
-	switch cfg.Provider {
+	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case "ollama":
 		return NewOllamaAdapter(cfg.Endpoint, cfg.Model, cfg.Store)
-
-	// case "claude":
-	// 	return NewClaudeAdapter(cfg.APIKey, cfg.Model, cfg.Store)
-	//
-	// case "openai":
-	// 	return NewOpenAIAdapter(cfg.Endpoint, cfg.APIKey, cfg.Model, cfg.Store)
-	//
-	// case "llamacpp":
-	// 	return NewLlamaCPPAdapter(cfg.Endpoint, cfg.Store)
-	//
-	// case "vllm":
-	// 	return NewVLLMAdapter(cfg.Endpoint, cfg.Model, cfg.Store)
-
+	case "claude", "anthropic":
+		return NewClaudeAdapter(cfg.APIKey, cfg.Model, cfg.Store)
+	case "openai":
+		return NewOpenAIAdapter(cfg.Endpoint, cfg.APIKey, cfg.Model, cfg.Store)
+	case "llamacpp", "llama.cpp":
+		return NewLlamaCPPAdapter(cfg.Endpoint, cfg.Store)
+	case "vllm":
+		return NewVLLMAdapter(cfg.Endpoint, cfg.Model, cfg.Store)
 	default:
-		// Default to local open-weights for edge architecture
-		return NewOllamaAdapter("http://localhost:11434", "qwen3.6:35b-a3b-q8_0", cfg.Store)
+		model := cfg.Model
+		if model == "" {
+			model = "qwen3.6:35b-a3b-q8_0"
+		}
+		endpoint := cfg.Endpoint
+		if endpoint == "" {
+			endpoint = "http://localhost:11434"
+		}
+		return NewOllamaAdapter(endpoint, model, cfg.Store)
 	}
 }

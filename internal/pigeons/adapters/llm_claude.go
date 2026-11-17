@@ -5,23 +5,32 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
+	"time"
+
+	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
 )
+
+var _ BaseLLM = (*ClaudeAdapter)(nil)
 
 type ClaudeAdapter struct {
 	apiKey string
 	model  string
+	store  db.BaseDB
 	client *http.Client
 }
 
-func NewClaudeAdapter(apiKey, model string) *ClaudeAdapter {
-	if model == "" {
+func NewClaudeAdapter(apiKey, model string, store db.BaseDB) *ClaudeAdapter {
+	if strings.TrimSpace(model) == "" {
 		model = "claude-3-5-sonnet-latest"
 	}
 	return &ClaudeAdapter{
 		apiKey: apiKey,
 		model:  model,
-		client: &http.Client{},
+		store:  store,
+		client: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -29,12 +38,15 @@ func (a *ClaudeAdapter) Chat(ctx context.Context, systemPrompt string, history [
 	payload := map[string]any{
 		"model":      a.model,
 		"max_tokens": 1024,
-		"system":     systemPrompt, // Claude extracts system context here
+		"system":     systemPrompt,
 		"messages":   history,
 	}
 
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(body))
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewBuffer(body))
 	if err != nil {
 		return "", err
 	}
@@ -49,6 +61,11 @@ func (a *ClaudeAdapter) Chat(ctx context.Context, systemPrompt string, history [
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode >= http.StatusBadRequest {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("claude HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+	}
+
 	var result struct {
 		Content []struct {
 			Text string `json:"text"`
@@ -60,4 +77,15 @@ func (a *ClaudeAdapter) Chat(ctx context.Context, systemPrompt string, history [
 	}
 
 	return result.Content[0].Text, nil
+}
+
+func (a *ClaudeAdapter) StreamChat(ctx context.Context, systemPrompt string, history []Message) (<-chan string, error) {
+	reply, err := a.Chat(ctx, systemPrompt, history)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan string, 1)
+	ch <- reply
+	close(ch)
+	return ch, nil
 }

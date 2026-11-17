@@ -7,6 +7,25 @@ import (
 	"time"
 )
 
+const (
+	// DefaultTopicPrefix is the canonical MQTT namespace for CTD wide events.
+	DefaultTopicPrefix = "pigeons/ctd"
+	// DefaultTelemetryWildcard subscribes to all pillars, nodes, and components.
+	DefaultTelemetryWildcard = "pigeons/ctd/#"
+	// RegistryWildcard subscribes to LWT / presence state changes across all nodes.
+	RegistryWildcard = "pigeons/registry/+/status"
+)
+
+// RegistryTopic returns the MQTT presence/LWT topic for a given edge node.
+func RegistryTopic(nodeID string) string {
+	return fmt.Sprintf("pigeons/registry/%s/status", nodeID)
+}
+
+// ControlTopic returns the MQTT runner control dispatch topic for a given edge node.
+func ControlTopic(nodeID string) string {
+	return fmt.Sprintf("pigeons/control/%s", nodeID)
+}
+
 // Pillar defines the core SDK primitive type emitting the event.
 type Pillar string
 
@@ -38,19 +57,19 @@ type TraceEdge struct {
 
 // CTDPayload is the immutable wire envelope transmitted over MQTT and stored in the Ledger.
 type CTDPayload struct {
-	EventID        string                 `json:"event_id,omitempty"`
-	NodeID         string                 `json:"node_id"`
-	Pillar         Pillar                 `json:"pillar"`
-	Component      string                 `json:"component"`
-	Status         string                 `json:"status"`
-	EventTimestamp time.Time              `json:"event_timestamp"`
-	Metrics        map[string]interface{} `json:"metrics,omitempty"`
-	Params         map[string]string      `json:"params,omitempty"`
-	Artifact       *Artifact              `json:"artifact,omitempty"`
-	Trace          *TraceEdge             `json:"trace,omitempty"`
+	EventID        string            `json:"event_id,omitempty"`
+	NodeID         string            `json:"node_id"`
+	Pillar         Pillar            `json:"pillar"`
+	Component      string            `json:"component"`
+	Status         string            `json:"status"`
+	EventTimestamp time.Time         `json:"event_timestamp"`
+	Metrics        map[string]any    `json:"metrics,omitempty"`
+	Params         map[string]string `json:"params,omitempty"`
+	Artifact       *Artifact         `json:"artifact,omitempty"`
+	Trace          *TraceEdge        `json:"trace,omitempty"`
 }
 
-// NewCTDPayload initializes a standard Observer/Runner payload (backward-compatible).
+// NewCTDPayload initializes a standard Observer/Runner payload.
 func NewCTDPayload(nodeID, component, status string) *CTDPayload {
 	return &CTDPayload{
 		NodeID:         nodeID,
@@ -58,7 +77,7 @@ func NewCTDPayload(nodeID, component, status string) *CTDPayload {
 		Component:      component,
 		Status:         status,
 		EventTimestamp: time.Now().UTC(),
-		Metrics:        make(map[string]interface{}),
+		Metrics:        make(map[string]any),
 		Params:         make(map[string]string),
 	}
 }
@@ -89,11 +108,19 @@ func (c *CTDPayload) WithTrace(sourceID, verb, targetID string, meta map[string]
 	return c
 }
 
-func (c *CTDPayload) AddMetric(key string, val interface{}) *CTDPayload {
+func (c *CTDPayload) AddMetric(key string, val any) *CTDPayload {
 	if c.Metrics == nil {
-		c.Metrics = make(map[string]interface{})
+		c.Metrics = make(map[string]any)
 	}
 	c.Metrics[key] = val
+	return c
+}
+
+func (c *CTDPayload) AddParam(key, val string) *CTDPayload {
+	if c.Params == nil {
+		c.Params = make(map[string]string)
+	}
+	c.Params[key] = val
 	return c
 }
 
@@ -105,9 +132,13 @@ func (c *CTDPayload) UpdateStatus(status string) *CTDPayload {
 
 func (c *CTDPayload) RoutingTopic(prefix string) string {
 	if prefix == "" {
-		prefix = "pigeons/ctd"
+		prefix = DefaultTopicPrefix
 	}
-	return fmt.Sprintf("%s/%s/%s/%s", prefix, c.Pillar, c.NodeID, c.Component)
+	pillar := c.Pillar
+	if pillar == "" {
+		pillar = PillarObserver
+	}
+	return fmt.Sprintf("%s/%s/%s/%s", prefix, pillar, c.NodeID, c.Component)
 }
 
 func (c *CTDPayload) ToJSON() ([]byte, error) {

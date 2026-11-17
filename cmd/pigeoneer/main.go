@@ -1,46 +1,68 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/collectors"
 	"github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/relay"
 
-	// Blank import forces init() to execute, registering the 'benchmark' runner
+	// Blank import registers built-in runners (e.g., "benchmark")
 	_ "github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/runners"
 )
 
+func resolveNodeID() string {
+	for _, key := range []string{"PIGEONEER_NODE_ID", "PIGEONS_NODE_ID"} {
+		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+			return val
+		}
+	}
+	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
+		return strings.TrimSpace(host)
+	}
+	return "edge-arm64-01"
+}
+
+func resolveBrokerURL() string {
+	for _, key := range []string{"PIGEONEER_BROKER_URL", "PIGEONS_BROKER_URL", "MQTT_BROKER_URL"} {
+		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+			return val
+		}
+	}
+	return "tcp://localhost:1883"
+}
+
 func main() {
 	log.Println("Starting Pigeoneer: CTD Edge Agent...")
-	nodeID := "edge-arm64-01" // Eventually pull this from env vars or config
 
-	// 1. Initialize the network relay with the offline spooler
-	// FIX: Pass nodeID cleanly, NewMQTTClient handles the Client ID prefix now
-	mqttRelay := relay.NewMQTTClient("tcp://localhost:1883", nodeID)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	nodeID := resolveNodeID()
+	brokerURL := resolveBrokerURL()
+	topicPrefix := strings.TrimSpace(os.Getenv("PIGEONEER_TOPIC_PREFIX"))
+
+	// 1. Initialize the network relay with LWT presence and offline spooler
+	mqttRelay := relay.NewMQTTClientWithPrefix(brokerURL, nodeID, topicPrefix)
 	defer mqttRelay.Disconnect()
-	log.Println("Network relay established.")
+	log.Printf("Configured relay for node %q -> %s", nodeID, brokerURL)
 
-	// 2. Bind the control topic to listen for dynamic Runner dispatches
-	go func() {
-		log.Printf("Binding runner control topic for node: %s", nodeID)
-		if err := mqttRelay.ListenForRunners(nodeID, mqttRelay); err != nil {
-			log.Printf("Fatal error on runner control topic: %v", err)
-		}
-	}()
+	// 2. Bind the control topic to listen for dynamic Runner dispatches (reconnect-safe)
+	if err := mqttRelay.ListenForRunners(ctx, nodeID, mqttRelay); err != nil {
+		log.Printf("[Runner Dispatch] Initial control bind deferred until broker reconnect: %v", err)
+	}
 
-	// 3. Deploy concurrent passive hardware collectors
-	go collectors.MonitorOS(mqttRelay, nodeID)
-	go collectors.MonitorAdapters(mqttRelay, nodeID)
+	// 3. Deploy concurrent passive hardware collectors bound to daemon lifecycle context
+	collectors.MonitorOS(ctx, mqttRelay, nodeID)
+	collectors.MonitorAdapters(ctx, mqttRelay, nodeID)
 
-	// 4. Block until shutdown
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
-	log.Println("Telemetry & Runner agents deployed. Press Ctrl+C to stop.")
-	<-sigs
+	// 4. Block until OS termination signal
+	log.Printf("Telemetry & Runner agents active for %q. Press Ctrl+C to stop.", nodeID)
+	<-ctx.Done()
 
 	log.Println("Shutting down Pigeoneer...")
 }

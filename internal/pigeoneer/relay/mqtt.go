@@ -3,92 +3,175 @@ package relay
 import (
 	"encoding/json"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-// MQTTClient manages the connection and the offline telemetry spool
+// MQTTClient manages the MQTT connection, LWT presence, and offline telemetry spool.
 type MQTTClient struct {
-	client mqtt.Client
-	nodeID string
-	spool  chan *core.CTDPayload
+	client      mqtt.Client
+	nodeID      string
+	topicPrefix string
+	spool       chan *core.CTDPayload
+	stopCh      chan struct{}
+	stopOnce    sync.Once
+
+	subMu        sync.RWMutex
+	onConnectSub func(mqtt.Client)
 }
 
-// NewMQTTClient initializes the broker connection and starts the background flusher
+// NewMQTTClient initializes the broker connection with default CTD topic routing.
 func NewMQTTClient(brokerURL, nodeID string) *MQTTClient {
+	return NewMQTTClientWithPrefix(brokerURL, nodeID, core.DefaultTopicPrefix)
+}
+
+// NewMQTTClientWithPrefix initializes the broker connection, LWT will, and background FIFO flusher.
+func NewMQTTClientWithPrefix(brokerURL, nodeID, topicPrefix string) *MQTTClient {
+	if topicPrefix == "" {
+		topicPrefix = core.DefaultTopicPrefix
+	}
+
+	c := &MQTTClient{
+		nodeID:      nodeID,
+		topicPrefix: topicPrefix,
+		// 5000 event buffer gives ~7 hours of offline capacity at 5s intervals
+		spool:  make(chan *core.CTDPayload, 5000),
+		stopCh: make(chan struct{}),
+	}
+
+	registryTopic := core.RegistryTopic(nodeID)
+
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(brokerURL)
 	opts.SetClientID("pigeoneer-" + nodeID)
 	opts.SetAutoReconnect(true)
+	opts.SetConnectRetry(true)
 	opts.SetConnectRetryInterval(5 * time.Second)
-	opts.SetMaxReconnectInterval(10 * time.Second)
+	opts.SetMaxReconnectInterval(15 * time.Second)
+	opts.SetWill(registryTopic, "OFFLINE", 1, true)
+
+	opts.OnConnect = func(client mqtt.Client) {
+		// Announce node ONLINE status (retained)
+		client.Publish(registryTopic, 1, true, []byte("ONLINE"))
+
+		// Re-bind control subscriptions across broker restarts
+		c.subMu.RLock()
+		subFn := c.onConnectSub
+		c.subMu.RUnlock()
+		if subFn != nil {
+			subFn(client)
+		}
+	}
 
 	client := mqtt.NewClient(opts)
+	c.client = client
+
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		log.Printf("[Relay] Warning: Broker unreachable on boot, telemetry will spool. (%v)", token.Error())
+		log.Printf("[Relay] Warning: Broker unreachable on boot, telemetry will spool (%v)", token.Error())
 	}
 
-	c := &MQTTClient{
-		client: client,
-		nodeID: nodeID,
-		// 5000 event buffer gives you roughly 1.5 hours of offline capacity at 1Hz
-		spool: make(chan *core.CTDPayload, 5000),
-	}
-
-	// Spin up the background telemetry flusher
 	go c.flushLoop()
 
 	return c
 }
 
-// Publish drops the payload into the spool channel. It will NEVER block the collectors.
+// Publish drops the payload into the spool channel without ever blocking collectors.
 func (c *MQTTClient) Publish(payload *core.CTDPayload) error {
-	select {
-	case c.spool <- payload:
-		// Successfully spooled
-	default:
-		// The buffer is completely full. We drop the oldest event to make room for the new one.
-		<-c.spool
-		c.spool <- payload
-		log.Printf("[Relay] Spool capacity reached. Dropping oldest telemetry.")
+	if payload == nil {
+		return nil
 	}
 
-	// Return nil to satisfy the core.TelemetryPublisher interface
+	select {
+	case <-c.stopCh:
+		return nil
+	default:
+	}
+
+	select {
+	case c.spool <- payload:
+	default:
+		// Buffer full: evict oldest event to preserve room for fresh telemetry.
+		select {
+		case <-c.spool:
+		default:
+		}
+		select {
+		case c.spool <- payload:
+		default:
+		}
+		log.Printf("[Relay] Spool capacity reached; dropped oldest telemetry event.")
+	}
+
 	return nil
 }
 
-// flushLoop runs continuously, pulling from the spool and publishing when connected
+// flushLoop pulls from the spool in strict FIFO order and publishes when connected.
 func (c *MQTTClient) flushLoop() {
-	for payload := range c.spool {
-		// If we are disconnected, sleep briefly and push the payload back to the front of the queue
-		if !c.client.IsConnected() {
-			time.Sleep(2 * time.Second)
-			c.Publish(payload) // Requeue
-			continue
-		}
-
-		data, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("[Relay] Failed to marshal payload: %v", err)
-			continue
-		}
-
-		topic := payload.RoutingTopic()
-		token := c.client.Publish(topic, 1, false, data)
-
-		// If the publish fails mid-flight, requeue it
-		if token.Wait() && token.Error() != nil {
-			log.Printf("[Relay] Flight error, requeuing payload: %v", token.Error())
-			time.Sleep(1 * time.Second)
-			c.Publish(payload)
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case payload := <-c.spool:
+			c.deliverWithRetry(payload)
 		}
 	}
 }
 
-// Disconnect gracefully shuts down the client
+func (c *MQTTClient) deliverWithRetry(payload *core.CTDPayload) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[Relay] Failed to marshal payload: %v", err)
+		return
+	}
+
+	topic := payload.RoutingTopic(c.topicPrefix)
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+
+		if !c.client.IsConnected() {
+			select {
+			case <-c.stopCh:
+				return
+			case <-time.After(1 * time.Second):
+				continue
+			}
+		}
+
+		token := c.client.Publish(topic, 1, false, data)
+		if token.WaitTimeout(5*time.Second) && token.Error() == nil {
+			return
+		}
+		if token.Error() != nil {
+			log.Printf("[Relay] Flight error publishing to %s, retrying: %v", topic, token.Error())
+		}
+
+		select {
+		case <-c.stopCh:
+			return
+		case <-time.After(1 * time.Second):
+		}
+	}
+}
+
+// Disconnect gracefully announces OFFLINE state, halts the flusher, and closes the socket.
 func (c *MQTTClient) Disconnect() {
-	log.Println("[Relay] Disconnecting from broker...")
-	c.client.Disconnect(250)
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+		log.Println("[Relay] Disconnecting from broker...")
+		if c.client != nil {
+			if c.client.IsConnected() {
+				tok := c.client.Publish(core.RegistryTopic(c.nodeID), 1, true, []byte("OFFLINE"))
+				tok.WaitTimeout(500 * time.Millisecond)
+			}
+			c.client.Disconnect(250)
+		}
+	})
 }

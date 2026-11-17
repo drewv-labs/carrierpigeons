@@ -1,36 +1,27 @@
 package collectors
 
 import (
+	"context"
 	"log"
-	"os/exec"
-	"runtime"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-// monitorGPU detects the local hardware and routes to the correct sensor binary.
-func monitorGPU(pub core.TelemetryPublisher, nodeID string) {
-	if isInstalled("rocm-smi") {
-		log.Println("[GPU Router] AMD hardware detected. Booting ROCm collector.")
-		go monitorGPUAMD(pub, nodeID)
-	}
-	if runtime.GOOS == "darwin" {
-		log.Println("[GPU Router] Apple/Darwin hardware detected. Booting powermetrics collector.")
-		go monitorGPUDarwin(pub, nodeID)
+// monitorGPU detects local GPU hardware and launches matching vendor collectors.
+func monitorGPU(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	if monitorGPUPlatform(ctx, pub, nodeID) {
 		return
 	}
+	if isInstalled("rocm-smi") {
+		log.Println("[GPU Router] AMD hardware detected. Booting ROCm collector.")
+		go monitorGPUAMD(ctx, pub, nodeID)
+	}
 	if isInstalled("intel_gpu_top") {
-		log.Println("[GPU Router] Intel hardware detected. Booting sysfs collector.")
-		go monitorGPUIntel(pub, nodeID)
+		log.Println("[GPU Router] Intel hardware detected. Booting intel_gpu_top collector.")
+		go monitorGPUIntel(ctx, pub, nodeID)
 	}
 	if isInstalled("nvidia-smi") {
-		log.Println("[GPU Router] Nvidia hardware detected. Booting NVML collector.")
-		go monitorGPUNvidia(pub, nodeID)
+		log.Println("[GPU Router] Nvidia hardware detected. Booting nvidia-smi collector.")
+		go monitorGPUNvidia(ctx, pub, nodeID)
 	}
-}
-
-// isInstalled checks if a command exists in the system PATH.
-func isInstalled(cmd string) bool {
-	_, err := exec.LookPath(cmd)
-	return err == nil
 }

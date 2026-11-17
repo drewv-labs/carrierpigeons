@@ -10,11 +10,12 @@ import (
 
 // NodeSummary represents the materialized state of an edge node for `pigeons list` and `ps`.
 type NodeSummary struct {
-	NodeID        string                 `json:"node_id"`
-	LastSeen      time.Time              `json:"last_seen"`
-	Status        string                 `json:"status"`
-	LatestMetrics map[string]interface{} `json:"latest_metrics"`
-	IsHealthy     bool                   `json:"is_healthy"`
+	NodeID        string         `json:"node_id"`
+	Component     string         `json:"component"`
+	LastSeen      time.Time      `json:"last_seen"`
+	Status        string         `json:"status"`
+	LatestMetrics map[string]any `json:"latest_metrics"`
+	IsHealthy     bool           `json:"is_healthy"`
 }
 
 // DAG represents a reconstructed Artifact & Tracer graph for PigeonMath / lineage authentication.

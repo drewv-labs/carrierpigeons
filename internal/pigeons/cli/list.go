@@ -7,58 +7,46 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/ledger"
+	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
 	"github.com/spf13/cobra"
 )
 
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all registered edge nodes and their last known activity",
-	Run: func(cmd *cobra.Command, args []string) {
-		dbURL := os.Getenv("PIGEONS_DB_URL")
-		if dbURL == "" {
-			dbURL = "postgres://drewv:ctd_password@localhost:5432/edge_ledger"
-		}
+	Run: func(_ *cobra.Command, _ []string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
-		store, err := ledger.NewStore(context.Background(), dbURL)
+		store, err := db.NewPostgresStore(ctx, db.ResolveDBURL())
 		if err != nil {
-			fmt.Printf("Fatal: Could not connect to ledger: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Fatal: Could not connect to ledger: %v\n", err)
 			os.Exit(1)
 		}
 		defer store.Close()
 
-		// Retrieve the last active timestamp for every node that has ever reported
-		query := `
-			SELECT node_id, MAX(event_timestamp) as last_seen
-			FROM telemetric_ledger
-			GROUP BY node_id
-			ORDER BY node_id ASC;
-		`
-
-		rows, err := store.Query(context.Background(), query)
+		summaries, err := store.GetClusterStatus(ctx, 5*time.Minute)
 		if err != nil {
-			fmt.Printf("Fatal: Failed to query ledger: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Fatal: Failed to query ledger: %v\n", err)
 			os.Exit(1)
 		}
-		defer rows.Close()
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 		fmt.Fprintln(w, "node\t| last seen\t| status")
 		fmt.Fprintln(w, "________________________________________________________\t")
 
-		for rows.Next() {
-			var nodeID string
-			var lastSeen time.Time
-
-			if err := rows.Scan(&nodeID, &lastSeen); err == nil {
-				status := "active"
-				if time.Since(lastSeen) > 5*time.Minute {
+		for _, n := range summaries {
+			status := "active"
+			if !n.IsHealthy {
+				if time.Since(n.LastSeen) > 5*time.Minute {
 					status = "offline"
+				} else {
+					status = n.Status
 				}
-				fmt.Fprintf(w, "%s\t| %s\t| %s\n", nodeID, lastSeen.Format(time.RFC3339), status)
 			}
+			fmt.Fprintf(w, "%s\t| %s\t| %s\n", n.NodeID, n.LastSeen.UTC().Format(time.RFC3339), status)
 		}
-		w.Flush()
+		_ = w.Flush()
 	},
 }
 

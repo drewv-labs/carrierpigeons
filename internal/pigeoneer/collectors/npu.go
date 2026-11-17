@@ -1,25 +1,22 @@
 package collectors
 
 import (
+	"context"
 	"log"
-	"runtime"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-// monitorNPU detects local neural processing units and routes to the correct sensor binary.
-func monitorNPU(pub core.TelemetryPublisher, nodeID string) {
-	if runtime.GOOS == "darwin" {
-		log.Println("[NPU Router] Apple Neural Engine detected. Booting ANE collector.")
-		go monitorNPUDarwin(pub, nodeID)
-	}
+// monitorNPU detects local neural processing units and routes to the matching collector.
+func monitorNPU(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	monitorNPUPlatform(ctx, pub, nodeID)
+
 	if isInstalled("hailortcli") {
 		log.Println("[NPU Router] Hailo NPU detected. Booting Hailo collector.")
-		go monitorNPUHailo(pub, nodeID)
-
+		go monitorNPUHailo(ctx, pub, nodeID)
 	}
-	if isInstalled("edgetpu_compiler") {
+	if pathExists("/sys/class/apex") || isInstalled("edgetpu_compiler") {
 		log.Println("[NPU Router] Google Coral TPU detected. Booting Coral collector.")
-		go monitorNPUCoral(pub, nodeID)
+		go monitorNPUCoral(ctx, pub, nodeID)
 	}
 }

@@ -5,20 +5,40 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-// ListenForRunners binds the MQTT client to the node's exclusive control topic.
-func (c *MQTTClient) ListenForRunners(nodeID string, pub core.TelemetryPublisher) error {
-	topic := "pigeons/control/" + nodeID
+type activeRun struct {
+	id     uint64
+	cancel context.CancelFunc
+}
 
-	// Thread-safe map to hold active runner cancellation functions
-	var activeRunners sync.Map
+// ListenForRunners binds the MQTT client to the node's exclusive control topic and re-subscribes on reconnect.
+func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, pub core.TelemetryPublisher) error {
+	topic := core.ControlTopic(nodeID)
 
-	token := c.client.Subscribe(topic, 1, func(client mqtt.Client, msg mqtt.Message) {
+	var (
+		mu            sync.Mutex
+		activeRunners = make(map[string]*activeRun)
+		seq           atomic.Uint64
+	)
+
+	// Cancel all active runners if the daemon shuts down.
+	go func() {
+		<-parentCtx.Done()
+		mu.Lock()
+		defer mu.Unlock()
+		for name, entry := range activeRunners {
+			entry.cancel()
+			delete(activeRunners, name)
+		}
+	}()
+
+	handler := func(_ mqtt.Client, msg mqtt.Message) {
 		var env runner.Envelope
 		if err := json.Unmarshal(msg.Payload(), &env); err != nil {
 			log.Printf("[Runner Dispatch] Invalid envelope dropped: %v", err)
@@ -30,53 +50,83 @@ func (c *MQTTClient) ListenForRunners(nodeID string, pub core.TelemetryPublisher
 			return
 		}
 
-		// Default to start if no action is provided (backwards compatibility)
 		action := env.Action
 		if action == "" {
 			action = "start"
 		}
 
-		// HANDLE CANCELLATION
 		if action == "abort" {
-			if cancelRaw, active := activeRunners.Load(env.Runner); active {
-				log.Printf("[Runner Dispatch] 🛑 ABORT SIGNAL RECEIVED: Killing %q on %s", env.Runner, nodeID)
-				cancel := cancelRaw.(context.CancelFunc)
-				cancel()
-				activeRunners.Delete(env.Runner)
+			mu.Lock()
+			entry, active := activeRunners[env.Runner]
+			if active {
+				delete(activeRunners, env.Runner)
+			}
+			mu.Unlock()
+
+			if active {
+				log.Printf("[Runner Dispatch] ABORT SIGNAL RECEIVED: Killing %q on %s", env.Runner, nodeID)
+				entry.cancel()
 			} else {
 				log.Printf("[Runner Dispatch] Abort ignored: %q is not currently running.", env.Runner)
 			}
 			return
 		}
 
-		// HANDLE EXECUTION
 		task, exists := runner.Get(env.Runner)
 		if !exists {
 			log.Printf("[Runner Dispatch] Unknown runner requested: %q", env.Runner)
 			return
 		}
 
-		// Prevent overlapping executions of the exact same runner
-		if _, active := activeRunners.Load(env.Runner); active {
+		mu.Lock()
+		if _, active := activeRunners[env.Runner]; active {
+			mu.Unlock()
 			log.Printf("[Runner Dispatch] Runner %q is already active. Ignoring duplicate start.", env.Runner)
 			return
 		}
 
-		// Create a cancellable context and store it in the registry
-		ctx, cancel := context.WithCancel(context.Background())
-		activeRunners.Store(env.Runner, cancel)
+		runCtx, cancel := context.WithCancel(parentCtx)
+		runID := seq.Add(1)
+		activeRunners[env.Runner] = &activeRun{id: runID, cancel: cancel}
+		mu.Unlock()
 
-		// Fire in an isolated goroutine
 		go func() {
-			defer activeRunners.Delete(env.Runner) // Clean up registry when finished
+			defer func() {
+				cancel()
+				mu.Lock()
+				if cur, ok := activeRunners[env.Runner]; ok && cur.id == runID {
+					delete(activeRunners, env.Runner)
+				}
+				mu.Unlock()
+			}()
 
-			log.Printf("[Runner Dispatch] 🚀 Executing %q on %s", env.Runner, nodeID)
-			if err := task.Run(ctx, nodeID, env.Params, pub); err != nil {
+			log.Printf("[Runner Dispatch] Executing %q on %s", env.Runner, nodeID)
+			if err := task.Run(runCtx, nodeID, env.Params, pub); err != nil {
 				log.Printf("[Runner Dispatch] Runner %q failed: %v", env.Runner, err)
 			}
 		}()
-	})
+	}
 
-	token.Wait()
-	return token.Error()
+	subscribeFn := func(client mqtt.Client) {
+		if tok := client.Subscribe(topic, 1, handler); tok.Wait() && tok.Error() != nil {
+			log.Printf("[Runner Dispatch] Failed subscribing to %s: %v", topic, tok.Error())
+		} else {
+			log.Printf("[Runner Dispatch] Listening on control topic: %s", topic)
+		}
+	}
+
+	c.subMu.Lock()
+	c.onConnectSub = subscribeFn
+	c.subMu.Unlock()
+
+	if c.client != nil && c.client.IsConnected() {
+		tok := c.client.Subscribe(topic, 1, handler)
+		tok.Wait()
+		if err := tok.Error(); err != nil {
+			return err
+		}
+		log.Printf("[Runner Dispatch] Listening on control topic: %s", topic)
+	}
+
+	return nil
 }

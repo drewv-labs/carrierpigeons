@@ -3,9 +3,9 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 
+	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/spf13/cobra"
@@ -22,23 +22,24 @@ var runnerBenchmarkCmd = &cobra.Command{
 	Use:   "benchmark [node-ids...]",
 	Short: "Dispatch a targeted synthetic benchmark to edge nodes",
 	Args:  cobra.MinimumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		// Default to system CPU burn if no targets are specified
+	Run: func(_ *cobra.Command, args []string) {
 		if !benchSystem && !benchGPU && !benchNPU {
 			benchSystem = true
 		}
 
-		// Spin up a transient MQTT client just for the CLI dispatch
-		opts := mqtt.NewClientOptions().AddBroker("tcp://localhost:1883").SetClientID("pigeons-cli-dispatcher")
+		brokerURL := resolveBrokerURL()
+		opts := mqtt.NewClientOptions().
+			AddBroker(brokerURL).
+			SetClientID(fmt.Sprintf("pigeons-cli-dispatcher-%d", os.Getpid()))
 		client := mqtt.NewClient(opts)
 		if token := client.Connect(); token.Wait() && token.Error() != nil {
-			fmt.Printf("Fatal: Could not reach local MQTT broker: %v\n", token.Error())
+			fmt.Fprintf(os.Stderr, "Fatal: Could not reach MQTT broker (%s): %v\n", brokerURL, token.Error())
 			os.Exit(1)
 		}
 		defer client.Disconnect(250)
 
-		// Construct the rigid protocol envelope
 		env := runner.Envelope{
+			Action: "start",
 			Runner: "benchmark",
 			Params: map[string]any{
 				"duration_sec":  benchSecs,
@@ -50,16 +51,16 @@ var runnerBenchmarkCmd = &cobra.Command{
 
 		payload, err := json.Marshal(env)
 		if err != nil {
-			log.Fatalf("Failed to marshal runner envelope: %v", err)
+			fmt.Fprintf(os.Stderr, "Fatal: Failed to marshal runner envelope: %v\n", err)
+			os.Exit(1)
 		}
 
-		// Dispatch to all targeted nodes
 		for _, nodeID := range args {
-			topic := "pigeons/control/" + nodeID
+			topic := core.ControlTopic(nodeID)
 			token := client.Publish(topic, 1, false, payload)
 			token.Wait()
 			if token.Error() != nil {
-				fmt.Printf("[-] Failed to dispatch to %s: %v\n", nodeID, token.Error())
+				fmt.Fprintf(os.Stderr, "[-] Failed to dispatch to %s: %v\n", nodeID, token.Error())
 			} else {
 				fmt.Printf("[+] Dispatched 'benchmark' runner to %s (Duration: %ds, Sys: %v, GPU: %v, NPU: %v)\n",
 					nodeID, benchSecs, benchSystem, benchGPU, benchNPU)

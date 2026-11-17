@@ -1,17 +1,18 @@
+//go:build linux
+
 package collectors
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"log"
-	"os/exec"
 	"time"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorOSOpenWrt(pub core.TelemetryPublisher, nodeID string) {
-	ticker := time.NewTicker(5 * time.Second)
+func monitorOSOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
 	type UbusSystemInfo struct {
@@ -22,29 +23,30 @@ func monitorOSOpenWrt(pub core.TelemetryPublisher, nodeID string) {
 		} `json:"memory"`
 	}
 
-	for range ticker.C {
-		cmd := exec.Command("ubus", "call", "system", "info")
-		var out bytes.Buffer
-		cmd.Stdout = &out
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			out, err := runCommand(ctx, defaultCmdTimeout, "ubus", "call", "system", "info")
+			if err != nil {
+				continue
+			}
 
-		if err := cmd.Run(); err != nil {
-			continue
-		}
+			var sysInfo UbusSystemInfo
+			if err := json.Unmarshal(out, &sysInfo); err != nil {
+				log.Printf("[OS Collector] Failed to parse ubus system info: %v", err)
+				continue
+			}
 
-		var sysInfo UbusSystemInfo
-		if err := json.Unmarshal(out.Bytes(), &sysInfo); err != nil {
-			log.Printf("[OS Collector] Failed to parse ubus system info: %v", err)
-			continue
-		}
+			event := core.NewCTDPayload(nodeID, "host-os", "active").
+				AddMetric("uptime_s", sysInfo.Uptime).
+				AddMetric("mem_total_mb", sysInfo.Memory.Total/1024.0/1024.0).
+				AddMetric("mem_free_mb", sysInfo.Memory.Free/1024.0/1024.0)
 
-		event := core.NewCTDPayload(nodeID, "session-live", "host-os").
-			UpdateStatus("active").
-			AddMetric("uptime_s", sysInfo.Uptime).
-			AddMetric("mem_total_mb", sysInfo.Memory.Total/1024/1024).
-			AddMetric("mem_free_mb", sysInfo.Memory.Free/1024/1024)
-
-		if err := pub.Publish(event); err != nil {
-			log.Printf("[OS Collector] Publish failed: %v", err)
+			if err := pub.Publish(event); err != nil {
+				log.Printf("[OS Collector] Publish failed: %v", err)
+			}
 		}
 	}
 }

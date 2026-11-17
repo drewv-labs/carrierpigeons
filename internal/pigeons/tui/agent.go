@@ -17,7 +17,6 @@ var (
 	waitStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
 )
 
-// Internal message types for the streaming loop
 type streamTokenMsg struct {
 	token string
 	ch    <-chan string
@@ -31,7 +30,8 @@ type AgentModel struct {
 	chatHistory     []adapters.Message
 	uiHistory       []string
 	userInput       string
-	currentResponse string // Holds the active string being streamed
+	currentResponse string
+	streamCancel    context.CancelFunc
 	waiting         bool
 	quitting        bool
 }
@@ -41,7 +41,7 @@ func NewAgentModel(ctx string, llm adapters.LLMAdapter) AgentModel {
 		llm:            llm,
 		clusterContext: ctx,
 		uiHistory: []string{
-			agentStyle.Render("🤖 PigeonCare+: I have analyzed the cluster topography. How can I assist with triage?"),
+			agentStyle.Render("PigeonCare+: I have analyzed the cluster topography. How can I assist with triage?"),
 		},
 	}
 }
@@ -54,55 +54,71 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.KeyMsg:
-		if m.waiting && msg.String() != "ctrl+c" && msg.String() != "esc" {
-			return m, nil // Lock input while streaming
-		}
-
-		switch msg.String() {
-		case "ctrl+c", "esc":
+		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc {
+			if m.streamCancel != nil {
+				m.streamCancel()
+				m.streamCancel = nil
+			}
 			m.quitting = true
 			return m, tea.Quit
+		}
 
-		case "enter":
+		if m.waiting {
+			return m, nil
+		}
+
+		switch msg.Type {
+		case tea.KeyEnter:
 			if strings.TrimSpace(m.userInput) == "" {
 				return m, nil
 			}
 
 			userText := m.userInput
 			m.chatHistory = append(m.chatHistory, adapters.Message{Role: "user", Content: userText})
-			m.uiHistory = append(m.uiHistory, userStyle.Render("Drew: "+userText))
-
-			// Append an empty string for the agent that we will update live
-			m.uiHistory = append(m.uiHistory, agentStyle.Render("🤖 PigeonCare+: "))
+			m.uiHistory = append(m.uiHistory, userStyle.Render("Operator: "+userText))
+			m.uiHistory = append(m.uiHistory, agentStyle.Render("PigeonCare+: "))
 
 			m.userInput = ""
 			m.currentResponse = ""
 			m.waiting = true
 
-			return m, m.startStream()
+			ctx, cancel := context.WithCancel(context.Background())
+			m.streamCancel = cancel
+			return m, m.startStream(ctx)
 
-		case "backspace":
-			if len(m.userInput) > 0 {
-				m.userInput = m.userInput[:len(m.userInput)-1]
+		case tea.KeyBackspace, tea.KeyDelete:
+			runes := []rune(m.userInput)
+			if len(runes) > 0 {
+				m.userInput = string(runes[:len(runes)-1])
 			}
-		default:
-			m.userInput += msg.String()
+
+		case tea.KeySpace:
+			m.userInput += " "
+
+		case tea.KeyRunes:
+			m.userInput += string(msg.Runes)
 		}
 
 	case streamErrMsg:
 		m.waiting = false
-		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render("🤖 PigeonCare+ Error: " + msg.err.Error())
+		if m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+		}
+		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render("PigeonCare+ Error: " + msg.err.Error())
 		return m, nil
 
 	case streamTokenMsg:
 		m.currentResponse += msg.token
-		// Overwrite the last message in the UI slice with the growing string
-		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render("🤖 PigeonCare+: " + m.currentResponse)
-		// Instantly request the next token
+		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render("PigeonCare+: " + m.currentResponse)
 		return m, waitForToken(msg.ch)
 
 	case streamDoneMsg:
 		m.waiting = false
+		if m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+		}
 		m.chatHistory = append(m.chatHistory, adapters.Message{Role: "assistant", Content: m.currentResponse})
 		return m, nil
 	}
@@ -110,25 +126,25 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// startStream initiates the HTTP request and grabs the channel
-func (m AgentModel) startStream() tea.Cmd {
+func (m AgentModel) startStream(ctx context.Context) tea.Cmd {
+	historySnapshot := append([]adapters.Message(nil), m.chatHistory...)
+	sysPrompt := "You are PigeonCare+, an expert site reliability engineer. Live cluster context:\n" + m.clusterContext
+	llm := m.llm
+
 	return func() tea.Msg {
-		sysPrompt := "You are PigeonCare+, an expert site reliability engineer. Live cluster context:\n" + m.clusterContext
-		ch, err := m.llm.StreamChat(context.Background(), sysPrompt, m.chatHistory)
+		ch, err := llm.StreamChat(ctx, sysPrompt, historySnapshot)
 		if err != nil {
 			return streamErrMsg{err}
 		}
-		// Kick off the channel reader
 		return waitForToken(ch)()
 	}
 }
 
-// waitForToken is a recursive loop that pulls from the channel without blocking the main UI thread
 func waitForToken(ch <-chan string) tea.Cmd {
 	return func() tea.Msg {
 		token, ok := <-ch
 		if !ok {
-			return streamDoneMsg{} // Channel closed, stream is finished
+			return streamDoneMsg{}
 		}
 		return streamTokenMsg{token: token, ch: ch}
 	}
@@ -147,7 +163,9 @@ func (m AgentModel) View() string {
 		sb.WriteString(msg + "\n")
 	}
 
-	if !m.waiting {
+	if m.waiting {
+		sb.WriteString("\n" + waitStyle.Render("Streaming response... (press Esc to cancel)"))
+	} else {
 		sb.WriteString("\n" + promptStyle.Render("Ask PigeonCare+ > ") + m.userInput)
 	}
 

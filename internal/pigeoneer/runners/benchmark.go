@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
@@ -12,7 +13,7 @@ import (
 
 type BenchmarkRunner struct{}
 
-// Automatically bind to the execution registry on binary boot
+// Automatically bind to the execution registry on binary boot.
 func init() {
 	runner.Register(&BenchmarkRunner{})
 }
@@ -22,57 +23,74 @@ func (b *BenchmarkRunner) Name() string {
 }
 
 func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[string]any, pub core.TelemetryPublisher) error {
-	// Parse dynamic JSON parameters passed over MQTT
 	durationSec := 60
-	if d, ok := params["duration_sec"].(float64); ok {
-		durationSec = int(d)
+	switch d := params["duration_sec"].(type) {
+	case float64:
+		if d > 0 {
+			durationSec = int(d)
+		}
+	case int:
+		if d > 0 {
+			durationSec = d
+		}
 	}
 
 	targetSystem, _ := params["target_system"].(bool)
-	targetNPU, _ := params["target_npu"].(bool) // Placeholder for Hailo/Coral CLI hooks
+	targetNPU, _ := params["target_npu"].(bool)
 	targetGPU, _ := params["target_gpu"].(bool)
 
-	runID := time.Now().UnixNano()
+	runID := time.Now().UTC().UnixNano()
 
-	// 1. Emit CTD Start Bookend
-	startEvent := core.NewCTDPayload(nodeID, "session-live", "runner:benchmark").
-		UpdateStatus("runner-start").
+	// 1. Emit CTD Start Bookend under the Runner pillar
+	startEvent := core.NewCTDPayload(nodeID, "runner:benchmark", "runner-start").
+		WithPillar(core.PillarRunner).
 		AddMetric("run_id", runID).
 		AddMetric("duration_sec", durationSec).
 		AddMetric("target_system", targetSystem).
 		AddMetric("target_npu", targetNPU).
 		AddMetric("target_gpu", targetGPU)
-	pub.Publish(startEvent)
+	_ = pub.Publish(startEvent)
 
-	// Enforce the requested duration without blocking the main runner dispatcher
+	// Enforce the requested duration while respecting external abort cancellation
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(durationSec)*time.Second)
 	defer cancel()
 
 	// 2. Execute Hardware Workloads
+	var wg sync.WaitGroup
 	if targetSystem {
+		payload := []byte("carrier-pigeons-burn")
 		for range runtime.NumCPU() {
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 				for {
 					select {
 					case <-runCtx.Done():
 						return
 					default:
-						// CPU Burner: Force thermal and power draw spike
-						_ = sha256.Sum256([]byte("carrier-pigeons-burn"))
+						for range 256 {
+							_ = sha256.Sum256(payload)
+						}
 					}
 				}
 			}()
 		}
 	}
 
-	// 3. Block until duration expires
+	// 3. Block until duration expires or abort is triggered, then drain workers
 	<-runCtx.Done()
+	wg.Wait()
 
-	// 4. Emit CTD End Bookend
-	endEvent := core.NewCTDPayload(nodeID, "session-live", "runner:benchmark").
-		UpdateStatus("runner-end").
+	endStatus := "runner-end"
+	if ctx.Err() != nil {
+		endStatus = "runner-aborted"
+	}
+
+	// 4. Emit CTD End Bookend under the Runner pillar
+	endEvent := core.NewCTDPayload(nodeID, "runner:benchmark", endStatus).
+		WithPillar(core.PillarRunner).
 		AddMetric("run_id", runID)
-	pub.Publish(endEvent)
+	_ = pub.Publish(endEvent)
 
 	return nil
 }

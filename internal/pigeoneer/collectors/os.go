@@ -1,32 +1,12 @@
 package collectors
 
 import (
-	"log"
-	"runtime"
+	"context"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-// MonitorOS detects the host operating system and routes to the correct system poller.
-func MonitorOS(pub core.TelemetryPublisher, nodeID string) {
-	switch runtime.GOOS {
-	case "darwin":
-		log.Println("[OS Router] MacOS/Darwin host detected.")
-		go monitorOSUnix(pub, nodeID)
-		return
-	case "linux":
-		if isInstalled("ubus") {
-			log.Println("[OS Router] OpenWrt host detected.")
-			go monitorOSOpenWrt(pub, nodeID)
-		} else {
-			log.Println("[OS Router] Standard Unix host detected.")
-			go monitorOSUnix(pub, nodeID)
-		}
-	case "windows":
-		log.Println("[OS Router] Windows host detected. Booting PowerShell CIM collector.")
-		go monitorOSWindows(pub, nodeID)
-	default:
-		log.Printf("[OS Router] Generic Unix host detected for %s.", runtime.GOOS)
-		go monitorOSUnix(pub, nodeID)
-	}
+// MonitorOS dispatches host OS telemetry collection for the target platform.
+func MonitorOS(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	go monitorOSPlatform(ctx, pub, nodeID)
 }

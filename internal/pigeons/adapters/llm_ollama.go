@@ -6,21 +6,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/ledger"
+	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
 )
+
+var _ BaseLLM = (*OllamaAdapter)(nil)
 
 type OllamaAdapter struct {
 	endpoint string
 	model    string
-	store    *ledger.Store
+	store    db.BaseDB
 	client   *http.Client
 }
 
-func NewOllamaAdapter(endpoint, model string, store *ledger.Store) *OllamaAdapter {
+func NewOllamaAdapter(endpoint, model string, store db.BaseDB) *OllamaAdapter {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	if endpoint == "" {
 		endpoint = "http://localhost:11434"
+	}
+	if strings.TrimSpace(model) == "" {
+		model = "qwen2.5-coder"
 	}
 	return &OllamaAdapter{
 		endpoint: endpoint + "/api/chat",
@@ -35,7 +43,8 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 
 	go func() {
 		defer close(tokenChan)
-		messages := []Message{{Role: "system", Content: systemPrompt}}
+		messages := make([]Message, 0, len(history)+1)
+		messages = append(messages, Message{Role: "system", Content: systemPrompt})
 		messages = append(messages, history...)
 
 		for {
@@ -43,59 +52,76 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				"model":    a.model,
 				"messages": messages,
 				"tools":    PigeonTools,
-				"stream":   true, // Enable real-time token streaming
+				"stream":   true,
 			}
 
-			body, _ := json.Marshal(payload)
-			req, err := http.NewRequestWithContext(ctx, "POST", a.endpoint, bytes.NewBuffer(body))
+			body, err := json.Marshal(payload)
 			if err != nil {
+				sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama encode error: %v]", err))
+				return
+			}
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewBuffer(body))
+			if err != nil {
+				sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama request error: %v]", err))
 				return
 			}
 			req.Header.Set("Content-Type", "application/json")
 
 			resp, err := a.client.Do(req)
 			if err != nil {
+				if ctx.Err() == nil {
+					sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama connection error: %v]", err))
+				}
+				return
+			}
+
+			if resp.StatusCode >= http.StatusBadRequest {
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama HTTP %d: %s]", resp.StatusCode, strings.TrimSpace(string(errBody))))
 				return
 			}
 
 			scanner := bufio.NewScanner(resp.Body)
-			var toolCalls []ToolCall
-			var fullContent string
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-			// Parse the NDJSON stream chunk by chunk
+			var toolCalls []ToolCall
+			var fullContent strings.Builder
+
 			for scanner.Scan() {
 				var chunk struct {
 					Message Message `json:"message"`
 				}
 				if err := json.Unmarshal(scanner.Bytes(), &chunk); err == nil {
-					// If there is text, push it immediately to the UI channel
 					if chunk.Message.Content != "" {
-						tokenChan <- chunk.Message.Content
-						fullContent += chunk.Message.Content
+						if !sendToken(ctx, tokenChan, chunk.Message.Content) {
+							resp.Body.Close()
+							return
+						}
+						fullContent.WriteString(chunk.Message.Content)
 					}
-					// If the chunk contains a tool call, capture it
 					if len(chunk.Message.ToolCalls) > 0 {
-						toolCalls = chunk.Message.ToolCalls
+						toolCalls = append(toolCalls, chunk.Message.ToolCalls...)
 					}
 				}
 			}
 			resp.Body.Close()
 
-			// Base Case: The LLM finished talking and did not request a tool. We are done.
 			if len(toolCalls) == 0 {
 				return
 			}
 
-			// Recursive Case: The LLM wants to run a PostgreSQL query.
 			messages = append(messages, Message{
 				Role:      "assistant",
-				Content:   fullContent,
+				Content:   fullContent.String(),
 				ToolCalls: toolCalls,
 			})
 
 			for _, tc := range toolCalls {
-				// We pipe a status update to the UI so you know what it's doing behind the scenes
-				tokenChan <- fmt.Sprintf("\n*(Running tool: %s...)*\n", tc.Function.Name)
+				if !sendToken(ctx, tokenChan, fmt.Sprintf("\n*(Running tool: %s...)*\n", tc.Function.Name)) {
+					return
+				}
 
 				observation := ExecuteTool(ctx, tc.Function.Name, tc.Function.Arguments, a.store)
 				messages = append(messages, Message{
@@ -103,7 +129,6 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 					Content: observation,
 				})
 			}
-			// The loop restarts, pushing the new DB context back to Ollama
 		}
 	}()
 

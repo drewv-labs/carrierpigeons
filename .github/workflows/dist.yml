@@ -27,20 +27,34 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22' # Update to your current Go version
+          go-version-file: 'go.mod'
+
+      - name: Run Vet & Unit Tests
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          go vet ./...
+          go test -race ./...
 
       - name: Build Binaries
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
+          LDFLAGS="-s -w"
 
           # Build Pigeoneer (Edge Daemon)
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o dist/pigeoneer-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeoneer
+          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeoneer-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeoneer
 
           # Build PigeonCoop (Hub Injector)
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o dist/pigeoncoop-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeoncoop
+          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeoncoop-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeoncoop
 
-          # Build Pigeons (CLI)
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o dist/pigeons-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeons
+          # Build PigeonMCP (Model Context Protocol Sidecar)
+          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeonmcp-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeonmcp
+
+          # Build Pigeons (CLI / TUI)
+          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeons-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeons
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4

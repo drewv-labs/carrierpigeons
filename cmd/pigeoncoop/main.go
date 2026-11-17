@@ -5,43 +5,53 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/broker"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/ledger"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/migrations"
+	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
 )
+
+func resolveBrokerURL() string {
+	for _, key := range []string{"PIGEONCOOP_BROKER_URL", "PIGEONS_BROKER_URL", "MQTT_BROKER_URL"} {
+		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+			return val
+		}
+	}
+	return "tcp://localhost:1883"
+}
 
 func main() {
 	log.Println("Starting PigeonCoop: CTD Ledger Injector...")
 
-	// 1. Initialize the PostgreSQL Store
-	dbURL := "postgres://drewv:ctd_password@localhost:5432/edge_ledger"
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	store, err := ledger.NewStore(context.Background(), dbURL)
+	// 1. Initialize the PostgreSQL CTD Store & Schema
+	dbURL := db.ResolveDBURL()
+	store, err := db.NewPostgresStore(ctx, dbURL)
 	if err != nil {
 		log.Fatalf("Failed to initialize PostgreSQL ledger: %v", err)
 	}
 	defer store.Close()
 	log.Println("Connected to PostgreSQL Ledger.")
 
-	if err := migrations.EnsureSchema(context.Background(), store); err != nil {
-		log.Fatalf("Migration failed: %v", err)
+	if err := store.EnsureSchema(ctx); err != nil {
+		log.Fatalf("Schema migration failed: %v", err)
 	}
+	log.Println("Verified PostgreSQL CTD schema (telemetric_ledger, ctd_artifacts, ctd_traces).")
 
-	// 2. Initialize the MQTT Subscriber, injecting the 'store' as the Ledger interface
-	mqttSub, err := broker.NewSubscriber("tcp://localhost:1883", store)
+	// 2. Initialize the MQTT Subscriber, injecting the store as the Ledger interface
+	brokerURL := resolveBrokerURL()
+	mqttSub, err := broker.NewSubscriber(brokerURL, store)
 	if err != nil {
-		log.Fatalf("Failed to connect to MQTT broker: %v", err)
+		log.Fatalf("Failed to connect to MQTT broker (%s): %v", brokerURL, err)
 	}
 	defer mqttSub.Disconnect()
 
-	// 3. Block for Graceful Shutdown
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	// 3. Block until OS termination signal
+	log.Printf("PigeonCoop is running on %s. Waiting for telemetry...", brokerURL)
+	<-ctx.Done()
 
-	log.Println("PigeonCoop is running. Waiting for telemetry...")
-	<-sigs
-
-	log.Println("Shutting down gracefully...")
+	log.Println("Shutting down PigeonCoop gracefully...")
 }

@@ -2,23 +2,39 @@ package broker
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-// handleRegistryUpdate intercepts LWT messages and triggers Ntfy alerts.
-func (s *Subscriber) handleRegistryUpdate(client mqtt.Client, msg mqtt.Message) {
-	// Topic structure: drewv/ctd/v1/registry/pigeoneer-edge-arm64-01/status
+var ntfyHTTPClient = &http.Client{
+	Timeout: 5 * time.Second,
+}
+
+func resolveNtfyURL() string {
+	for _, key := range []string{"PIGEONCOOP_NTFY_URL", "NTFY_URL"} {
+		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+			return val
+		}
+	}
+	return "http://localhost:2586/carrier-pigeons"
+}
+
+// handleRegistryUpdate intercepts LWT / presence messages and triggers Ntfy alerts.
+func (s *Subscriber) handleRegistryUpdate(_ mqtt.Client, msg mqtt.Message) {
+	// Topic structure: pigeons/registry/<node_id>/status
 	parts := strings.Split(msg.Topic(), "/")
-	if len(parts) < 6 {
+	if len(parts) < 3 {
 		return
 	}
 
-	nodeID := parts[4]
-	status := string(msg.Payload())
+	nodeID := strings.TrimPrefix(parts[len(parts)-2], "pigeoneer-")
+	status := strings.TrimSpace(string(msg.Payload()))
 
 	log.Printf("[Registry] %s state changed to: %s", nodeID, status)
 
@@ -27,20 +43,29 @@ func (s *Subscriber) handleRegistryUpdate(client mqtt.Client, msg mqtt.Message) 
 	}
 }
 
-// sendNtfyAlert pushes a notification to your local Ntfy instance.
+// sendNtfyAlert pushes a notification to the configured Ntfy instance.
 func sendNtfyAlert(nodeID, status string) {
-	// Adjust this URL to point to the Ntfy server in your homelab edge architecture
-	url := "http://localhost:2586/carrier-pigeons"
+	url := resolveNtfyURL()
+	if url == "off" || url == "disabled" || url == "none" {
+		return
+	}
 
 	var message string
 	if status == "OFFLINE" {
-		message = "🚨 CRITICAL: " + nodeID + " has dropped off the network."
+		message = "CRITICAL: " + nodeID + " has dropped off the network."
 	} else {
-		message = "✅ RECOVERY: " + nodeID + " is back online."
+		message = "RECOVERY: " + nodeID + " is back online."
 	}
 
-	req, _ := http.NewRequest("POST", url, bytes.NewBufferString(message))
-	req.Header.Set("Title", "Ada Lovespace Hardware Alert")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(message))
+	if err != nil {
+		log.Printf("[Ntfy] Invalid request URL %q: %v", url, err)
+		return
+	}
+	req.Header.Set("Title", "CarrierPigeons Hardware Alert")
 
 	if status == "OFFLINE" {
 		req.Header.Set("Tags", "warning,skull")
@@ -49,8 +74,10 @@ func sendNtfyAlert(nodeID, status string) {
 		req.Header.Set("Tags", "white_check_mark")
 	}
 
-	client := &http.Client{}
-	if _, err := client.Do(req); err != nil {
+	resp, err := ntfyHTTPClient.Do(req)
+	if err != nil {
 		log.Printf("[Ntfy] Failed to send alert: %v", err)
+		return
 	}
+	defer resp.Body.Close()
 }
