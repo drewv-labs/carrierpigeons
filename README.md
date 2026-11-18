@@ -58,7 +58,7 @@ This project empowers developers to build scalable, observable infrastructure mo
 
 
 🚀 **Pigeoneer Edge Agent**
-* **Hardware-Agnostic Observers:** Auto-detects and independently observes Nvidia, AMD, Apple, and Intel GPUs alongside Linux/OpenWrt/macOS/Windows host, SoC thermal, CPU cooler fan speed (`cpu_fan_rpm`, `cpu_fan_pwm_pct`), and network telemetry. 
+* **Hardware-Agnostic Observers:** Auto-detects and independently observes Nvidia, AMD, Apple, and Intel GPUs alongside Linux/OpenWrt/macOS/Windows host, SoC thermal, and network telemetry along with other system metrics. 
 * **AI Accelerator Support:** Dedicated Hailo, Google Coral, & Apple ANE NPU support featuring PCIe device isolation and array scaling. 
 * **State Awareness:** Event-driven heartbeat architecture utilizing MQTT Last Will and Testament (LWT) registries.
 
