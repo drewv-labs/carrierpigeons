@@ -6,11 +6,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeons/adapters"
+	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
 )
 
 var (
-	agentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).MarginBottom(1)
+	agentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 	userStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("253"))
 	systemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).BorderStyle(lipgloss.RoundedBorder()).Padding(0, 1)
 	promptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
@@ -24,10 +25,11 @@ type streamTokenMsg struct {
 type streamDoneMsg struct{}
 type streamErrMsg struct{ err error }
 
+// AgentModel provides a standalone single-pane PigeonCare chat model when invoked directly.
 type AgentModel struct {
-	llm             adapters.LLMAdapter
+	llm             llm.BaseLLM
 	clusterContext  string
-	chatHistory     []adapters.Message
+	chatHistory     []llm.Message
 	uiHistory       []string
 	userInput       string
 	currentResponse string
@@ -36,12 +38,13 @@ type AgentModel struct {
 	quitting        bool
 }
 
-func NewAgentModel(ctx string, llm adapters.LLMAdapter) AgentModel {
+func NewAgentModel(ctx string, adapter llm.BaseLLM) AgentModel {
+	name := brand.Active().AgentName
 	return AgentModel{
-		llm:            llm,
+		llm:            adapter,
 		clusterContext: ctx,
 		uiHistory: []string{
-			agentStyle.Render("PigeonCare+: I have analyzed the cluster topography. How can I assist with triage?"),
+			agentStyle.Render(name + ": I have analyzed the cluster topography. How can I assist with triage?"),
 		},
 	}
 }
@@ -51,6 +54,7 @@ func (m AgentModel) Init() tea.Cmd {
 }
 
 func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	name := brand.Active().AgentName
 	switch msg := msg.(type) {
 
 	case tea.KeyMsg:
@@ -74,9 +78,9 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			userText := m.userInput
-			m.chatHistory = append(m.chatHistory, adapters.Message{Role: "user", Content: userText})
+			m.chatHistory = append(m.chatHistory, llm.Message{Role: "user", Content: userText})
 			m.uiHistory = append(m.uiHistory, userStyle.Render("Operator: "+userText))
-			m.uiHistory = append(m.uiHistory, agentStyle.Render("PigeonCare+: "))
+			m.uiHistory = append(m.uiHistory, agentStyle.Render(name+": "))
 
 			m.userInput = ""
 			m.currentResponse = ""
@@ -105,12 +109,12 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
-		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render("PigeonCare+ Error: " + msg.err.Error())
+		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render(name + " Error: " + msg.err.Error())
 		return m, nil
 
 	case streamTokenMsg:
 		m.currentResponse += msg.token
-		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render("PigeonCare+: " + m.currentResponse)
+		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render(name + ": " + m.currentResponse)
 		return m, waitForToken(msg.ch)
 
 	case streamDoneMsg:
@@ -119,7 +123,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
-		m.chatHistory = append(m.chatHistory, adapters.Message{Role: "assistant", Content: m.currentResponse})
+		m.chatHistory = append(m.chatHistory, llm.Message{Role: "assistant", Content: m.currentResponse})
 		return m, nil
 	}
 
@@ -127,12 +131,12 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m AgentModel) startStream(ctx context.Context) tea.Cmd {
-	historySnapshot := append([]adapters.Message(nil), m.chatHistory...)
-	sysPrompt := "You are PigeonCare+, an expert site reliability engineer. Live cluster context:\n" + m.clusterContext
-	llm := m.llm
+	historySnapshot := append([]llm.Message(nil), m.chatHistory...)
+	sysPrompt := "You are " + brand.Active().AgentName + ", an expert hardware site reliability engineer. Live cluster context:\n" + m.clusterContext
+	adapter := m.llm
 
 	return func() tea.Msg {
-		ch, err := llm.StreamChat(ctx, sysPrompt, historySnapshot)
+		ch, err := adapter.StreamChat(ctx, sysPrompt, historySnapshot)
 		if err != nil {
 			return streamErrMsg{err}
 		}
@@ -151,8 +155,9 @@ func waitForToken(ch <-chan string) tea.Cmd {
 }
 
 func (m AgentModel) View() string {
+	name := brand.Active().AgentName
 	if m.quitting {
-		return "PigeonCare+ session terminated.\n"
+		return name + " session terminated.\n"
 	}
 
 	var sb strings.Builder
@@ -166,7 +171,7 @@ func (m AgentModel) View() string {
 	if m.waiting {
 		sb.WriteString("\n" + waitStyle.Render("Streaming response... (press Esc to cancel)"))
 	} else {
-		sb.WriteString("\n" + promptStyle.Render("Ask PigeonCare+ > ") + m.userInput)
+		sb.WriteString("\n" + promptStyle.Render("Ask "+name+" > ") + m.userInput)
 	}
 
 	return sb.String()

@@ -4,7 +4,11 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
+
+	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
 )
 
 const (
@@ -14,16 +18,101 @@ const (
 	DefaultTelemetryWildcard = "pigeons/ctd/#"
 	// RegistryWildcard subscribes to LWT / presence state changes across all nodes.
 	RegistryWildcard = "pigeons/registry/+/status"
+	// HelloWildcard subscribes to boot metadata & tag announcements across all nodes.
+	HelloWildcard = "pigeons/registry/+/hello"
+	// DefaultRunnerRequestTopic is the Coop control-plane ingress topic for RunnerRequestCTD.
+	DefaultRunnerRequestTopic = "pigeons/requests/runner"
 )
 
 // RegistryTopic returns the MQTT presence/LWT topic for a given edge node.
 func RegistryTopic(nodeID string) string {
-	return fmt.Sprintf("pigeons/registry/%s/status", nodeID)
+	return brand.Active().RegistryTopic(nodeID)
+}
+
+// HelloTopic returns the MQTT metadata & boot-tag announcement topic for a given node.
+func HelloTopic(nodeID string) string {
+	return brand.Active().HelloTopic(nodeID)
 }
 
 // ControlTopic returns the MQTT runner control dispatch topic for a given edge node.
 func ControlTopic(nodeID string) string {
-	return fmt.Sprintf("pigeons/control/%s", nodeID)
+	return brand.Active().ControlTopic(nodeID)
+}
+
+// RunnerRequestTopic returns the MQTT topic where CLI/Agent clients submit RunnerRequestCTD payloads to Coop.
+func RunnerRequestTopic() string {
+	return brand.Active().RunnerRequestTopic()
+}
+
+// NormalizeTags trims, lowercases, deduplicates, and sorts a tag slice deterministically.
+func NormalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, raw := range tags {
+		t := strings.ToLower(strings.TrimSpace(raw))
+		if t == "" {
+			continue
+		}
+		if _, exists := seen[t]; !exists {
+			seen[t] = struct{}{}
+			out = append(out, t)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// NodeHello announces node hardware capabilities and config-defined boot tags upon connection.
+type NodeHello struct {
+	NodeID    string            `json:"node_id"`
+	Arch      string            `json:"arch"`
+	OS        string            `json:"os"`
+	NumCPU    int               `json:"num_cpu"`
+	BootTags  []string          `json:"boot_tags"`
+	Meta      map[string]string `json:"meta,omitempty"`
+	Timestamp time.Time         `json:"timestamp"`
+}
+
+// RunnerSelector scopes which nodes in the mesh should execute or abort a RunnerRequestCTD.
+type RunnerSelector struct {
+	All   bool     `json:"all,omitempty"`
+	Nodes []string `json:"nodes,omitempty"`
+	Tags  []string `json:"tags,omitempty"`
+}
+
+func (s RunnerSelector) IsEmpty() bool {
+	return !s.All && len(s.Nodes) == 0 && len(s.Tags) == 0
+}
+
+// RunnerRequestCTD is submitted by Pigeons CLI/TUI or PigeonCare to PigeonCoop
+// to resolve node/tag targets, record lineage, and fan out runner execution.
+type RunnerRequestCTD struct {
+	RequestID   string         `json:"request_id"`
+	Action      string         `json:"action"` // "start" or "abort"
+	Runner      string         `json:"runner"`
+	Selectors   RunnerSelector `json:"selectors"`
+	Params      map[string]any `json:"params,omitempty"`
+	RequestedBy string         `json:"requested_by,omitempty"`
+	RequestedAt time.Time      `json:"requested_at"`
+}
+
+func (r RunnerRequestCTD) Validate() error {
+	if strings.TrimSpace(r.RequestID) == "" {
+		return fmt.Errorf("missing request_id")
+	}
+	if strings.TrimSpace(r.Runner) == "" {
+		return fmt.Errorf("missing runner name")
+	}
+	if r.Action != "" && r.Action != "start" && r.Action != "abort" {
+		return fmt.Errorf("invalid runner request action: %s", r.Action)
+	}
+	if r.Selectors.IsEmpty() {
+		return fmt.Errorf("runner request requires at least one selector (--all, --node, or --tag)")
+	}
+	return nil
 }
 
 // Pillar defines the core SDK primitive type emitting the event.
@@ -35,10 +124,10 @@ const (
 	PillarTracer   Pillar = "tracer"
 )
 
-// Artifact represents any tangible Noun (hardware node, dataset, binary blob, script) in the DAG.
+// Artifact represents any tangible Noun (hardware node, dataset, binary blob, script, PMV) in the DAG.
 type Artifact struct {
 	ID        string            `json:"id"`
-	Kind      string            `json:"kind"` // e.g., "node", "dataset", "process", "model"
+	Kind      string            `json:"kind"` // e.g., "node", "dataset", "ephemeral_runner", "pmv"
 	NodeID    string            `json:"node_id,omitempty"`
 	Meta      map[string]string `json:"meta,omitempty"`
 	CreatedAt time.Time         `json:"created_at"`
@@ -47,7 +136,7 @@ type Artifact struct {
 // TraceEdge represents a directed Verb connecting two Artifacts across time.
 type TraceEdge struct {
 	SourceID  string            `json:"source_id"`
-	Verb      string            `json:"verb"` // e.g., "calibrated_with", "stacked_into", "connected_to"
+	Verb      string            `json:"verb"` // e.g., "dispatched_to", "certified_as", "transformed_into"
 	TargetID  string            `json:"target_id"`
 	NodeID    string            `json:"node_id,omitempty"`
 	RunID     string            `json:"run_id,omitempty"`
@@ -132,7 +221,7 @@ func (c *CTDPayload) UpdateStatus(status string) *CTDPayload {
 
 func (c *CTDPayload) RoutingTopic(prefix string) string {
 	if prefix == "" {
-		prefix = DefaultTopicPrefix
+		prefix = brand.Active().CTDPrefix()
 	}
 	pillar := c.Pillar
 	if pillar == "" {

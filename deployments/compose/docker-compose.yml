@@ -1,28 +1,35 @@
 services:
-  mqtt-broker:
-    image: eclipse-mosquitto:2
-    container_name: pigeon-broker
-    ports:
-      - "1883:1883"
-      - "9001:9001"
-    volumes:
-      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-    restart: unless-stopped
-
   postgres-ledger:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: pigeon-db
+    command: ["postgres", "-c", "log_statement=ddl", "-c", "log_connections=on"]
     environment:
-      POSTGRES_USER: pigeonuser
+      POSTGRES_USER: drewv
       POSTGRES_PASSWORD: ctd_password
       POSTGRES_DB: edge_ledger
     ports:
       - "5432:5432"
     volumes:
       - pigeon_db_data:/var/lib/postgresql/data
-      # Postgres automatically runs any .sql file in this folder on first boot
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     restart: unless-stopped
+    networks:
+      - pigeon-net
+
+  # Optional external MQTT broker (PigeonCoop embeds a pure-Go MQTT broker by default;
+  # start with `--profile external-mqtt` if offloading to standalone Mosquitto).
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: pigeon-broker
+    profiles: ["external-mqtt"]
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+    networks:
+      - pigeon-net
 
   ntfy:
     image: binwiederhier/ntfy:latest
@@ -31,27 +38,18 @@ services:
     ports:
       - "2586:80"
     environment:
-      # Sets the base URL for the web app and notifications
       - NTFY_BASE_URL=http://localhost:2586
-
-      # SQLite cache file for persisting messages across container restarts
       - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
-
-      # (Optional) Required to wake up iOS devices via Apple Push Notification service
-      # while keeping your server strictly inside your local network.
       - NTFY_UPSTREAM_BASE_URL=https://ntfy.sh
-
-      # (Optional) Disable web UI if you strictly want API access
-      # - NTFY_WEB_ROOT=disable
     volumes:
       - ./data/ntfy:/var/cache/ntfy
     restart: unless-stopped
     networks:
-      - pigeon-net # Ensure it shares a network with PigeonCoop
+      - pigeon-net
 
 networks:
   pigeon-net:
     driver: bridge
 
 volumes:
-  pigeon_db_data: # Persists data so you don't lose the ledger if the container restarts
+  pigeon_db_data:

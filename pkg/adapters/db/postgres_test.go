@@ -26,6 +26,53 @@ func TestValidateViewIdentifier(t *testing.T) {
 	}
 }
 
+func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
+	got, err := NormalizePMVName("thermal_rollup")
+	if err != nil || got != "pmv_thermal_rollup" {
+		t.Fatalf("expected pmv_thermal_rollup, got %q (err=%v)", got, err)
+	}
+	got, err = NormalizePMVName("pigeonmath.PMV_Node_Health")
+	if err != nil || got != "pmv_node_health" {
+		t.Fatalf("expected pmv_node_health, got %q (err=%v)", got, err)
+	}
+	if _, err := NormalizePMVName("bad-name!"); err == nil {
+		t.Fatal("expected invalid PMV name to fail")
+	}
+
+	validQueries := []string{
+		"SELECT node_id, created_at, updated_at FROM ctd_nodes;",
+		"WITH recent AS (SELECT node_id, metrics FROM telemetric_ledger) SELECT * FROM recent",
+	}
+	for _, q := range validQueries {
+		if _, err := ValidateSelectOnlySQL(q); err != nil {
+			t.Fatalf("expected query %q to pass validation, got %v", q, err)
+		}
+	}
+
+	blockedQueries := []string{
+		"",
+		"DELETE FROM telemetric_ledger",
+		"SELECT 1; DROP TABLE telemetric_ledger",
+		"WITH evil AS (DELETE FROM telemetric_ledger RETURNING *) SELECT * FROM evil",
+		"UPDATE ctd_nodes SET status = 'OFFLINE'",
+	}
+	for _, q := range blockedQueries {
+		if _, err := ValidateSelectOnlySQL(q); err == nil {
+			t.Fatalf("expected mutating query %q to be rejected", q)
+		}
+	}
+}
+
+func TestReadOnlyAgentStoreExposesNoWriteCapability(t *testing.T) {
+	var safe any = (*ReadOnlyAgentStore)(nil)
+	if _, ok := safe.(AgentSafeDB); !ok {
+		t.Fatal("ReadOnlyAgentStore must implement AgentSafeDB")
+	}
+	if _, ok := safe.(BaseDB); ok {
+		t.Fatal("ReadOnlyAgentStore MUST NOT implement BaseDB write interface")
+	}
+}
+
 func TestMarshalObjectOrEmpty(t *testing.T) {
 	var nilMap map[string]string
 	raw, err := marshalObjectOrEmpty(nilMap)

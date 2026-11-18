@@ -1,0 +1,214 @@
+package mcpserver
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/drewv-labs/carrier-pigeons/internal/pigeonmath"
+	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+)
+
+// Options configures a whitelabelable PigeonMCP server instance.
+// SECURITY INVARIANT: Store is typed as `db.AgentSafeDB`, guaranteeing strictly Read-Only access
+// to the public CTD Ledger for Zed, Google Antigravity, Claude Code/Desktop, and custom harnesses.
+type Options struct {
+	Store     db.AgentSafeDB
+	Brand     brand.Spec
+	Optimizer llm.BaseLLM
+	Version   string
+}
+
+// New constructs a configured `*server.MCPServer` ready for `ServeStdio` or `NewStreamableHTTPServer`.
+func New(opts Options) *server.MCPServer {
+	bSpec := opts.Brand.MergeWithDefaults()
+	version := strings.TrimSpace(opts.Version)
+	if version == "" {
+		version = "0.2.0"
+	}
+	mathEngine := pigeonmath.NewEngine(opts.Store)
+
+	s := server.NewMCPServer(
+		bSpec.MCPName+" ("+bSpec.ProductName+" CTD Telemetry)",
+		version,
+		server.WithToolCapabilities(false),
+		server.WithRecovery(),
+	)
+
+	// 1. get_cluster_status
+	clusterTool := mcp.NewTool("get_cluster_status",
+		mcp.WithDescription("List all registered mesh nodes with hardware architecture, tags, liveness, and latest metrics."),
+	)
+	s.AddTool(clusterTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		summaries, err := opts.Store.GetClusterStatus(ctx, 90*time.Second)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Database error: %v", err)), nil
+		}
+		raw, _ := json.MarshalIndent(summaries, "", "  ")
+		return mcp.NewToolResultText(string(raw)), nil
+	})
+
+	// 2. get_node_telemetry
+	telemetryTool := mcp.NewTool("get_node_telemetry",
+		mcp.WithDescription("Fetch the latest CTD telemetry events for a specific node."),
+		mcp.WithString("node_id", mcp.Required(), mcp.Description("Hardware node ID (e.g., rv64-coop-01, rv64-compute-01, arm64-gateway-01)")),
+	)
+	s.AddTool(telemetryTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeID, err := req.RequireString("node_id")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid node_id: %v", err)), nil
+		}
+		rows, err := opts.Store.QueryReadOnlyMaps(ctx, `
+			SELECT pillar, component, status, metrics, event_timestamp
+			FROM telemetric_ledger
+			WHERE node_id = $1
+			ORDER BY event_timestamp DESC
+			LIMIT 15
+		`, nodeID)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Database error: %v", err)), nil
+		}
+		if len(rows) == 0 {
+			return mcp.NewToolResultText("No telemetry found for " + nodeID), nil
+		}
+		var sb strings.Builder
+		for _, r := range rows {
+			tsStr := fmt.Sprint(r["event_timestamp"])
+			if ts, ok := r["event_timestamp"].(time.Time); ok {
+				tsStr = ts.UTC().Format(time.RFC3339)
+			}
+			metricsJSON, _ := json.Marshal(r["metrics"])
+			fmt.Fprintf(&sb, "[%s] (%v) %v [%v]: %s\n", tsStr, r["pillar"], r["component"], r["status"], string(metricsJSON))
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	})
+
+	// 3. check_offline_nodes
+	offlineTool := mcp.NewTool("check_offline_nodes",
+		mcp.WithDescription("Identify any nodes that stopped reporting in the last 60 seconds or entered an unhealthy state."),
+	)
+	s.AddTool(offlineTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		summaries, err := opts.Store.GetClusterStatus(ctx, 60*time.Second)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Database error: %v", err)), nil
+		}
+		var sb strings.Builder
+		for _, n := range summaries {
+			if !n.IsHealthy {
+				fmt.Fprintf(&sb, "WARNING %s (arch: %s, tags: %v, status: %s, component: %s, last seen: %s ago)\n",
+					n.NodeID, n.Arch, n.Tags, n.Status, n.Component, time.Since(n.LastSeen).Round(time.Second))
+			}
+		}
+		if sb.Len() == 0 {
+			return mcp.NewToolResultText("All registered nodes are currently online and healthy."), nil
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	})
+
+	// 4. query_ctd_readonly
+	sqlTool := mcp.NewTool("query_ctd_readonly",
+		mcp.WithDescription("Execute a strictly read-only SELECT query against the CTD Ledger or certified pigeonmath.pmv_* views."),
+		mcp.WithString("sql", mcp.Required(), mcp.Description("Single read-only SELECT or WITH ... SELECT statement")),
+	)
+	s.AddTool(sqlTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sqlStr, err := req.RequireString("sql")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid sql: %v", err)), nil
+		}
+		rows, err := opts.Store.QueryReadOnlyMaps(ctx, sqlStr)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Read-only query error: %v", err)), nil
+		}
+		if len(rows) > 100 {
+			rows = rows[:100]
+		}
+		raw, _ := json.MarshalIndent(rows, "", "  ")
+		return mcp.NewToolResultText(string(raw)), nil
+	})
+
+	// 5. get_lineage_dag
+	lineageTool := mcp.NewTool("get_lineage_dag",
+		mcp.WithDescription("Walk upstream and downstream CTD artifact provenance edges from a given artifact ID."),
+		mcp.WithString("artifact_id", mcp.Required(), mcp.Description("Root artifact ID to inspect")),
+	)
+	s.AddTool(lineageTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		artifactID, err := req.RequireString("artifact_id")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid artifact_id: %v", err)), nil
+		}
+		dag, err := opts.Store.GetLineageDAG(ctx, artifactID, 10)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Lineage query error: %v", err)), nil
+		}
+		out, _ := json.MarshalIndent(dag, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	})
+
+	// 6. get_ledger_activity
+	activityTool := mcp.NewTool("get_ledger_activity",
+		mcp.WithDescription("Inspect write/update actor attribution across the CTD Ledger."),
+	)
+	s.AddTool(activityTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		items, err := opts.Store.GetLedgerActivity(ctx, 25)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Activity query error: %v", err)), nil
+		}
+		out, _ := json.MarshalIndent(items, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	})
+
+	// 7. list_pigeonmath_views
+	listViewsTool := mcp.NewTool("list_pigeonmath_views",
+		mcp.WithDescription("List cached and certified analytical views (pigeonmath.pmv_*) including original raw SQL intent."),
+	)
+	s.AddTool(listViewsTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		views, err := mathEngine.ListPMVs(ctx)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("List PMVs error: %v", err)), nil
+		}
+		out, _ := json.MarshalIndent(views, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	})
+
+	// 8. create_pigeonmath_view
+	createViewTool := mcp.NewTool("create_pigeonmath_view",
+		mcp.WithDescription("Cache raw SQL intent, validate read-only safety, and materialize an analytical view inside pigeonmath.pmv_<name>."),
+		mcp.WithString("view_name", mcp.Required(), mcp.Description("Analytical view slug (e.g., cooling_headroom)")),
+		mcp.WithString("sql", mcp.Required(), mcp.Description("Single read-only SELECT query")),
+	)
+	s.AddTool(createViewTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		viewName, err := req.RequireString("view_name")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid view_name: %v", err)), nil
+		}
+		rawSQL, err := req.RequireString("sql")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid sql: %v", err)), nil
+		}
+		rec, err := mathEngine.SubmitAndCertifyPMV(ctx, strings.ToLower(bSpec.MCPName), viewName, rawSQL, opts.Optimizer)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("PMV certification failed: %v", err)), nil
+		}
+		out, _ := json.MarshalIndent(rec, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	})
+
+	return s
+}
+
+// ServeStdio runs the MCP server over standard input/output (compatible with Zed, Antigravity, Claude Desktop/Code).
+func ServeStdio(s *server.MCPServer) error {
+	return server.ServeStdio(s)
+}
+
+// ServeHTTP runs the MCP server over Streamable HTTP at `listenAddr` (e.g., "127.0.0.1:8089").
+func ServeHTTP(s *server.MCPServer, listenAddr string) error {
+	httpSrv := server.NewStreamableHTTPServer(s)
+	return httpSrv.Start(listenAddr)
+}

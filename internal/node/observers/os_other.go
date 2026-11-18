@@ -1,0 +1,32 @@
+//go:build !linux && !darwin && !windows
+
+package observers
+
+import (
+	"context"
+	"log"
+	"runtime"
+	"time"
+
+	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+)
+
+func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	log.Printf("[OS Observer] Generic host observer started for %s.", runtime.GOOS)
+
+	ticker := time.NewTicker(pollInterval(ctx))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			event := core.NewCTDPayload(nodeID, "host-os", "active").
+				AddMetric("num_cpu", runtime.NumCPU())
+			if err := pub.Publish(event); err != nil {
+				log.Printf("[OS Observer] Publish failed: %v", err)
+			}
+		}
+	}
+}

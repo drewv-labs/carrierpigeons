@@ -8,24 +8,22 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
 	"github.com/spf13/cobra"
 )
 
 var nodeCmd = &cobra.Command{
 	Use:   "node [node_id]",
-	Short: "Inspect latest component telemetry for a specific Pigeoneer edge node",
+	Short: "Inspect latest component telemetry and tags for a specific node",
 	Args:  cobra.ExactArgs(1),
-	Run: func(_ *cobra.Command, args []string) {
+	RunE: func(_ *cobra.Command, args []string) error {
 		nodeID := args[0]
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		store, err := db.NewPostgresStore(ctx, db.ResolveDBURL())
+		store, err := openOperatorStore(ctx)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Could not connect to ledger: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("connect CTD Ledger: %w", err)
 		}
 		defer store.Close()
 
@@ -37,13 +35,12 @@ var nodeCmd = &cobra.Command{
 			ORDER BY component, event_timestamp DESC
 		`, nodeID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Failed to query node %q: %v\n", nodeID, err)
-			os.Exit(1)
+			return fmt.Errorf("query node %q: %w", nodeID, err)
 		}
 
 		if len(rows) == 0 {
 			fmt.Printf("No telemetry records found for node %q.\n", nodeID)
-			return
+			return nil
 		}
 
 		fmt.Printf("Node: %s\n\n", nodeID)
@@ -60,7 +57,7 @@ var nodeCmd = &cobra.Command{
 			fmt.Fprintf(w, "%v\t| %v\t| %v\t| %s\t| %s\n",
 				r["component"], r["pillar"], r["status"], tsStr, string(metricsJSON))
 		}
-		_ = w.Flush()
+		return w.Flush()
 	},
 }
 

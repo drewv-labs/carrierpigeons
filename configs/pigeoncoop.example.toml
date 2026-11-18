@@ -1,0 +1,41 @@
+# PigeonCoop Unified Hub Configuration (RISC-V / ARM64 / x86_64)
+# PigeonCoop natively observes its own hardware and executes Runners alongside
+# operating the MQTT broker, batched PostgreSQL COPY ingestor, and Ntfy alerting.
+
+node_id        = "rv64-coop-01"
+tags           = ["coop", "databroker", "riscv64"]
+self_observe   = true
+poll_interval  = "5s"
+spool_capacity = 10000
+
+[mqtt]
+# "embedded" runs an in-process pure-Go MQTT v5/v3.1.1 broker; set "external" for Mosquitto.
+mode   = "embedded"
+listen = "0.0.0.0:1883"
+url    = "tcp://localhost:1883"
+
+[database]
+url       = "postgres://drewv:ctd_password@localhost:5432/edge_ledger"
+max_conns = 24
+min_conns = 2
+
+[ingest]
+queue_size     = 65536
+batch_size     = 2000
+flush_interval = "100ms"
+
+[ntfy]
+enabled = true
+url     = "http://localhost:2586/carrier-pigeons"
+
+[observers]
+os  = true
+net = true
+gpu = true
+npu = true
+
+[runners]
+enabled              = true
+allow_ephemeral      = true
+allowed_interpreters = ["sh", "bash", "python3"]
+max_timeout_sec      = 300

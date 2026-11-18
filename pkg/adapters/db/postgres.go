@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,7 +20,11 @@ import (
 // DefaultPostgresURL is the local development fallback DSN matching deployments/compose.
 const DefaultPostgresURL = "postgres://drewv:ctd_password@localhost:5432/edge_ledger"
 
-var validIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+var (
+	validIdentifier    = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+	validPMVIdentifier = regexp.MustCompile(`^pmv_[a-z0-9_]+$`)
+	forbiddenViewDMLRe = regexp.MustCompile(`(?i)\b(insert|update|delete|drop|alter|truncate|grant|revoke|copy|call|do|create|execute)\b`)
+)
 
 var _ BaseDB = (*PostgresStore)(nil)
 
@@ -32,12 +38,78 @@ func ResolveDBURL() string {
 	return DefaultPostgresURL
 }
 
+// ResolveReadOnlyDBURL resolves the dedicated read-only DSN for PigeonCare/PigeonMCP, falling back to ResolveDBURL.
+func ResolveReadOnlyDBURL() string {
+	for _, key := range []string{"PIGEONCARE_DB_URL", "PIGEONS_RO_DB_URL", "PIGEONMCP_DB_URL"} {
+		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+			return val
+		}
+	}
+	return ResolveDBURL()
+}
+
+// NormalizePMVName ensures any user/agent view name conforms to `pmv_<lowercase_slug>`.
+func NormalizePMVName(raw string) (string, error) {
+	name := strings.ToLower(strings.TrimSpace(raw))
+	if idx := strings.LastIndexByte(name, '.'); idx >= 0 {
+		name = name[idx+1:]
+	}
+	if name == "" {
+		return "", fmt.Errorf("empty PigeonMath view name")
+	}
+	if !strings.HasPrefix(name, "pmv_") {
+		name = "pmv_" + name
+	}
+	if !validPMVIdentifier.MatchString(name) {
+		return "", fmt.Errorf("invalid PigeonMath view name %q (must match ^pmv_[a-z0-9_]+$)", name)
+	}
+	return name, nil
+}
+
+// ValidateSelectOnlySQL enforces single-statement read-only SELECT/WITH syntax before view creation.
+func ValidateSelectOnlySQL(rawSQL string) (string, error) {
+	cleaned := strings.TrimSpace(rawSQL)
+	cleaned = strings.TrimSuffix(cleaned, ";")
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" {
+		return "", fmt.Errorf("SQL query cannot be empty")
+	}
+	if strings.Contains(cleaned, ";") {
+		return "", fmt.Errorf("multi-statement SQL is forbidden")
+	}
+	lower := strings.ToLower(cleaned)
+	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
+		return "", fmt.Errorf("SQL must start with SELECT or WITH")
+	}
+	if match := forbiddenViewDMLRe.FindString(cleaned); match != "" {
+		return "", fmt.Errorf("forbidden mutating or DDL keyword %q in analytical query", match)
+	}
+	return cleaned, nil
+}
+
+// StoreOptions customizes connection pool sizing and actor attribution metadata.
+type StoreOptions struct {
+	AppActor string
+	MaxConns int32
+	MinConns int32
+}
+
 type PostgresStore struct {
-	pool *pgxpool.Pool
+	pool       *pgxpool.Pool
+	mathSchema string
 }
 
 // NewPostgresStore initializes a connection pool to the PostgreSQL CTD Ledger.
 func NewPostgresStore(ctx context.Context, connStr string) (*PostgresStore, error) {
+	return NewPostgresStoreWithOptions(ctx, connStr, StoreOptions{
+		AppActor: "carrierpigeons",
+		MaxConns: 16,
+		MinConns: 2,
+	})
+}
+
+// NewPostgresStoreWithOptions initializes a connection pool stamped with `application_name` for ledger attribution.
+func NewPostgresStoreWithOptions(ctx context.Context, connStr string, opts StoreOptions) (*PostgresStore, error) {
 	if strings.TrimSpace(connStr) == "" {
 		connStr = ResolveDBURL()
 	}
@@ -46,8 +118,24 @@ func NewPostgresStore(ctx context.Context, connStr string) (*PostgresStore, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse pgx config: %w", err)
 	}
-	cfg.MaxConns = 16
-	cfg.MinConns = 2
+	if opts.MaxConns > 0 {
+		cfg.MaxConns = opts.MaxConns
+	} else {
+		cfg.MaxConns = 16
+	}
+	if opts.MinConns > 0 {
+		cfg.MinConns = opts.MinConns
+	} else {
+		cfg.MinConns = 2
+	}
+	if strings.TrimSpace(opts.AppActor) != "" {
+		if cfg.ConnConfig.RuntimeParams == nil {
+			cfg.ConnConfig.RuntimeParams = make(map[string]string)
+		}
+		if _, exists := cfg.ConnConfig.RuntimeParams["application_name"]; !exists {
+			cfg.ConnConfig.RuntimeParams["application_name"] = strings.TrimSpace(opts.AppActor)
+		}
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -59,7 +147,12 @@ func NewPostgresStore(ctx context.Context, connStr string) (*PostgresStore, erro
 		return nil, fmt.Errorf("postgres ping failed: %w", err)
 	}
 
-	return &PostgresStore{pool: pool}, nil
+	schema := brand.Active().MathSchema
+	if !validIdentifier.MatchString(schema) {
+		schema = "pigeonmath"
+	}
+
+	return &PostgresStore{pool: pool, mathSchema: schema}, nil
 }
 
 // Pool exposes the underlying pgxpool.Pool for advanced callers.
@@ -73,7 +166,7 @@ func (s *PostgresStore) Close() {
 	}
 }
 
-// EnsureSchema migrates the 3 core CTD tables (Ledger, Artifacts, Traces) and GIN indexes.
+// EnsureSchema migrates the core CTD Ledger tables, Node/Tag Registry, attribution columns, and PigeonMath schema.
 func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	ddl := `
 	CREATE TABLE IF NOT EXISTS telemetric_ledger (
@@ -84,12 +177,36 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		status TEXT NOT NULL,
 		event_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
-		params JSONB NOT NULL DEFAULT '{}'::jsonb
+		params JSONB NOT NULL DEFAULT '{}'::jsonb,
+		ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		db_actor TEXT NOT NULL DEFAULT SESSION_USER,
+		app_actor TEXT NOT NULL DEFAULT COALESCE(NULLIF(current_setting('application_name', true), ''), 'unknown')
 	);
+
+	ALTER TABLE telemetric_ledger ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+	ALTER TABLE telemetric_ledger ADD COLUMN IF NOT EXISTS db_actor TEXT NOT NULL DEFAULT SESSION_USER;
+	ALTER TABLE telemetric_ledger ADD COLUMN IF NOT EXISTS app_actor TEXT NOT NULL DEFAULT COALESCE(NULLIF(current_setting('application_name', true), ''), 'unknown');
 
 	CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_pillar ON telemetric_ledger (pillar);
+	CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_metrics_gin ON telemetric_ledger USING GIN (metrics);
+
+	CREATE TABLE IF NOT EXISTS ctd_nodes (
+		node_id TEXT PRIMARY KEY,
+		arch TEXT NOT NULL DEFAULT '',
+		os TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'ONLINE',
+		boot_tags TEXT[] NOT NULL DEFAULT '{}',
+		operator_tags TEXT[] NOT NULL DEFAULT '{}',
+		tags TEXT[] NOT NULL DEFAULT '{}',
+		last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_by TEXT NOT NULL DEFAULT SESSION_USER,
+		meta JSONB NOT NULL DEFAULT '{}'::jsonb
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_ctd_nodes_tags_gin ON ctd_nodes USING GIN (tags);
 
 	CREATE TABLE IF NOT EXISTS ctd_artifacts (
 		id TEXT PRIMARY KEY,
@@ -97,9 +214,11 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		node_id TEXT,
 		meta JSONB NOT NULL DEFAULT '{}'::jsonb,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_by TEXT NOT NULL DEFAULT SESSION_USER
 	);
 
+	ALTER TABLE ctd_artifacts ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT SESSION_USER;
 	CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON ctd_artifacts (kind);
 
 	CREATE TABLE IF NOT EXISTS ctd_traces (
@@ -110,13 +229,87 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		node_id TEXT,
 		run_id TEXT,
 		meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-		event_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		event_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		db_actor TEXT NOT NULL DEFAULT SESSION_USER
 	);
 
+	ALTER TABLE ctd_traces ADD COLUMN IF NOT EXISTS db_actor TEXT NOT NULL DEFAULT SESSION_USER;
 	CREATE INDEX IF NOT EXISTS idx_traces_source ON ctd_traces (source_id);
 	CREATE INDEX IF NOT EXISTS idx_traces_target ON ctd_traces (target_id);
 	`
+	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+		return err
+	}
+	return s.EnsureMathSchema(ctx)
+}
+
+// EnsureMathSchema creates the isolated `pigeonmath` analytical schema and `pmv_catalog` intent cache.
+func (s *PostgresStore) EnsureMathSchema(ctx context.Context) error {
+	if !validIdentifier.MatchString(s.mathSchema) {
+		return fmt.Errorf("invalid math schema identifier: %s", s.mathSchema)
+	}
+	ddl := fmt.Sprintf(`
+	CREATE SCHEMA IF NOT EXISTS %[1]s;
+
+	CREATE TABLE IF NOT EXISTS %[1]s.pmv_catalog (
+		view_name TEXT PRIMARY KEY CHECK (view_name ~ '^pmv_[a-z0-9_]+$'),
+		submitted_by TEXT NOT NULL DEFAULT SESSION_USER,
+		raw_intent_sql TEXT NOT NULL,
+		optimized_sql TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'draft',
+		version INT NOT NULL DEFAULT 1,
+		agent_notes TEXT NOT NULL DEFAULT '',
+		validation_report JSONB NOT NULL DEFAULT '{}'::jsonb,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	`, s.mathSchema)
 	_, err := s.pool.Exec(ctx, ddl)
+	return err
+}
+
+// ProvisionRoles idempotently configures least-privilege PostgreSQL roles:
+// - `ctd_ingestor`: Write/COPY access for PigeonCoop ingestion.
+// - `pigeoncare_ro`: Strictly Read-Only on `public.*` + isolated view creation in `pigeonmath`.
+func (s *PostgresStore) ProvisionRoles(ctx context.Context, ingestPassword, readOnlyPassword string) error {
+	if ingestPassword == "" {
+		ingestPassword = "ctd_ingest_password"
+	}
+	if readOnlyPassword == "" {
+		readOnlyPassword = "pigeoncare_readonly"
+	}
+	escapeLit := func(v string) string {
+		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	}
+
+	sql := fmt.Sprintf(`
+	DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ctd_ingestor') THEN
+			EXECUTE 'CREATE ROLE ctd_ingestor LOGIN PASSWORD ' || %[1]s;
+		END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pigeoncare_ro') THEN
+			EXECUTE 'CREATE ROLE pigeoncare_ro LOGIN PASSWORD ' || %[2]s;
+		END IF;
+	END
+	$$;
+
+	GRANT USAGE ON SCHEMA public TO ctd_ingestor;
+	GRANT SELECT, INSERT ON telemetric_ledger, ctd_traces TO ctd_ingestor;
+	GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts TO ctd_ingestor;
+	GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ctd_ingestor;
+
+	REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM pigeoncare_ro;
+	REVOKE CREATE ON SCHEMA public FROM pigeoncare_ro;
+	GRANT USAGE ON SCHEMA public TO pigeoncare_ro;
+	GRANT SELECT ON ALL TABLES IN SCHEMA public TO pigeoncare_ro;
+	ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO pigeoncare_ro;
+
+	GRANT USAGE, CREATE ON SCHEMA %[3]s TO pigeoncare_ro;
+	GRANT SELECT, INSERT, UPDATE ON %[3]s.pmv_catalog TO pigeoncare_ro;
+	`, escapeLit(ingestPassword), escapeLit(readOnlyPassword), s.mathSchema)
+
+	_, err := s.pool.Exec(ctx, sql)
 	return err
 }
 
@@ -127,7 +320,7 @@ func marshalObjectOrEmpty[K comparable, V any](m map[K]V) ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// InsertEvent writes the CTD envelope and automatically shreds embedded Artifacts/Traces.
+// InsertEvent writes a single CTD envelope and shreds embedded Artifacts/Traces.
 func (s *PostgresStore) InsertEvent(ctx context.Context, p *core.CTDPayload) error {
 	if p == nil {
 		return fmt.Errorf("cannot insert nil CTDPayload")
@@ -164,48 +357,209 @@ func (s *PostgresStore) InsertEvent(ctx context.Context, p *core.CTDPayload) err
 		return fmt.Errorf("insert telemetric_ledger: %w", err)
 	}
 
-	if p.Artifact != nil {
-		metaJSON, err := marshalObjectOrEmpty(p.Artifact.Meta)
-		if err != nil {
-			return fmt.Errorf("marshal artifact meta: %w", err)
-		}
-		createdAt := p.Artifact.CreatedAt
-		if createdAt.IsZero() {
-			createdAt = ts
-		}
-		_, err = tx.Exec(ctx, `
-			INSERT INTO ctd_artifacts (id, kind, node_id, meta, created_at, updated_at)
-			VALUES ($1, $2, NULLIF($3, ''), $4, $5, NOW())
-			ON CONFLICT (id) DO UPDATE SET
-				kind = EXCLUDED.kind,
-				node_id = COALESCE(EXCLUDED.node_id, ctd_artifacts.node_id),
-				meta = ctd_artifacts.meta || EXCLUDED.meta,
-				updated_at = NOW()
-		`, p.Artifact.ID, p.Artifact.Kind, p.Artifact.NodeID, metaJSON, createdAt)
-		if err != nil {
-			return fmt.Errorf("upsert artifact: %w", err)
-		}
+	if err := s.upsertArtifactTx(ctx, tx, p.Artifact, ts); err != nil {
+		return err
 	}
-
-	if p.Trace != nil {
-		traceMetaJSON, err := marshalObjectOrEmpty(p.Trace.Meta)
-		if err != nil {
-			return fmt.Errorf("marshal trace meta: %w", err)
-		}
-		traceTS := p.Trace.Timestamp
-		if traceTS.IsZero() {
-			traceTS = ts
-		}
-		_, err = tx.Exec(ctx, `
-			INSERT INTO ctd_traces (source_id, verb, target_id, node_id, run_id, meta, event_timestamp)
-			VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6, $7)
-		`, p.Trace.SourceID, p.Trace.Verb, p.Trace.TargetID, p.Trace.NodeID, p.Trace.RunID, traceMetaJSON, traceTS)
-		if err != nil {
-			return fmt.Errorf("insert trace: %w", err)
-		}
+	if err := s.insertTraceTx(ctx, tx, p.Trace, ts); err != nil {
+		return err
 	}
 
 	return tx.Commit(ctx)
+}
+
+// BatchInsertEvents streams wide events into `telemetric_ledger` using PostgreSQL's binary
+// `COPY FROM STDIN` protocol (`pgx.CopyFrom`) and flushes any attached Artifacts/Traces in the same transaction.
+// If binary COPY fails due to a malformed payload, it automatically falls back to row-by-row isolation.
+func (s *PostgresStore) BatchInsertEvents(ctx context.Context, payloads []*core.CTDPayload) (int64, error) {
+	if len(payloads) == 0 {
+		return 0, nil
+	}
+	if len(payloads) == 1 {
+		if err := s.InsertEvent(ctx, payloads[0]); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+
+	now := time.Now().UTC()
+	copyRows := make([][]any, 0, len(payloads))
+	nodeLastSeen := make(map[string]time.Time, 16)
+	var artifacts []*core.Artifact
+	var traces []*core.TraceEdge
+
+	for _, p := range payloads {
+		if p == nil || strings.TrimSpace(p.NodeID) == "" {
+			continue
+		}
+		pillar := p.Pillar
+		if pillar == "" {
+			pillar = core.PillarObserver
+		}
+		ts := p.EventTimestamp
+		if ts.IsZero() {
+			ts = now
+		}
+		metricsJSON, err := marshalObjectOrEmpty(p.Metrics)
+		if err != nil {
+			continue
+		}
+		paramsJSON, err := marshalObjectOrEmpty(p.Params)
+		if err != nil {
+			continue
+		}
+
+		copyRows = append(copyRows, []any{
+			p.NodeID,
+			string(pillar),
+			p.Component,
+			p.Status,
+			ts,
+			metricsJSON,
+			paramsJSON,
+		})
+
+		if prev, ok := nodeLastSeen[p.NodeID]; !ok || ts.After(prev) {
+			nodeLastSeen[p.NodeID] = ts
+		}
+		if p.Artifact != nil {
+			a := *p.Artifact
+			if a.CreatedAt.IsZero() {
+				a.CreatedAt = ts
+			}
+			artifacts = append(artifacts, &a)
+		}
+		if p.Trace != nil {
+			t := *p.Trace
+			if t.Timestamp.IsZero() {
+				t.Timestamp = ts
+			}
+			traces = append(traces, &t)
+		}
+	}
+
+	if len(copyRows) == 0 {
+		return 0, nil
+	}
+
+	copied, err := s.execCopyBatch(ctx, copyRows, nodeLastSeen, artifacts, traces)
+	if err == nil {
+		return copied, nil
+	}
+
+	// Fallback: isolate any poison pill row individually so healthy telemetry is never lost.
+	var fallbackCount int64
+	var lastErr error
+	for _, p := range payloads {
+		if p == nil {
+			continue
+		}
+		if err := s.InsertEvent(ctx, p); err != nil {
+			lastErr = err
+		} else {
+			fallbackCount++
+		}
+	}
+	return fallbackCount, lastErr
+}
+
+func (s *PostgresStore) execCopyBatch(
+	ctx context.Context,
+	copyRows [][]any,
+	nodeLastSeen map[string]time.Time,
+	artifacts []*core.Artifact,
+	traces []*core.TraceEdge,
+) (int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	copied, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"telemetric_ledger"},
+		[]string{"node_id", "pillar", "component", "status", "event_timestamp", "metrics", "params"},
+		pgx.CopyFromRows(copyRows),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("copy telemetric_ledger: %w", err)
+	}
+
+	for nodeID, ts := range nodeLastSeen {
+		_, _ = tx.Exec(ctx, `
+			INSERT INTO ctd_nodes (node_id, status, last_seen, updated_at, updated_by)
+			VALUES ($1, 'ONLINE', $2, NOW(), SESSION_USER)
+			ON CONFLICT (node_id) DO UPDATE SET
+				last_seen = GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen),
+				updated_at = NOW()
+		`, nodeID, ts)
+	}
+
+	for _, a := range artifacts {
+		if err := s.upsertArtifactTx(ctx, tx, a, a.CreatedAt); err != nil {
+			return 0, err
+		}
+	}
+	for _, t := range traces {
+		if err := s.insertTraceTx(ctx, tx, t, t.Timestamp); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return copied, nil
+}
+
+func (s *PostgresStore) upsertArtifactTx(ctx context.Context, tx pgx.Tx, a *core.Artifact, fallbackTS time.Time) error {
+	if a == nil {
+		return nil
+	}
+	metaJSON, err := marshalObjectOrEmpty(a.Meta)
+	if err != nil {
+		return fmt.Errorf("marshal artifact meta: %w", err)
+	}
+	createdAt := a.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = fallbackTS
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO ctd_artifacts (id, kind, node_id, meta, created_at, updated_at, updated_by)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5, NOW(), SESSION_USER)
+		ON CONFLICT (id) DO UPDATE SET
+			kind = EXCLUDED.kind,
+			node_id = COALESCE(EXCLUDED.node_id, ctd_artifacts.node_id),
+			meta = ctd_artifacts.meta || EXCLUDED.meta,
+			updated_at = NOW(),
+			updated_by = SESSION_USER
+	`, a.ID, a.Kind, a.NodeID, metaJSON, createdAt)
+	if err != nil {
+		return fmt.Errorf("upsert artifact: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) insertTraceTx(ctx context.Context, tx pgx.Tx, t *core.TraceEdge, fallbackTS time.Time) error {
+	if t == nil {
+		return nil
+	}
+	traceMetaJSON, err := marshalObjectOrEmpty(t.Meta)
+	if err != nil {
+		return fmt.Errorf("marshal trace meta: %w", err)
+	}
+	traceTS := t.Timestamp
+	if traceTS.IsZero() {
+		traceTS = fallbackTS
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO ctd_traces (source_id, verb, target_id, node_id, run_id, meta, event_timestamp)
+		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6, $7)
+	`, t.SourceID, t.Verb, t.TargetID, t.NodeID, t.RunID, traceMetaJSON, traceTS)
+	if err != nil {
+		return fmt.Errorf("insert trace: %w", err)
+	}
+	return nil
 }
 
 func (s *PostgresStore) UpsertArtifact(ctx context.Context, a core.Artifact) error {
@@ -217,13 +571,14 @@ func (s *PostgresStore) UpsertArtifact(ctx context.Context, a core.Artifact) err
 		return fmt.Errorf("marshal artifact meta: %w", err)
 	}
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO ctd_artifacts (id, kind, node_id, meta, created_at, updated_at)
-		VALUES ($1, $2, NULLIF($3, ''), $4, $5, NOW())
+		INSERT INTO ctd_artifacts (id, kind, node_id, meta, created_at, updated_at, updated_by)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5, NOW(), SESSION_USER)
 		ON CONFLICT (id) DO UPDATE SET
 			kind = EXCLUDED.kind,
 			node_id = COALESCE(EXCLUDED.node_id, ctd_artifacts.node_id),
 			meta = ctd_artifacts.meta || EXCLUDED.meta,
-			updated_at = NOW()
+			updated_at = NOW(),
+			updated_by = SESSION_USER
 	`, a.ID, a.Kind, a.NodeID, metaJSON, a.CreatedAt)
 	return err
 }
@@ -243,6 +598,181 @@ func (s *PostgresStore) InsertTrace(ctx context.Context, t core.TraceEdge) error
 	return err
 }
 
+// UpsertNodeHello registers a connecting node's hardware metadata & boot tags while preserving operator tags.
+func (s *PostgresStore) UpsertNodeHello(ctx context.Context, h core.NodeHello) ([]string, error) {
+	bootTags := core.NormalizeTags(h.BootTags)
+	metaJSON, err := marshalObjectOrEmpty(h.Meta)
+	if err != nil {
+		return nil, err
+	}
+	ts := h.Timestamp
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+
+	var merged []string
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO ctd_nodes (node_id, arch, os, status, boot_tags, operator_tags, tags, last_seen, updated_at, updated_by, meta)
+		VALUES ($1, $2, $3, 'ONLINE', $4, '{}', $4, $5, NOW(), SESSION_USER, $6)
+		ON CONFLICT (node_id) DO UPDATE SET
+			arch = CASE WHEN EXCLUDED.arch <> '' THEN EXCLUDED.arch ELSE ctd_nodes.arch END,
+			os = CASE WHEN EXCLUDED.os <> '' THEN EXCLUDED.os ELSE ctd_nodes.os END,
+			status = 'ONLINE',
+			boot_tags = EXCLUDED.boot_tags,
+			tags = ARRAY(
+				SELECT DISTINCT unnest(EXCLUDED.boot_tags || ctd_nodes.operator_tags) ORDER BY 1
+			),
+			last_seen = GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen),
+			updated_at = NOW(),
+			updated_by = SESSION_USER,
+			meta = ctd_nodes.meta || EXCLUDED.meta
+		RETURNING tags
+	`, h.NodeID, h.Arch, h.OS, bootTags, ts, metaJSON).Scan(&merged)
+	return merged, err
+}
+
+// UpdateNodePresence updates a node's LWT status (`ONLINE` / `OFFLINE`) in `ctd_nodes`.
+func (s *PostgresStore) UpdateNodePresence(ctx context.Context, nodeID, status string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO ctd_nodes (node_id, status, last_seen, updated_at, updated_by)
+		VALUES ($1, $2, NOW(), NOW(), SESSION_USER)
+		ON CONFLICT (node_id) DO UPDATE SET
+			status = EXCLUDED.status,
+			last_seen = CASE WHEN EXCLUDED.status = 'ONLINE' THEN NOW() ELSE ctd_nodes.last_seen END,
+			updated_at = NOW(),
+			updated_by = SESSION_USER
+	`, nodeID, status)
+	return err
+}
+
+// AddNodeTags appends operator-defined tags to a node and returns the merged effective tag set.
+func (s *PostgresStore) AddNodeTags(ctx context.Context, nodeID string, add []string) ([]string, error) {
+	norm := core.NormalizeTags(add)
+	if len(norm) == 0 {
+		return nil, fmt.Errorf("no valid tags provided")
+	}
+	var merged []string
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO ctd_nodes (node_id, operator_tags, tags, updated_at, updated_by)
+		VALUES ($1, $2, $2, NOW(), SESSION_USER)
+		ON CONFLICT (node_id) DO UPDATE SET
+			operator_tags = ARRAY(
+				SELECT DISTINCT unnest(ctd_nodes.operator_tags || EXCLUDED.operator_tags) ORDER BY 1
+			),
+			tags = ARRAY(
+				SELECT DISTINCT unnest(ctd_nodes.boot_tags || ctd_nodes.operator_tags || EXCLUDED.operator_tags) ORDER BY 1
+			),
+			updated_at = NOW(),
+			updated_by = SESSION_USER
+		RETURNING tags
+	`, nodeID, norm).Scan(&merged)
+	return merged, err
+}
+
+// RemoveNodeTags removes tags from a node's operator_tags (and boot_tags cache) and returns the remaining effective tags.
+func (s *PostgresStore) RemoveNodeTags(ctx context.Context, nodeID string, remove []string) ([]string, error) {
+	norm := core.NormalizeTags(remove)
+	if len(norm) == 0 {
+		return nil, fmt.Errorf("no valid tags provided")
+	}
+	var merged []string
+	err := s.pool.QueryRow(ctx, `
+		UPDATE ctd_nodes
+		SET
+			operator_tags = ARRAY(
+				SELECT t FROM unnest(ctd_nodes.operator_tags) AS t WHERE NOT (t = ANY($2)) ORDER BY 1
+			),
+			boot_tags = ARRAY(
+				SELECT t FROM unnest(ctd_nodes.boot_tags) AS t WHERE NOT (t = ANY($2)) ORDER BY 1
+			),
+			tags = ARRAY(
+				SELECT DISTINCT t FROM unnest(ctd_nodes.boot_tags || ctd_nodes.operator_tags) AS t WHERE NOT (t = ANY($2)) ORDER BY 1
+			),
+			updated_at = NOW(),
+			updated_by = SESSION_USER
+		WHERE node_id = $1
+		RETURNING tags
+	`, nodeID, norm).Scan(&merged)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("node %q not found in registry", nodeID)
+	}
+	return merged, err
+}
+
+// ResolveNodes evaluates a RunnerSelector (`--all`, `--node`, `--tag`) against `ctd_nodes` and `telemetric_ledger`.
+func (s *PostgresStore) ResolveNodes(ctx context.Context, sel core.RunnerSelector) ([]string, error) {
+	if sel.IsEmpty() {
+		return nil, nil
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if sel.All {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT node_id FROM (
+				SELECT node_id FROM ctd_nodes WHERE status <> 'OFFLINE'
+				UNION
+				SELECT DISTINCT node_id FROM telemetric_ledger WHERE event_timestamp >= NOW() - INTERVAL '15 minutes'
+			) active_nodes
+			ORDER BY node_id ASC
+		`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err == nil {
+				out = append(out, id)
+			}
+		}
+		return out, rows.Err()
+	}
+
+	resolved := make(map[string]struct{})
+	for _, n := range sel.Nodes {
+		trimmed := strings.TrimSpace(n)
+		if trimmed != "" {
+			resolved[trimmed] = struct{}{}
+		}
+	}
+
+	normTags := core.NormalizeTags(sel.Tags)
+	if len(normTags) > 0 {
+		rows, err := tx.Query(ctx, `
+			SELECT node_id
+			FROM ctd_nodes
+			WHERE tags && $1
+			ORDER BY node_id ASC
+		`, normTags)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err == nil {
+				resolved[id] = struct{}{}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]string, 0, len(resolved))
+	for id := range resolved {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 func isAbnormalStatus(status string) bool {
 	s := strings.ToLower(status)
 	return strings.Contains(s, "error") ||
@@ -251,17 +781,40 @@ func isAbnormalStatus(status string) bool {
 		s == "offline"
 }
 
-// GetClusterStatus returns the latest state per node using Postgres DISTINCT ON.
+// GetClusterStatus returns the latest state, hardware arch/OS, and tags per node.
 func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold time.Duration) ([]NodeSummary, error) {
 	if staleThreshold <= 0 {
 		staleThreshold = 3 * time.Minute
 	}
 
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (node_id)
-			node_id, component, event_timestamp, status, metrics
-		FROM telemetric_ledger
-		ORDER BY node_id, event_timestamp DESC
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		WITH latest_ledger AS (
+			SELECT DISTINCT ON (node_id)
+				node_id, component, event_timestamp, status, metrics
+			FROM telemetric_ledger
+			ORDER BY node_id, event_timestamp DESC
+		)
+		SELECT
+			COALESCE(n.node_id, l.node_id) AS node_id,
+			COALESCE(n.arch, '') AS arch,
+			COALESCE(n.os, '') AS os,
+			COALESCE(n.tags, '{}') AS tags,
+			COALESCE(l.component, 'registry') AS component,
+			GREATEST(COALESCE(l.event_timestamp, TIMESTAMPTZ 'epoch'), COALESCE(n.last_seen, TIMESTAMPTZ 'epoch')) AS last_seen,
+			CASE
+				WHEN n.status = 'OFFLINE' THEN 'OFFLINE'
+				ELSE COALESCE(l.status, n.status, 'unknown')
+			END AS status,
+			COALESCE(l.metrics, '{}'::jsonb) AS metrics
+		FROM ctd_nodes n
+		FULL OUTER JOIN latest_ledger l ON n.node_id = l.node_id
+		ORDER BY 1 ASC
 	`)
 	if err != nil {
 		return nil, err
@@ -274,8 +827,11 @@ func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold tim
 	for rows.Next() {
 		var ns NodeSummary
 		var metricsBytes []byte
-		if err := rows.Scan(&ns.NodeID, &ns.Component, &ns.LastSeen, &ns.Status, &metricsBytes); err != nil {
+		if err := rows.Scan(&ns.NodeID, &ns.Arch, &ns.OS, &ns.Tags, &ns.Component, &ns.LastSeen, &ns.Status, &metricsBytes); err != nil {
 			return nil, err
+		}
+		if ns.Tags == nil {
+			ns.Tags = []string{}
 		}
 		if len(metricsBytes) > 0 {
 			_ = json.Unmarshal(metricsBytes, &ns.LatestMetrics)
@@ -286,13 +842,89 @@ func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold tim
 	return summaries, rows.Err()
 }
 
+// GetLedgerActivity returns actor write/update attribution summaries across the CTD Ledger without maintaining a heavy audit table.
+func (s *PostgresStore) GetLedgerActivity(ctx context.Context, limit int) ([]LedgerActivity, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		WITH activity AS (
+			SELECT
+				'telemetric_ledger' AS source_table,
+				'INSERT/COPY' AS action,
+				db_actor,
+				app_actor,
+				node_id || '/' || pillar AS target,
+				COUNT(*)::bigint AS record_count,
+				MAX(ingested_at) AS last_event_at
+			FROM telemetric_ledger
+			GROUP BY db_actor, app_actor, node_id, pillar
+
+			UNION ALL
+
+			SELECT
+				'ctd_nodes' AS source_table,
+				'UPSERT/TAG' AS action,
+				updated_by AS db_actor,
+				'registry' AS app_actor,
+				node_id AS target,
+				1::bigint AS record_count,
+				updated_at AS last_event_at
+			FROM ctd_nodes
+
+			UNION ALL
+
+			SELECT
+				'ctd_artifacts' AS source_table,
+				'UPSERT' AS action,
+				updated_by AS db_actor,
+				kind AS app_actor,
+				id AS target,
+				1::bigint AS record_count,
+				updated_at AS last_event_at
+			FROM ctd_artifacts
+		)
+		SELECT source_table, action, db_actor, app_actor, target, record_count, last_event_at
+		FROM activity
+		ORDER BY last_event_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []LedgerActivity
+	for rows.Next() {
+		var a LedgerActivity
+		if err := rows.Scan(&a.SourceTable, &a.Action, &a.DBActor, &a.AppActor, &a.Target, &a.RecordCount, &a.LastEventAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // GetLineageDAG walks upstream and downstream edges from any Artifact ID using a recursive CTE.
 func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, maxDepth int) (*DAG, error) {
 	if maxDepth <= 0 {
 		maxDepth = 10
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE lineage AS (
 			SELECT source_id, verb, target_id, COALESCE(node_id, '') AS node_id, COALESCE(run_id, '') AS run_id, meta, event_timestamp, 1 AS depth
 			FROM ctd_traces
@@ -337,7 +969,7 @@ func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, ma
 		ids = append(ids, id)
 	}
 
-	aRows, err := s.pool.Query(ctx, `
+	aRows, err := tx.Query(ctx, `
 		SELECT id, kind, COALESCE(node_id, ''), meta, created_at
 		FROM ctd_artifacts
 		WHERE id = ANY($1)
@@ -418,6 +1050,186 @@ func (s *PostgresStore) FetchForUnload(ctx context.Context, f UnloadFilter) ([]c
 	return results, rows.Err()
 }
 
+// QueryReadOnlyMaps executes arbitrary read queries strictly inside a PostgreSQL `READ ONLY` transaction,
+// guaranteeing that PigeonCare and PigeonMCP can never write to or mutate the CTD Ledger.
+func (s *PostgresStore) QueryReadOnlyMaps(ctx context.Context, sql string, args ...any) ([]map[string]any, error) {
+	if _, err := ValidateSelectOnlySQL(sql); err != nil {
+		return nil, err
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return pgx.CollectRows(rows, pgx.RowToMap)
+}
+
+// ExplainReadOnly validates syntax and planner structure of a candidate SELECT query inside a rolled-back READ ONLY transaction.
+func (s *PostgresStore) ExplainReadOnly(ctx context.Context, selectSQL string) (string, error) {
+	cleaned, err := ValidateSelectOnlySQL(selectSQL)
+	if err != nil {
+		return "", err
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var planJSON string
+	if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+cleaned).Scan(&planJSON); err != nil {
+		return "", err
+	}
+	return planJSON, nil
+}
+
+// SavePMVDraft caches the actor's raw SQL intent in `pigeonmath.pmv_catalog` before optimization.
+func (s *PostgresStore) SavePMVDraft(ctx context.Context, rec PMVRecord) (*PMVRecord, error) {
+	normName, err := NormalizePMVName(rec.ViewName)
+	if err != nil {
+		return nil, err
+	}
+	cleanedRaw, err := ValidateSelectOnlySQL(rec.RawIntentSQL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid raw SQL intent: %w", err)
+	}
+	reportJSON, err := marshalObjectOrEmpty(rec.ValidationReport)
+	if err != nil {
+		return nil, err
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO %[1]s.pmv_catalog (view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at)
+		VALUES ($1, COALESCE(NULLIF($2, ''), SESSION_USER), $3, $4, 'draft', 1, $5, $6, NOW(), NOW())
+		ON CONFLICT (view_name) DO UPDATE SET
+			submitted_by = COALESCE(NULLIF(EXCLUDED.submitted_by, ''), %[1]s.pmv_catalog.submitted_by),
+			raw_intent_sql = EXCLUDED.raw_intent_sql,
+			optimized_sql = EXCLUDED.optimized_sql,
+			status = 'draft',
+			version = %[1]s.pmv_catalog.version + 1,
+			agent_notes = EXCLUDED.agent_notes,
+			validation_report = EXCLUDED.validation_report,
+			updated_at = NOW()
+		RETURNING view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, created_at, updated_at
+	`, s.mathSchema)
+
+	var out PMVRecord
+	err = s.pool.QueryRow(ctx, query, normName, rec.SubmittedBy, cleanedRaw, rec.OptimizedSQL, rec.AgentNotes, reportJSON).
+		Scan(&out.ViewName, &out.SubmittedBy, &out.RawIntentSQL, &out.OptimizedSQL, &out.Status, &out.Version, &out.AgentNotes, &out.CreatedAt, &out.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	out.ValidationReport = rec.ValidationReport
+	return &out, nil
+}
+
+// UpdatePMVState updates optimization notes, status, and validation report for a cached PMV.
+func (s *PostgresStore) UpdatePMVState(ctx context.Context, rec PMVRecord) error {
+	normName, err := NormalizePMVName(rec.ViewName)
+	if err != nil {
+		return err
+	}
+	reportJSON, err := marshalObjectOrEmpty(rec.ValidationReport)
+	if err != nil {
+		return err
+	}
+	query := fmt.Sprintf(`
+		UPDATE %[1]s.pmv_catalog
+		SET
+			optimized_sql = $2,
+			status = $3,
+			agent_notes = $4,
+			validation_report = $5,
+			updated_at = NOW()
+		WHERE view_name = $1
+	`, s.mathSchema)
+	_, err = s.pool.Exec(ctx, query, normName, rec.OptimizedSQL, rec.Status, rec.AgentNotes, reportJSON)
+	return err
+}
+
+// GetPMV retrieves a cached/certified PigeonMath view record by name (reloading original raw intent across context flushes).
+func (s *PostgresStore) GetPMV(ctx context.Context, viewName string) (*PMVRecord, error) {
+	normName, err := NormalizePMVName(viewName)
+	if err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(`
+		SELECT view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at
+		FROM %[1]s.pmv_catalog
+		WHERE view_name = $1
+	`, s.mathSchema)
+
+	var rec PMVRecord
+	var reportBytes []byte
+	err = s.pool.QueryRow(ctx, query, normName).Scan(
+		&rec.ViewName, &rec.SubmittedBy, &rec.RawIntentSQL, &rec.OptimizedSQL,
+		&rec.Status, &rec.Version, &rec.AgentNotes, &reportBytes, &rec.CreatedAt, &rec.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(reportBytes) > 0 {
+		_ = json.Unmarshal(reportBytes, &rec.ValidationReport)
+	}
+	return &rec, nil
+}
+
+// ListPMVs lists all cached and certified PigeonMath views in `pigeonmath.pmv_catalog`.
+func (s *PostgresStore) ListPMVs(ctx context.Context) ([]PMVRecord, error) {
+	query := fmt.Sprintf(`
+		SELECT view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at
+		FROM %[1]s.pmv_catalog
+		ORDER BY updated_at DESC
+	`, s.mathSchema)
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PMVRecord
+	for rows.Next() {
+		var rec PMVRecord
+		var reportBytes []byte
+		if err := rows.Scan(
+			&rec.ViewName, &rec.SubmittedBy, &rec.RawIntentSQL, &rec.OptimizedSQL,
+			&rec.Status, &rec.Version, &rec.AgentNotes, &reportBytes, &rec.CreatedAt, &rec.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if len(reportBytes) > 0 {
+			_ = json.Unmarshal(reportBytes, &rec.ValidationReport)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MaterializePMV creates or replaces `pigeonmath.pmv_<slug>` after validating read-only SELECT syntax.
+func (s *PostgresStore) MaterializePMV(ctx context.Context, viewName string, selectSQL string) error {
+	normName, err := NormalizePMVName(viewName)
+	if err != nil {
+		return err
+	}
+	cleanedSQL, err := ValidateSelectOnlySQL(selectSQL)
+	if err != nil {
+		return err
+	}
+	ddl := fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS %s", s.mathSchema, normName, cleanedSQL)
+	_, err = s.pool.Exec(ctx, ddl)
+	return err
+}
+
 // validateViewIdentifier checks that a view name is a safe unquoted SQL identifier.
 func validateViewIdentifier(viewName string) error {
 	if !validIdentifier.MatchString(viewName) {
@@ -426,17 +1238,12 @@ func validateViewIdentifier(viewName string) error {
 	return nil
 }
 
-// RegisterView powers PigeonMath's QueryModelAdapter ("CREATE OR REPLACE VIEW").
+// RegisterView creates a PigeonMath view inside the isolated `pigeonmath` schema.
 func (s *PostgresStore) RegisterView(ctx context.Context, viewName string, selectQuery string) error {
 	if err := validateViewIdentifier(viewName); err != nil {
 		return err
 	}
-	if strings.TrimSpace(selectQuery) == "" {
-		return fmt.Errorf("selectQuery cannot be empty")
-	}
-	sql := fmt.Sprintf("CREATE OR REPLACE VIEW %s AS %s", viewName, selectQuery)
-	_, err := s.pool.Exec(ctx, sql)
-	return err
+	return s.MaterializePMV(ctx, viewName, selectQuery)
 }
 
 func (s *PostgresStore) ExecRaw(ctx context.Context, sql string, args ...any) error {
@@ -444,7 +1251,7 @@ func (s *PostgresStore) ExecRaw(ctx context.Context, sql string, args ...any) er
 	return err
 }
 
-// QueryMaps executes arbitrary read queries and returns a driver-agnostic slice of maps.
+// QueryMaps executes read/admin queries for human CLI callers and returns a driver-agnostic slice of maps.
 func (s *PostgresStore) QueryMaps(ctx context.Context, sql string, args ...any) ([]map[string]any, error) {
 	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {

@@ -2,67 +2,55 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
-	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/relay"
-	"github.com/drewv-labs/carrier-pigeons/pkg/observer"
-
-	// Blank imports register built-in hardware observers and remote runners
-	_ "github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/observers"
-	_ "github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/runners"
+	"github.com/drewv-labs/carrier-pigeons/pkg/config"
+	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrier-pigeons/pkg/edge"
 )
 
-func resolveNodeID() string {
-	for _, key := range []string{"PIGEONEER_NODE_ID", "PIGEONS_NODE_ID"} {
-		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
-			return val
-		}
-	}
-	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
-		return strings.TrimSpace(host)
-	}
-	return "edge-arm64-01"
-}
-
-func resolveBrokerURL() string {
-	for _, key := range []string{"PIGEONEER_BROKER_URL", "PIGEONS_BROKER_URL", "MQTT_BROKER_URL"} {
-		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
-			return val
-		}
-	}
-	return "tcp://localhost:1883"
-}
-
 func main() {
-	log.Println("Starting Pigeoneer: CTD Edge Agent...")
+	var (
+		cfgPath   = flag.String("config", "", "Path to pigeoneer.toml")
+		nodeID    = flag.String("node-id", "", "Override node_id")
+		brokerURL = flag.String("broker", "", "Override MQTT broker URL")
+		tagsCSV   = flag.String("tags", "", "Comma-separated boot tags (e.g. riscv64,compute-bench)")
+		spoolCap  = flag.Int("spool", 0, "Override ring-buffer spool capacity")
+	)
+	flag.Parse()
+
+	cfg, err := config.LoadEdgeConfig(*cfgPath)
+	if err != nil {
+		log.Fatalf("Failed loading configuration: %v", err)
+	}
+	if strings.TrimSpace(*nodeID) != "" {
+		cfg.NodeID = strings.TrimSpace(*nodeID)
+	}
+	if strings.TrimSpace(*brokerURL) != "" {
+		cfg.BrokerURL = strings.TrimSpace(*brokerURL)
+	}
+	if strings.TrimSpace(*tagsCSV) != "" {
+		cfg.Tags = core.NormalizeTags(strings.Split(*tagsCSV, ","))
+	}
+	if *spoolCap > 0 {
+		cfg.SpoolCapacity = *spoolCap
+	}
+
+	log.Printf("Starting %s: CTD Edge Agent (%s -> %s)...", cfg.Brand.EdgeName, cfg.NodeID, cfg.BrokerURL)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	nodeID := resolveNodeID()
-	brokerURL := resolveBrokerURL()
-	topicPrefix := strings.TrimSpace(os.Getenv("PIGEONEER_TOPIC_PREFIX"))
-
-	// 1. Initialize the network relay with LWT presence and offline spooler
-	mqttRelay := relay.NewMQTTClientWithPrefix(brokerURL, nodeID, topicPrefix)
-	defer mqttRelay.Disconnect()
-	log.Printf("Configured relay for node %q -> %s", nodeID, brokerURL)
-
-	// 2. Bind the control topic to listen for dynamic Runner dispatches (reconnect-safe)
-	if err := mqttRelay.ListenForRunners(ctx, nodeID, mqttRelay); err != nil {
-		log.Printf("[Runner Dispatch] Initial control bind deferred until broker reconnect: %v", err)
+	agent := edge.New(cfg)
+	if err := agent.Start(ctx); err != nil {
+		log.Fatalf("Failed starting %s: %v", cfg.Brand.EdgeName, err)
 	}
+	defer agent.Stop()
 
-	// 3. Deploy concurrent passive hardware observers bound to daemon lifecycle context
-	observer.StartAll(ctx, nodeID, mqttRelay)
-
-	// 4. Block until OS termination signal
-	log.Printf("Observers (%v) & Runner agents active for %q. Press Ctrl+C to stop.", observer.RegistryNames(), nodeID)
 	<-ctx.Done()
-
-	log.Println("Shutting down Pigeoneer...")
+	log.Printf("Shutting down %s...", cfg.Brand.EdgeName)
 }

@@ -1,0 +1,23 @@
+# Pigeons Workstation Control Plane Configuration
+
+broker_url            = "tcp://localhost:1883"
+database_url          = "postgres://drewv:ctd_password@localhost:5432/edge_ledger"
+readonly_database_url = "postgres://pigeoncare_ro:pigeoncare_readonly@localhost:5432/edge_ledger"
+operator              = "operator"
+
+[llm]
+provider = "ollama"
+model    = "qwen2.5-coder"
+endpoint = "http://localhost:11434"
+
+[permissions]
+# Agent execution confirmation mode:
+# - "default":   Prompt [Allow / Always Allow / Deny] before Runners and PigeonMath DDL
+# - "auto_edit": Auto-approve read-only diagnostics & PigeonMath views; prompt before Runners
+# - "yolo":      Autonomous execution of diagnostics, PigeonMath views, and Ephemeral Runners
+mode                  = "default"
+allowed_runners       = ["benchmark"]
+allowed_script_hashes = []
+
+[math]
+refresh_interval = "60s"

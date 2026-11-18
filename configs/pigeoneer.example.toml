@@ -1,0 +1,20 @@
+# Pigeoneer Edge Daemon Configuration (RISC-V / ARM64 / x86_64 / OpenWrt / macOS / Windows)
+
+node_id        = "rv64-compute-01"
+tags           = ["riscv64", "compute-bench", "npu-edge"]
+poll_interval  = "5s"
+spool_capacity = 10000
+broker_url     = "tcp://pigeoncoop.local:1883"
+topic_prefix   = "pigeons/ctd"
+
+[observers]
+os  = true
+net = true
+gpu = true
+npu = true
+
+[runners]
+enabled              = true
+allow_ephemeral      = true
+allowed_interpreters = ["sh", "bash", "python3"]
+max_timeout_sec      = 300
