@@ -10,12 +10,17 @@ spool_capacity = 10000
 
 [mqtt]
 # "embedded" runs an in-process pure-Go MQTT v5/v3.1.1 broker; set "external" for Mosquitto.
-mode   = "embedded"
-listen = "0.0.0.0:1883"
-url    = "tcp://localhost:1883"
+# Bind "127.0.0.1:1883" for single-host testing, or "0.0.0.0:1883" with credentials + TLS for LAN fleets.
+mode          = "embedded"
+listen        = "127.0.0.1:1883"
+url           = "tcp://127.0.0.1:1883"
+username      = ""
+password      = ""
+edge_username = ""
+edge_password = ""
 
 [database]
-url       = "postgres://drewv:ctd_password@localhost:5432/edge_ledger"
+url       = "postgres://ctd_ingestor:ctd_ingest_password@127.0.0.1:5432/edge_ledger"
 max_conns = 24
 min_conns = 2
 
@@ -26,7 +31,7 @@ flush_interval = "100ms"
 
 [ntfy]
 enabled = true
-url     = "http://localhost:2586/carrier-pigeons"
+url     = "http://127.0.0.1:2586/carrier-pigeons"
 
 [observers]
 os  = true
@@ -36,6 +41,6 @@ npu = true
 
 [runners]
 enabled              = true
-allow_ephemeral      = true
+allow_ephemeral      = false
 allowed_interpreters = ["sh", "bash", "python3"]
 max_timeout_sec      = 300

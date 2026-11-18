@@ -7,13 +7,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeonmath"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeonmath"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
 // RequestDispatcher transmits a RunnerRequestCTD to PigeonCoop over MQTT (`pigeons/requests/runner`).
@@ -318,20 +318,23 @@ func (s *Service) Execute(ctx context.Context, name string, args map[string]any)
 		rows, err := s.store.QueryReadOnlyMaps(ctx, `
 			WITH latest_run AS (
 				SELECT
-					(metrics->>'run_id')::bigint AS run_id,
+					metrics->>'run_id' AS run_id,
 					event_timestamp AS start_time,
 					COALESCE(
 						(
 							SELECT MIN(e.event_timestamp)
 							FROM telemetric_ledger e
 							WHERE e.node_id = $1
+							  AND e.pillar = 'runner'
 							  AND e.status IN ('runner-end', 'runner-aborted', 'runner-error')
-							  AND (e.metrics->>'run_id')::bigint = (s.metrics->>'run_id')::bigint
+							  AND e.metrics->>'run_id' = s.metrics->>'run_id'
 						),
 						s.event_timestamp + (COALESCE(NULLIF(s.metrics->>'duration_sec', '')::numeric, 60) || ' seconds')::interval
 					) AS end_time
 				FROM telemetric_ledger s
-				WHERE s.node_id = $1 AND s.status = 'runner-start'
+				WHERE s.node_id = $1
+				  AND s.pillar = 'runner'
+				  AND s.status = 'runner-start'
 				ORDER BY s.event_timestamp DESC
 				LIMIT 1
 			)
@@ -343,6 +346,7 @@ func (s *Service) Execute(ctx context.Context, name string, args map[string]any)
 			  AND t.event_timestamp <= lr.end_time
 			  AND t.pillar = 'observer'
 			ORDER BY t.event_timestamp ASC
+			LIMIT 250
 		`, nodeID)
 		if err != nil {
 			return fmt.Sprintf("Read-only ledger query failed: %v", err)

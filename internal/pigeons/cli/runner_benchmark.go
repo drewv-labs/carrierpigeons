@@ -1,13 +1,10 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
+	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/spf13/cobra"
 )
 
@@ -20,52 +17,38 @@ var (
 
 var runnerBenchmarkCmd = &cobra.Command{
 	Use:   "benchmark [node-ids...]",
-	Short: "Dispatch a targeted synthetic benchmark to edge nodes",
+	Short: "Dispatch a targeted synthetic benchmark via PigeonCoop RunnerRequestCTD",
 	Args:  cobra.MinimumNArgs(1),
-	Run: func(_ *cobra.Command, args []string) {
+	RunE: func(_ *cobra.Command, args []string) error {
 		if !benchSystem && !benchGPU && !benchNPU {
 			benchSystem = true
 		}
 
-		brokerURL := resolveBrokerURL()
-		opts := mqtt.NewClientOptions().
-			AddBroker(brokerURL).
-			SetClientID(fmt.Sprintf("pigeons-cli-dispatcher-%d", os.Getpid()))
-		client := mqtt.NewClient(opts)
-		if token := client.Connect(); token.Wait() && token.Error() != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Could not reach MQTT broker (%s): %v\n", brokerURL, token.Error())
-			os.Exit(1)
-		}
-		defer client.Disconnect(250)
-
-		env := runner.Envelope{
-			Action: "start",
-			Runner: "benchmark",
+		req := core.RunnerRequestCTD{
+			RequestID: fmt.Sprintf("bench-%d", time.Now().UTC().UnixNano()),
+			Action:    "start",
+			Runner:    "benchmark",
+			Selectors: core.RunnerSelector{
+				Nodes: cleanSelectorTokens(args, false),
+			},
 			Params: map[string]any{
 				"duration_sec":  benchSecs,
 				"target_system": benchSystem,
 				"target_gpu":    benchGPU,
 				"target_npu":    benchNPU,
 			},
+			RequestedBy: wsCfg.Operator,
+			RequestedAt: time.Now().UTC(),
 		}
 
-		payload, err := json.Marshal(env)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Failed to marshal runner envelope: %v\n", err)
-			os.Exit(1)
+		brokerURL := resolveBrokerURL()
+		if err := publishRunnerRequest(brokerURL, req); err != nil {
+			return err
 		}
 
-		for _, nodeID := range args {
-			topic := core.ControlTopic(nodeID)
-			token := client.Publish(topic, 1, false, payload)
-			token.Wait()
-			if token.Error() != nil {
-				fmt.Fprintf(os.Stderr, "[-] Failed to dispatch to %s: %v\n", nodeID, token.Error())
-			} else {
-				fmt.Printf("[+] Dispatched 'benchmark' runner to %s (Duration: %ds, Sys: %v, GPU: %v, NPU: %v)\n",
-					nodeID, benchSecs, benchSystem, benchGPU, benchNPU)
-			}
-		}
+		fmt.Printf("[+] Submitted RunnerRequestCTD %s ('benchmark') -> %v (Duration: %ds, Sys: %v, GPU: %v, NPU: %v)\n",
+			req.RequestID, req.Selectors.Nodes, benchSecs, benchSystem, benchGPU, benchNPU)
+		return nil
 	},
 }
 

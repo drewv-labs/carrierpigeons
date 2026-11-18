@@ -8,8 +8,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/coop"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/coop"
 )
 
 func main() {

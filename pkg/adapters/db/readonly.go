@@ -2,44 +2,68 @@ package db
 
 import (
 	"context"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 var _ AgentSafeDB = (*ReadOnlyAgentStore)(nil)
+
+// ReadOnlyOptions customizes connection safety checks for ReadOnlyAgentStore.
+type ReadOnlyOptions struct {
+	AllowSuperuser bool
+	MaxRows        int
+}
 
 // ReadOnlyAgentStore wraps a PostgresStore behind the narrow AgentSafeDB capability boundary,
 // physically withholding all write/mutation methods against the public CTD Ledger.
 type ReadOnlyAgentStore struct {
 	inner     *PostgresStore
 	ownsInner bool
+	maxRows   int
 }
 
 // NewReadOnlyAgentStore opens a dedicated connection pool for PigeonCare or PigeonMCP
-// stamped with `application_name` and constrained to AgentSafeDB methods.
-func NewReadOnlyAgentStore(ctx context.Context, connStr, appActor string) (*ReadOnlyAgentStore, error) {
-	if connStr == "" {
+// stamped with `application_name`, session read-only enforcement, and non-superuser verification.
+func NewReadOnlyAgentStore(ctx context.Context, connStr, appActor string, opts ...ReadOnlyOptions) (*ReadOnlyAgentStore, error) {
+	var roOpt ReadOnlyOptions
+	if len(opts) > 0 {
+		roOpt = opts[0]
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("PIGEONS_ALLOW_SUPERUSER_RO")), "true") {
+		roOpt.AllowSuperuser = true
+	}
+
+	if strings.TrimSpace(connStr) == "" {
 		connStr = ResolveReadOnlyDBURL()
 	}
-	if appActor == "" {
+	if strings.TrimSpace(appActor) == "" {
 		appActor = "pigeoncare-agent"
 	}
+	maxRows := roOpt.MaxRows
+	if maxRows <= 0 {
+		maxRows = DefaultReadOnlyMaxRows
+	}
+
 	store, err := NewPostgresStoreWithOptions(ctx, connStr, StoreOptions{
-		AppActor: appActor,
-		MaxConns: 8,
-		MinConns: 1,
+		AppActor:            appActor,
+		MaxConns:            8,
+		MinConns:            1,
+		StatementTimeoutMs:  5000,
+		EnforceNonSuperuser: !roOpt.AllowSuperuser,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &ReadOnlyAgentStore{inner: store, ownsInner: true}, nil
+	return &ReadOnlyAgentStore{inner: store, ownsInner: true, maxRows: maxRows}, nil
 }
 
 // WrapAgentSafeDB wraps an existing PostgresStore without transferring Close() ownership,
 // useful when the operator TUI shares a pool across views while restricting PigeonCare's capability surface.
 func WrapAgentSafeDB(store *PostgresStore) *ReadOnlyAgentStore {
-	return &ReadOnlyAgentStore{inner: store, ownsInner: false}
+	return &ReadOnlyAgentStore{inner: store, ownsInner: false, maxRows: DefaultReadOnlyMaxRows}
 }
 
 func (r *ReadOnlyAgentStore) Close() {
@@ -65,7 +89,7 @@ func (r *ReadOnlyAgentStore) GetLedgerActivity(ctx context.Context, limit int) (
 }
 
 func (r *ReadOnlyAgentStore) QueryReadOnlyMaps(ctx context.Context, sql string, args ...any) ([]map[string]any, error) {
-	return r.inner.QueryReadOnlyMaps(ctx, sql, args...)
+	return r.inner.QueryReadOnlyMapsBounded(ctx, r.maxRows, sql, args...)
 }
 
 func (r *ReadOnlyAgentStore) ExplainReadOnly(ctx context.Context, selectSQL string) (string, error) {
@@ -94,4 +118,8 @@ func (r *ReadOnlyAgentStore) ListPMVs(ctx context.Context) ([]PMVRecord, error) 
 
 func (r *ReadOnlyAgentStore) MaterializePMV(ctx context.Context, viewName string, selectSQL string) error {
 	return r.inner.MaterializePMV(ctx, viewName, selectSQL)
+}
+
+func (r *ReadOnlyAgentStore) DropPMV(ctx context.Context, viewName string) error {
+	return r.inner.DropPMV(ctx, viewName)
 }

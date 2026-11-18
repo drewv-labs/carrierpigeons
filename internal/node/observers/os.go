@@ -3,8 +3,8 @@ package observers
 import (
 	"context"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/observer"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 )
 
 type hostOSObserver struct{}

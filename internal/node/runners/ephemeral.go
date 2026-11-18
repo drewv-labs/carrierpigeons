@@ -8,15 +8,63 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
 const maxCapturedStreamBytes = 16 * 1024
+
+var safeEnvKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+
+var blockedEnvKeys = map[string]struct{}{
+	"PATH":           {},
+	"HOME":           {},
+	"TMPDIR":         {},
+	"TMP":            {},
+	"TEMP":           {},
+	"USER":           {},
+	"LOGNAME":        {},
+	"SHELL":          {},
+	"BASH_ENV":       {},
+	"ENV":            {},
+	"IFS":            {},
+	"CDPATH":         {},
+	"PROMPT_COMMAND": {},
+	"PYTHONPATH":     {},
+	"PYTHONHOME":     {},
+	"PYTHONSTARTUP":  {},
+	"PYTHONINSPECT":  {},
+	"NODE_OPTIONS":   {},
+	"PERL5OPT":       {},
+	"PERL5LIB":       {},
+	"RUBYOPT":        {},
+	"RUBYLIB":        {},
+	"GCONV_PATH":     {},
+	"HOSTALIASES":    {},
+}
+
+func validateSandboxEnvVar(key, val string) (string, error) {
+	k := strings.TrimSpace(key)
+	if !safeEnvKeyRe.MatchString(k) {
+		return "", fmt.Errorf("disallowed environment variable name %q (must match ^[A-Z][A-Z0-9_]{0,63}$)", key)
+	}
+	if _, blocked := blockedEnvKeys[k]; blocked ||
+		strings.HasPrefix(k, "LD_") ||
+		strings.HasPrefix(k, "DYLD_") ||
+		strings.HasPrefix(k, "BASH_FUNC_") {
+		return "", fmt.Errorf("environment variable %q is blocked by sandbox policy", k)
+	}
+	if strings.ContainsRune(val, 0) {
+		return "", fmt.Errorf("environment variable %q contains NUL byte", k)
+	}
+	return k + "=" + val, nil
+}
 
 type boundedBuffer struct {
 	buf       bytes.Buffer
@@ -48,7 +96,8 @@ func (b *boundedBuffer) String() string {
 }
 
 // EphemeralRunner executes ad-hoc diagnostic scripts synthesized by PigeonCare or an operator
-// inside an isolated temporary directory with strict interpreter allowlists, SHA-256 verification, and timeouts.
+// inside an isolated temporary directory with strict interpreter allowlists, SHA-256 verification,
+// env-var sanitization, and process-group termination on timeout/abort.
 type EphemeralRunner struct{}
 
 func init() {
@@ -83,10 +132,14 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 		return emitErr("missing script_body parameter")
 	}
 
-	interp, _ := params["interpreter"].(string)
-	interp = strings.ToLower(strings.TrimSpace(filepath.Base(interp)))
-	if interp == "" {
-		interp = "sh"
+	rawInterp, _ := params["interpreter"].(string)
+	rawInterp = strings.TrimSpace(rawInterp)
+	interp := "sh"
+	if rawInterp != "" {
+		interp = strings.ToLower(strings.TrimSpace(filepath.Base(rawInterp)))
+		if interp == "" || interp == "." || interp == string(filepath.Separator) {
+			interp = "sh"
+		}
 	}
 
 	allowed := policy.AllowedInterpreters
@@ -108,6 +161,33 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 	if expectedHash, _ := params["sha256"].(string); strings.TrimSpace(expectedHash) != "" {
 		if !strings.EqualFold(strings.TrimSpace(expectedHash), actualHash) {
 			return emitErr("ephemeral script SHA-256 digest mismatch")
+		}
+	}
+	if len(policy.AllowedScriptHashes) > 0 {
+		matched := slices.ContainsFunc(policy.AllowedScriptHashes, func(h string) bool {
+			return strings.EqualFold(strings.TrimSpace(h), actualHash)
+		})
+		if !matched {
+			return emitErr("ephemeral script SHA-256 is not in node allowed_script_hashes policy")
+		}
+	}
+
+	var customEnv []string
+	if envMap, ok := params["env"].(map[string]any); ok {
+		for k, v := range envMap {
+			kv, envErr := validateSandboxEnvVar(k, fmt.Sprint(v))
+			if envErr != nil {
+				return emitErr(envErr.Error())
+			}
+			customEnv = append(customEnv, kv)
+		}
+	} else if envStrMap, ok := params["env"].(map[string]string); ok {
+		for k, v := range envStrMap {
+			kv, envErr := validateSandboxEnvVar(k, v)
+			if envErr != nil {
+				return emitErr(envErr.Error())
+			}
+			customEnv = append(customEnv, kv)
 		}
 	}
 
@@ -140,7 +220,7 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 		shortHash = shortHash[:12]
 	}
 	artifactID := "ephemeral:" + shortHash
-	runID := time.Now().UTC().UnixNano()
+	runID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	startedAt := time.Now()
 
 	startEv := core.NewCTDPayload(nodeID, "runner:ephemeral", "runner-start").
@@ -167,22 +247,14 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, interpBin, scriptPath)
+	configureProcessGroup(cmd)
 	cmd.Dir = workDir
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"HOME=" + workDir,
 		"TMPDIR=" + workDir,
 		"PIGEONS_NODE_ID=" + nodeID,
-	}
-	if envMap, ok := params["env"].(map[string]any); ok {
-		for k, v := range envMap {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%v", k, v))
-		}
-	} else if envStrMap, ok := params["env"].(map[string]string); ok {
-		for k, v := range envStrMap {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-		}
-	}
+	}, customEnv...)
 
 	stdoutBuf := &boundedBuffer{limit: maxCapturedStreamBytes}
 	stderrBuf := &boundedBuffer{limit: maxCapturedStreamBytes}

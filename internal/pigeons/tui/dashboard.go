@@ -10,13 +10,13 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncare"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeonmath"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeoncare"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeonmath"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // TabID identifies the active view tab inside the Pigeons Control Plane TUI.
@@ -33,10 +33,26 @@ const (
 type RunnerRecord struct {
 	Timestamp time.Time
 	NodeID    string
+	Targets   []string
 	Runner    string
 	Status    string
 	RequestID string
 	Detail    string
+}
+
+func truncateRunes(s string, maxRunes int, ellipsis string) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	ellRunes := []rune(ellipsis)
+	if len(ellRunes) >= maxRunes {
+		return string(r[:maxRunes])
+	}
+	return string(r[:maxRunes-len(ellRunes)]) + ellipsis
 }
 
 // DashboardOptions configures the multi-tab Pigeons TUI control plane.
@@ -145,8 +161,13 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 	agentGreeting := fmt.Sprintf("%s: Connected to %s read-only CTD Ledger. Ask about thermals, runners, or %s views.",
 		bSpec.AgentName, bSpec.ProductName, bSpec.MathName)
 	uiHist := []string{agentStyle.Render(agentGreeting)}
-	if strings.TrimSpace(opts.FaultContext) != "" {
-		uiHist = append([]string{systemStyle.Render("Fault Context:\n" + strings.TrimSpace(opts.FaultContext))}, uiHist...)
+	var chatHist []llm.Message
+	if fault := strings.TrimSpace(opts.FaultContext); fault != "" {
+		uiHist = append([]string{systemStyle.Render("Fault Context:\n" + fault)}, uiHist...)
+		chatHist = append(chatHist,
+			llm.Message{Role: "user", Content: "Operator-supplied fault context for triage:\n" + fault},
+			llm.Message{Role: "assistant", Content: "Fault context loaded into session memory. Ready to correlate against CTD Ledger telemetry."},
+		)
 	}
 
 	banner := "Ready"
@@ -167,6 +188,7 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 		height:        32,
 		focusRequest:  opts.FocusRequest,
 		statusBanner:  banner,
+		chatHistory:   chatHist,
 		uiHistory:     uiHist,
 	}
 }
@@ -210,6 +232,23 @@ func (m DashboardModel) scheduleMathTick() tea.Cmd {
 	})
 }
 
+func extractTargetNodes(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s := strings.TrimSpace(fmt.Sprint(item)); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func (m DashboardModel) fetchOverviewCmd() tea.Cmd {
 	store := m.store
 	return func() tea.Msg {
@@ -245,25 +284,21 @@ func (m DashboardModel) fetchOverviewCmd() tea.Cmd {
 					}
 				}
 				detail := ""
+				var targets []string
 				if mMap, ok := r["metrics"].(map[string]any); ok {
+					targets = extractTargetNodes(mMap["targets"])
 					if out, hasOut := mMap["stdout"].(string); hasOut && out != "" {
 						line := strings.Split(out, "\n")[0]
-						if len(line) > 48 {
-							line = line[:48] + "..."
-						}
-						detail = line
+						detail = truncateRunes(line, 48, "...")
 					} else {
 						raw, _ := json.Marshal(mMap)
-						s := string(raw)
-						if len(s) > 52 {
-							s = s[:52] + "..."
-						}
-						detail = s
+						detail = truncateRunes(string(raw), 52, "...")
 					}
 				}
 				recs = append(recs, RunnerRecord{
 					Timestamp: ts,
 					NodeID:    fmt.Sprint(r["node_id"]),
+					Targets:   targets,
 					Runner:    runnerName,
 					Status:    fmt.Sprint(r["status"]),
 					RequestID: reqID,
@@ -295,12 +330,19 @@ func (m DashboardModel) dispatchAbortCmd(rec RunnerRecord) tea.Cmd {
 		if disp == nil {
 			return abortResultMsg{status: "MQTT dispatcher unavailable"}
 		}
+		targetNodes := rec.Targets
+		if len(targetNodes) == 0 && strings.TrimSpace(rec.NodeID) != "" {
+			targetNodes = []string{rec.NodeID}
+		}
+		if len(targetNodes) == 0 {
+			return abortResultMsg{status: "No active target nodes on selected row"}
+		}
 		req := core.RunnerRequestCTD{
 			RequestID: fmt.Sprintf("abort-%d", time.Now().UTC().UnixNano()),
 			Action:    "abort",
 			Runner:    rec.Runner,
 			Selectors: core.RunnerSelector{
-				Nodes: []string{rec.NodeID},
+				Nodes: targetNodes,
 			},
 			RequestedBy: operator,
 			RequestedAt: time.Now().UTC(),
@@ -310,7 +352,7 @@ func (m DashboardModel) dispatchAbortCmd(rec RunnerRecord) tea.Cmd {
 		if err := disp(ctx, req); err != nil {
 			return abortResultMsg{status: fmt.Sprintf("Abort failed: %v", err)}
 		}
-		return abortResultMsg{status: fmt.Sprintf("Sent abort for %s on %s", rec.Runner, rec.NodeID)}
+		return abortResultMsg{status: fmt.Sprintf("Sent abort for %s -> %v", rec.Runner, targetNodes)}
 	}
 }
 
@@ -625,9 +667,7 @@ func (m DashboardModel) renderOverview(box lipgloss.Style) string {
 		if tagStr == "" {
 			tagStr = "-"
 		}
-		if len(tagStr) > 22 {
-			tagStr = tagStr[:19] + "..."
-		}
+		tagStr = truncateRunes(tagStr, 22, "...")
 		fanRPM := "-"
 		if v, ok := n.LatestMetrics["cpu_fan_rpm"]; ok {
 			fanRPM = fmt.Sprint(v)
@@ -637,6 +677,8 @@ func (m DashboardModel) renderOverview(box lipgloss.Style) string {
 			tempC = fmt.Sprint(v)
 		} else if v, ok := n.LatestMetrics["soc_temp_c"]; ok {
 			tempC = fmt.Sprint(v)
+		} else if v, ok := n.LatestMetrics["temperature_c"]; ok {
+			tempC = fmt.Sprint(v)
 		}
 		state := "ONLINE"
 		if !n.IsHealthy {
@@ -644,7 +686,7 @@ func (m DashboardModel) renderOverview(box lipgloss.Style) string {
 		}
 		ago := time.Since(n.LastSeen).Round(time.Second)
 		fmt.Fprintf(&sb, "%-22s %-14s %-24s %-12s %-10s %-9s %-8s %s ago\n",
-			n.NodeID, archOS, tagStr, n.Component, state, fanRPM, tempC, ago)
+			truncateRunes(n.NodeID, 22, ".."), archOS, tagStr, truncateRunes(n.Component, 12, ".."), state, fanRPM, tempC, ago)
 	}
 	return box.Render(sb.String())
 }
@@ -672,15 +714,12 @@ func (m DashboardModel) renderRunnerManager(box lipgloss.Style, accent lipgloss.
 		if i == m.runnerCursor {
 			cursor = "▸"
 		}
-		reqShort := r.RequestID
-		if len(reqShort) > 16 {
-			reqShort = reqShort[:16]
-		}
+		reqShort := truncateRunes(r.RequestID, 16, "")
 		if reqShort == "" {
 			reqShort = "-"
 		}
 		fmt.Fprintf(&sb, "%s %-10s %-20s %-20s %-18s %-18s %s\n",
-			cursor, r.Timestamp.UTC().Format("15:04:05"), r.NodeID, r.Runner, r.Status, reqShort, r.Detail)
+			cursor, r.Timestamp.UTC().Format("15:04:05"), truncateRunes(r.NodeID, 20, ".."), truncateRunes(r.Runner, 20, ".."), r.Status, reqShort, r.Detail)
 	}
 	return box.Render(sb.String())
 }
@@ -765,7 +804,8 @@ func (m DashboardModel) renderPigeonCare(box lipgloss.Style, accent lipgloss.Col
 		var mText strings.Builder
 		fmt.Fprintf(&mText, "⚠ %s Action Confirmation Required: %s\n", m.brand.AgentName, prop.Title)
 		if prop.Kind == pigeoncare.ActionEphemeralRunner {
-			fmt.Fprintf(&mText, "Interpreter: %s | Timeout: %ds | SHA-256: %s\n", prop.Interpreter, prop.TimeoutSec, prop.SHA256[:16])
+			fmt.Fprintf(&mText, "Interpreter: %s | Timeout: %ds | SHA-256: %s\n",
+				prop.Interpreter, prop.TimeoutSec, truncateRunes(prop.SHA256, 16, ""))
 			fmt.Fprintf(&mText, "Targets: nodes=%v tags=%v\n", prop.Selectors.Nodes, prop.Selectors.Tags)
 			fmt.Fprintf(&mText, "Script:\n%s\n", strings.TrimSpace(prop.ScriptBody))
 		} else if prop.Kind == pigeoncare.ActionCreatePMV {

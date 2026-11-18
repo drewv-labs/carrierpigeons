@@ -10,7 +10,7 @@ import (
 func TestCTDPayloadLifecycleAndRouting(t *testing.T) {
 	p := NewCTDPayload("rv64-coop-01", "host-os", "active").
 		AddMetric("load_1m", 1.42).
-		AddParam("io_method", "epoll")
+		AddParam("governor", "performance")
 
 	if p.NodeID != "rv64-coop-01" {
 		t.Fatalf("expected NodeID rv64-coop-01, got %q", p.NodeID)
@@ -40,7 +40,7 @@ func TestCTDPayloadLifecycleAndRouting(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("Unmarshal failed: %v", err)
 	}
-	if decoded.Component != "host-os" || decoded.Params["io_method"] != "epoll" {
+	if decoded.Component != "host-os" || decoded.Params["governor"] != "performance" {
 		t.Fatalf("round-trip mismatch: %+v", decoded)
 	}
 }
@@ -48,10 +48,10 @@ func TestCTDPayloadLifecycleAndRouting(t *testing.T) {
 func TestCTDPayloadArtifactAndTrace(t *testing.T) {
 	p := NewCTDPayload("rv64-compute-01", "pipeline", "completed").
 		WithArtifact(Artifact{
-			ID:   "dataset:clean-001",
+			ID:   "dataset:telemetry-001",
 			Kind: "dataset",
 		}).
-		WithTrace("dataset:raw-001", "transformed_into", "dataset:clean-001", map[string]string{"profile": "rva23"})
+		WithTrace("dataset:raw-001", "transformed_into", "dataset:telemetry-001", map[string]string{"arch": "riscv64"})
 
 	if p.Pillar != PillarTracer {
 		t.Fatalf("WithTrace should set PillarTracer, got %q", p.Pillar)
@@ -88,7 +88,7 @@ func TestNormalizeTagsAndRunnerRequestValidate(t *testing.T) {
 		Action:      "start",
 		Runner:      "SyntheticComputeRnr",
 		Selectors:   RunnerSelector{Nodes: []string{"rv64-compute-01"}, Tags: []string{"compute-bench"}},
-		RequestedBy: "drew",
+		RequestedBy: "operator",
 		RequestedAt: time.Now().UTC(),
 	}
 	if err := req.Validate(); err != nil {

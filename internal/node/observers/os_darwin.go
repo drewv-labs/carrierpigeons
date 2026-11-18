@@ -4,29 +4,146 @@ package observers
 
 import (
 	"context"
+	"encoding/binary"
 	"log"
+	"math"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"golang.org/x/sys/unix"
 )
 
-var darwinSMCFanRe = regexp.MustCompile(`(?i)Fan(?:\s*(\d+))?\s*:\s*([\d\.]+)\s*rpm`)
+var (
+	darwinSMCFanRe = regexp.MustCompile(`(?i)Fan(?:\s*(\d+))?\s*:\s*([\d\.]+)\s*rpm`)
+	darwinTempRe   = regexp.MustCompile(`(?i)(?:CPU die temperature|SMC.*temp).*?:\s*([\d\.]+)\s*C`)
+
+	darwinPMCacheMu sync.Mutex
+	darwinPMCacheAt time.Time
+	darwinPMCache   string
+)
+
+// sampleDarwinPowermetrics consolidates SMC, GPU, and ANE `powermetrics` queries into a single cached subprocess call per interval.
+func sampleDarwinPowermetrics(ctx context.Context) (string, error) {
+	ttl := min(pollInterval(ctx)/2, 2*time.Second)
+	if ttl < 500*time.Millisecond {
+		ttl = 500 * time.Millisecond
+	}
+
+	darwinPMCacheMu.Lock()
+	if darwinPMCache != "" && time.Since(darwinPMCacheAt) < ttl {
+		cached := darwinPMCache
+		darwinPMCacheMu.Unlock()
+		return cached, nil
+	}
+	darwinPMCacheMu.Unlock()
+
+	samplers := "smc,gpu_power"
+	if runtime.GOARCH == "arm64" {
+		samplers = "smc,gpu_power,ane_power"
+	}
+	out, err := runCommand(ctx, defaultCmdTimeout, "powermetrics", "--samplers", samplers, "-n", "1", "-i", "100")
+	if err != nil {
+		return "", err
+	}
+
+	s := string(out)
+	darwinPMCacheMu.Lock()
+	darwinPMCache = s
+	darwinPMCacheAt = time.Now()
+	darwinPMCacheMu.Unlock()
+	return s, nil
+}
+
+func readDarwinLoadAvg() (load1, load5, load15 float64, ok bool) {
+	raw, err := unix.SysctlRaw("vm.loadavg")
+	if err != nil || len(raw) < 24 {
+		return 0, 0, 0, false
+	}
+	l1 := binary.LittleEndian.Uint32(raw[0:4])
+	l5 := binary.LittleEndian.Uint32(raw[4:8])
+	l15 := binary.LittleEndian.Uint32(raw[8:12])
+	scale := int64(binary.LittleEndian.Uint64(raw[16:24]))
+	if scale <= 0 {
+		scale = 2048
+	}
+	fScale := float64(scale)
+	return math.Round((float64(l1)/fScale)*100) / 100,
+		math.Round((float64(l5)/fScale)*100) / 100,
+		math.Round((float64(l15)/fScale)*100) / 100,
+		true
+}
 
 func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	log.Println("[OS Observer] macOS/Darwin host detected.")
+	log.Println("[OS Observer] macOS/Darwin host detected (zero-fork sysctl observer).")
 
 	isRoot := os.Geteuid() == 0
-
 	var memTotalMB float64
-	if out, err := runCommand(ctx, defaultCmdTimeout, "sysctl", "-n", "hw.memsize"); err == nil {
-		if bytesTotal, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64); err == nil {
-			memTotalMB = bytesTotal / 1024.0 / 1024.0
+	if memBytes, err := unix.SysctlUint64("hw.memsize"); err == nil && memBytes > 0 {
+		memTotalMB = math.Round((float64(memBytes)/1024.0/1024.0)*10) / 10
+	}
+
+	emit := func() {
+		event := core.NewCTDPayload(nodeID, "host-os", "active")
+		if memTotalMB > 0 {
+			event.AddMetric("mem_total_mb", memTotalMB)
+		}
+		if tv, err := unix.SysctlTimeval("kern.boottime"); err == nil && tv.Sec > 0 {
+			uptime := time.Since(time.Unix(tv.Sec, int64(tv.Usec)*1000)).Seconds()
+			if uptime > 0 {
+				event.AddMetric("uptime_s", math.Round(uptime))
+			}
+		}
+		if l1, l5, l15, ok := readDarwinLoadAvg(); ok {
+			event.AddMetric("load_1m", l1)
+			event.AddMetric("load_5m", l5)
+			event.AddMetric("load_15m", l15)
+		}
+
+		if isRoot {
+			if smcOut, err := sampleDarwinPowermetrics(ctx); err == nil {
+				matches := darwinSMCFanRe.FindAllStringSubmatch(smcOut, -1)
+				if len(matches) > 0 {
+					fans := make(map[string]int, len(matches))
+					firstSet := false
+					for i, m := range matches {
+						rpmFloat, err := strconv.ParseFloat(m[2], 64)
+						if err != nil {
+							continue
+						}
+						rpm := int(rpmFloat)
+						idx := m[1]
+						if idx == "" {
+							idx = strconv.Itoa(i)
+						}
+						fans["smc:fan"+idx] = rpm
+						if !firstSet {
+							event.AddMetric("cpu_fan_rpm", rpm)
+							firstSet = true
+						}
+					}
+					if len(fans) > 0 {
+						event.AddMetric("fans_rpm", fans)
+					}
+				}
+				if tMatch := darwinTempRe.FindStringSubmatch(smcOut); len(tMatch) > 1 {
+					if tC, err := strconv.ParseFloat(tMatch[1], 64); err == nil && tC > 0 {
+						event.AddMetric("cpu_temp_c", tC)
+					}
+				}
+			}
+		}
+
+		if err := pub.Publish(event); err != nil {
+			log.Printf("[OS Observer] Publish failed: %v", err)
 		}
 	}
+
+	emit()
 
 	ticker := time.NewTicker(pollInterval(ctx))
 	defer ticker.Stop()
@@ -36,60 +153,7 @@ func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			event := core.NewCTDPayload(nodeID, "host-os", "active")
-			if memTotalMB > 0 {
-				event.AddMetric("mem_total_mb", memTotalMB)
-			}
-
-			// Example output: "{ 2.14 1.98 1.85 }"
-			if out, err := runCommand(ctx, defaultCmdTimeout, "sysctl", "-n", "vm.loadavg"); err == nil {
-				trimmed := strings.Trim(strings.TrimSpace(string(out)), "{}")
-				fields := strings.Fields(trimmed)
-				if len(fields) >= 1 {
-					if load1, err := strconv.ParseFloat(fields[0], 64); err == nil {
-						event.AddMetric("load_1m", load1)
-					}
-				}
-				if len(fields) >= 2 {
-					if load5, err := strconv.ParseFloat(fields[1], 64); err == nil {
-						event.AddMetric("load_5m", load5)
-					}
-				}
-			}
-
-			// Observe Apple SMC cooler fan RPM when running with root privileges
-			if isRoot {
-				if smcOut, err := runCommand(ctx, defaultCmdTimeout, "powermetrics", "--samplers", "smc", "-n", "1", "-i", "100"); err == nil {
-					matches := darwinSMCFanRe.FindAllStringSubmatch(string(smcOut), -1)
-					if len(matches) > 0 {
-						fans := make(map[string]int, len(matches))
-						firstSet := false
-						for i, m := range matches {
-							rpmFloat, err := strconv.ParseFloat(m[2], 64)
-							if err != nil {
-								continue
-							}
-							rpm := int(rpmFloat)
-							idx := m[1]
-							if idx == "" {
-								idx = strconv.Itoa(i)
-							}
-							fans["smc:fan"+idx] = rpm
-							if !firstSet {
-								event.AddMetric("cpu_fan_rpm", rpm)
-								firstSet = true
-							}
-						}
-						if len(fans) > 0 {
-							event.AddMetric("fans_rpm", fans)
-						}
-					}
-				}
-			}
-
-			if err := pub.Publish(event); err != nil {
-				log.Printf("[OS Observer] Publish failed: %v", err)
-			}
+			emit()
 		}
 	}
 }

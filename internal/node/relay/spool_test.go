@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func TestRingSpoolEvictsOldestWhenFull(t *testing.T) {

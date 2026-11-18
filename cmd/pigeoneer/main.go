@@ -8,9 +8,9 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/edge"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/edge"
 )
 
 func main() {

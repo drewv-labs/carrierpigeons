@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {

@@ -1,13 +1,13 @@
-//go:build !linux
+//go:build !linux && !darwin && !windows
 
 package observers
 
 import (
 	"context"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func observeNetPlatform(_ context.Context, _ core.TelemetryPublisher, _ string) {
-	// Non-Linux network observers are currently no-ops.
+	// Unsupported OS network observer stub.
 }

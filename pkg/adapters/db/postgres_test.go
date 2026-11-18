@@ -5,7 +5,7 @@ import (
 )
 
 func TestValidateViewIdentifier(t *testing.T) {
-	valid := []string{"benchmark_telemetry", "_internal_view", "v1_epoll_stats"}
+	valid := []string{"benchmark_telemetry", "_internal_view", "v1_storage_stats"}
 	for _, name := range valid {
 		if err := validateViewIdentifier(name); err != nil {
 			t.Fatalf("expected valid view identifier %q, got %v", name, err)
@@ -42,6 +42,9 @@ func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
 	validQueries := []string{
 		"SELECT node_id, created_at, updated_at FROM ctd_nodes;",
 		"WITH recent AS (SELECT node_id, metrics FROM telemetric_ledger) SELECT * FROM recent",
+		"SELECT 'drop table telemetric_ledger; update ctd_nodes' AS literal_note FROM ctd_nodes",
+		"SELECT $$delete from telemetric_ledger$$ AS dollar_literal /* nested /* drop */ comment */ FROM ctd_nodes",
+		"SELECT node_id -- trailing comment with delete keyword\nFROM ctd_nodes",
 	}
 	for _, q := range validQueries {
 		if _, err := ValidateSelectOnlySQL(q); err != nil {
@@ -55,11 +58,22 @@ func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
 		"SELECT 1; DROP TABLE telemetric_ledger",
 		"WITH evil AS (DELETE FROM telemetric_ledger RETURNING *) SELECT * FROM evil",
 		"UPDATE ctd_nodes SET status = 'OFFLINE'",
+		"SELECT * INTO sneaky_copy FROM ctd_nodes",
+		"SELECT pg_sleep(30)",
+		"SELECT lo_import('/etc/passwd')",
+		"SELECT pg_read_file('/etc/hostname')",
 	}
 	for _, q := range blockedQueries {
 		if _, err := ValidateSelectOnlySQL(q); err == nil {
-			t.Fatalf("expected mutating query %q to be rejected", q)
+			t.Fatalf("expected mutating or dangerous query %q to be rejected", q)
 		}
+	}
+}
+
+func TestDeriveReadOnlyURLFromAdmin(t *testing.T) {
+	roURL := DeriveReadOnlyURLFromAdmin("postgres://ctd_ingestor:ingestor_pw@127.0.0.1:5432/edge_ledger?sslmode=disable", "ro_secret")
+	if roURL != "postgres://pigeoncare_ro:ro_secret@127.0.0.1:5432/edge_ledger?sslmode=disable" {
+		t.Fatalf("unexpected derived URL: %q", roURL)
 	}
 }
 

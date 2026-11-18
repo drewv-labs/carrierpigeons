@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeons/tui"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/spf13/cobra"
 )
 

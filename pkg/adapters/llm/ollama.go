@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 var _ BaseLLM = (*OllamaAdapter)(nil)
@@ -23,7 +24,7 @@ type OllamaAdapter struct {
 func NewOllamaAdapter(endpoint, model string, tools ToolExecutor) *OllamaAdapter {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	if endpoint == "" {
-		endpoint = "http://localhost:11434"
+		endpoint = "http://127.0.0.1:11434"
 	}
 	if strings.TrimSpace(model) == "" {
 		model = "qwen2.5-coder"
@@ -32,7 +33,11 @@ func NewOllamaAdapter(endpoint, model string, tools ToolExecutor) *OllamaAdapter
 		endpoint: endpoint + "/api/chat",
 		model:    model,
 		tools:    tools,
-		client:   &http.Client{},
+		client: &http.Client{
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
+		},
 	}
 }
 
@@ -124,7 +129,12 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 					}
 				}
 			}
+			scanErr := scanner.Err()
 			resp.Body.Close()
+			if scanErr != nil && ctx.Err() == nil {
+				sendToken(ctx, tokenChan, fmt.Sprintf("\n[Ollama stream error: %v]", scanErr))
+				return
+			}
 
 			if len(toolCalls) == 0 || a.tools == nil {
 				return

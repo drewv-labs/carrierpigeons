@@ -9,12 +9,12 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncare"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeons/tui"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeoncare"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/spf13/cobra"
 )
@@ -64,7 +64,40 @@ func resolveBrokerURL() string {
 			return val
 		}
 	}
-	return "tcp://localhost:1883"
+	return "tcp://127.0.0.1:1883"
+}
+
+func dialMQTTClient(brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
+	mqttAuth := wsCfg.EffectiveMQTTAuth()
+	tlsCfg, err := config.BuildMQTTTLSConfig(
+		mqttAuth.TLSCAFile,
+		mqttAuth.TLSCertFile,
+		mqttAuth.TLSKeyFile,
+		mqttAuth.TLSInsecureSkipVerify,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := mqtt.NewClientOptions().
+		AddBroker(brokerURL).
+		SetClientID(clientID).
+		SetConnectTimeout(timeout)
+	if mqttAuth.Username != "" {
+		opts.SetUsername(mqttAuth.Username)
+		opts.SetPassword(mqttAuth.Password)
+	}
+	if tlsCfg != nil {
+		opts.SetTLSConfig(tlsCfg)
+	}
+
+	client := mqtt.NewClient(opts)
+	if tok := client.Connect(); !tok.WaitTimeout(timeout) {
+		return nil, fmt.Errorf("timeout connecting MQTT broker %s", brokerURL)
+	} else if tok.Error() != nil {
+		return nil, fmt.Errorf("connect MQTT broker %s: %w", brokerURL, tok.Error())
+	}
+	return client, nil
 }
 
 func openOperatorStore(ctx context.Context) (*db.PostgresStore, error) {
@@ -73,6 +106,12 @@ func openOperatorStore(ctx context.Context) (*db.PostgresStore, error) {
 		AppActor: actor,
 		MaxConns: 6,
 		MinConns: 1,
+	})
+}
+
+func openReadOnlyStore(ctx context.Context, actor string) (*db.ReadOnlyAgentStore, error) {
+	return db.NewReadOnlyAgentStore(ctx, wsCfg.ReadOnlyDatabaseURL, actor, db.ReadOnlyOptions{
+		AllowSuperuser: wsCfg.AllowSuperuserReadOnly,
 	})
 }
 
@@ -85,14 +124,10 @@ func publishRunnerRequest(brokerURL string, req core.RunnerRequestCTD) error {
 		return err
 	}
 
-	opts := mqtt.NewClientOptions().
-		AddBroker(brokerURL).
-		SetClientID(fmt.Sprintf("%s-req-%d", wsCfg.Brand.CLIName, time.Now().UnixNano())).
-		SetConnectTimeout(4 * time.Second)
-
-	client := mqtt.NewClient(opts)
-	if tok := client.Connect(); tok.WaitTimeout(4*time.Second) && tok.Error() != nil {
-		return fmt.Errorf("connect MQTT broker %s: %w", brokerURL, tok.Error())
+	clientID := fmt.Sprintf("%s-req-%d", wsCfg.Brand.CLIName, time.Now().UnixNano())
+	client, err := dialMQTTClient(brokerURL, clientID, 4*time.Second)
+	if err != nil {
+		return err
 	}
 	defer client.Disconnect(200)
 
@@ -105,7 +140,7 @@ func publishRunnerRequest(brokerURL string, req core.RunnerRequestCTD) error {
 
 func launchDashboard(initialTab tui.TabID, focusReq, faultContext, modeOverride string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	roStore, err := db.NewReadOnlyAgentStore(ctx, wsCfg.ReadOnlyDatabaseURL, strings.ToLower(wsCfg.Brand.AgentName))
+	roStore, err := openReadOnlyStore(ctx, strings.ToLower(wsCfg.Brand.AgentName))
 	cancel()
 	if err != nil {
 		return fmt.Errorf("connect read-only CTD Ledger: %w", err)

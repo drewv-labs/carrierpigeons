@@ -1,55 +1,40 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
+	"strings"
+	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/spf13/cobra"
 )
 
 var runnerAbortCmd = &cobra.Command{
 	Use:   "abort [runner-name] [node-ids...]",
-	Short: "Send a hard kill signal to an active runner on edge nodes",
+	Short: "Send a hard kill signal to an active runner via PigeonCoop RunnerRequestCTD",
 	Args:  cobra.MinimumNArgs(2),
-	Run: func(_ *cobra.Command, args []string) {
-		runnerName := args[0]
-		targetNodes := args[1:]
+	RunE: func(_ *cobra.Command, args []string) error {
+		runnerName := strings.TrimSpace(args[0])
+		targetNodes := cleanSelectorTokens(args[1:], false)
+
+		req := core.RunnerRequestCTD{
+			RequestID: fmt.Sprintf("abort-%d", time.Now().UTC().UnixNano()),
+			Action:    "abort",
+			Runner:    runnerName,
+			Selectors: core.RunnerSelector{
+				Nodes: targetNodes,
+			},
+			RequestedBy: wsCfg.Operator,
+			RequestedAt: time.Now().UTC(),
+		}
 
 		brokerURL := resolveBrokerURL()
-		opts := mqtt.NewClientOptions().
-			AddBroker(brokerURL).
-			SetClientID(fmt.Sprintf("pigeons-cli-abort-%d", os.Getpid()))
-		client := mqtt.NewClient(opts)
-		if token := client.Connect(); token.Wait() && token.Error() != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Could not reach broker (%s): %v\n", brokerURL, token.Error())
-			os.Exit(1)
-		}
-		defer client.Disconnect(250)
-
-		env := runner.Envelope{
-			Action: "abort",
-			Runner: runnerName,
-		}
-		payload, err := json.Marshal(env)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Failed to marshal abort envelope: %v\n", err)
-			os.Exit(1)
+		if err := publishRunnerRequest(brokerURL, req); err != nil {
+			return err
 		}
 
-		for _, nodeID := range targetNodes {
-			topic := core.ControlTopic(nodeID)
-			token := client.Publish(topic, 1, false, payload)
-			token.Wait()
-			if token.Error() == nil {
-				fmt.Printf("[+] Dispatched abort signal for %q to %s\n", runnerName, nodeID)
-			} else {
-				fmt.Fprintf(os.Stderr, "[-] Failed to dispatch to %s: %v\n", nodeID, token.Error())
-			}
-		}
+		fmt.Printf("[+] Submitted abort RunnerRequestCTD %s for %q -> %v\n", req.RequestID, runnerName, targetNodes)
+		return nil
 	},
 }
 

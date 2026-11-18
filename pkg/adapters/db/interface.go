@@ -5,7 +5,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // NodeSummary represents the materialized state of an edge or hub node for CLI, TUI, and MCP.
@@ -81,6 +81,7 @@ type MathDB interface {
 	GetPMV(ctx context.Context, viewName string) (*PMVRecord, error)
 	ListPMVs(ctx context.Context) ([]PMVRecord, error)
 	MaterializePMV(ctx context.Context, viewName string, selectSQL string) error
+	DropPMV(ctx context.Context, viewName string) error
 }
 
 // AgentSafeDB combines strictly read-only CTD Ledger queries with isolated `pigeonmath` view management.
@@ -108,6 +109,7 @@ type BaseDB interface {
 	// Node & Hub-authoritative Tag Registry
 	UpsertNodeHello(ctx context.Context, hello core.NodeHello) ([]string, error)
 	UpdateNodePresence(ctx context.Context, nodeID, status string) error
+	UpdateNodePresenceTransition(ctx context.Context, nodeID, status string) (prevStatus string, changed bool, err error)
 	AddNodeTags(ctx context.Context, nodeID string, tags []string) ([]string, error)
 	RemoveNodeTags(ctx context.Context, nodeID string, tags []string) ([]string, error)
 

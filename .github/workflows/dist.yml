@@ -4,20 +4,48 @@ on:
   push:
     branches:
       - main
+      - master
     tags:
       - 'v*' # Triggers a formal release on version tags (e.g., v1.0.0)
+  pull_request:
+    branches:
+      - main
+      - master
 
 jobs:
+  test:
+    name: Vet & Race Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run Vet & Unit Tests
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
   build:
     name: Build Go Binaries
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, darwin]
+        goos: [linux, darwin, windows]
         goarch: [amd64, arm64, riscv64]
         exclude:
           # Apple does not make RISC-V hardware
           - goos: darwin
+            goarch: riscv64
+          # Windows distribution targets amd64
+          - goos: windows
+            goarch: arm64
+          - goos: windows
             goarch: riscv64
 
     steps:
@@ -29,12 +57,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Run Vet & Unit Tests
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: |
-          go vet ./...
-          go test -race ./...
-
       - name: Build Binaries
         env:
           CGO_ENABLED: '0'
@@ -43,18 +65,22 @@ jobs:
         run: |
           mkdir -p dist
           LDFLAGS="-s -w"
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
 
           # Build Pigeoneer (Edge Daemon)
-          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeoneer-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeoneer
+          go build -trimpath -ldflags="$LDFLAGS" -o "dist/pigeoneer-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/pigeoneer
 
           # Build PigeonCoop (Hub Injector)
-          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeoncoop-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeoncoop
+          go build -trimpath -ldflags="$LDFLAGS" -o "dist/pigeoncoop-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/pigeoncoop
 
           # Build PigeonMCP (Model Context Protocol Sidecar)
-          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeonmcp-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeonmcp
+          go build -trimpath -ldflags="$LDFLAGS" -o "dist/pigeonmcp-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/pigeonmcp
 
           # Build Pigeons (CLI / TUI)
-          go build -trimpath -ldflags="$LDFLAGS" -o dist/pigeons-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/pigeons
+          go build -trimpath -ldflags="$LDFLAGS" -o "dist/pigeons-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/pigeons
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
@@ -76,6 +102,11 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Generate SHA-256 Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > checksums.txt
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2

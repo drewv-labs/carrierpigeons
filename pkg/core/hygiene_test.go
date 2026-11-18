@@ -11,20 +11,31 @@ import (
 func TestRepositoryUpstreamVendorNeutrality(t *testing.T) {
 	repoRoot := filepath.Join("..", "..")
 
-	// Assemble downstream appliance tokens dynamically so this test file itself stays clean.
+	// Assemble downstream appliance & sibling-project tokens dynamically so this test file stays clean.
 	forbidden := []string{
 		"braker" + "rak",
 		"braker" + "box",
 		"brak" + "sky",
 		"braker" + "bench",
+		"bracker" + "bench",
+		"vision" + "bench",
 		"vision" + "ferret",
 		"ada" + "lovespace",
 		"ham" + "stak",
 		"babbage" + "box",
+		"rv" + "dk",
+		"riscv-" + "data-kit",
+		"riscv_" + "data_kit",
+		"fits " + "frame",
+		"calibrated_" + "into",
+		"io_" + "uring",
+		"lil" + "blu",
+		"big" + "red",
 	}
 
 	skipExt := map[string]bool{
 		".png": true, ".gif": true, ".jpg": true, ".jpeg": true, ".ico": true, ".sum": true,
+		".exe": true, ".bin": true,
 	}
 
 	err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, walkErr error) error {
@@ -32,7 +43,8 @@ func TestRepositoryUpstreamVendorNeutrality(t *testing.T) {
 			return walkErr
 		}
 		if d.IsDir() {
-			if strings.HasPrefix(d.Name(), ".") {
+			name := d.Name()
+			if name == ".git" || name == "dist" || name == "vendor" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -47,7 +59,7 @@ func TestRepositoryUpstreamVendorNeutrality(t *testing.T) {
 		lower := strings.ToLower(string(raw))
 		for _, bad := range forbidden {
 			if strings.Contains(lower, bad) {
-				t.Errorf("downstream appliance branding token %q found in %s", bad, path)
+				t.Errorf("downstream appliance/sibling token %q found in %s", bad, path)
 			}
 		}
 		return nil

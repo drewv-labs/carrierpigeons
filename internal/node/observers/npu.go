@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // observeNPU detects local neural processing units and routes to the matching observer.

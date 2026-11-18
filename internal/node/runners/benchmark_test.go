@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
 type capturePublisher struct {
@@ -84,7 +84,17 @@ func TestEphemeralRunnerExecutesAndEnforcesPolicy(t *testing.T) {
 	params := spec.ToParams()
 	params["request_id"] = "req-eph-01"
 
-	if err := er.Run(context.Background(), "rv64-compute-01", params, pub); err != nil {
+	// Default policy must deny ephemeral execution unless explicitly opted in.
+	if err := er.Run(context.Background(), "rv64-compute-01", params, &capturePublisher{}); err == nil {
+		t.Fatal("expected default policy (AllowEphemeral=false) to block execution")
+	}
+
+	allowCtx := runner.WithExecutionPolicy(context.Background(), runner.ExecutionPolicy{
+		AllowEphemeral:      true,
+		AllowedInterpreters: []string{"sh", "bash", "python3"},
+		MaxTimeoutSec:       30,
+	})
+	if err := er.Run(allowCtx, "rv64-compute-01", params, pub); err != nil {
 		t.Fatalf("EphemeralRunner failed: %v", err)
 	}
 
@@ -107,15 +117,7 @@ func TestEphemeralRunnerExecutesAndEnforcesPolicy(t *testing.T) {
 		"interpreter": "perl",
 		"script_body": "print 1;",
 	}
-	if err := er.Run(context.Background(), "rv64-compute-01", badParams, blockedPub); err == nil {
+	if err := er.Run(allowCtx, "rv64-compute-01", badParams, blockedPub); err == nil {
 		t.Fatal("expected disallowed interpreter 'perl' to be rejected")
-	}
-
-	// Disabled ephemeral policy must fail
-	disabledCtx := runner.WithExecutionPolicy(context.Background(), runner.ExecutionPolicy{
-		AllowEphemeral: false,
-	})
-	if err := er.Run(disabledCtx, "rv64-compute-01", params, blockedPub); err == nil {
-		t.Fatal("expected AllowEphemeral=false policy to block execution")
 	}
 }

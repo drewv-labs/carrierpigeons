@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 type stubSafeDB struct{}
@@ -51,7 +51,8 @@ func (s *stubSafeDB) ListPMVs(context.Context) ([]db.PMVRecord, error) { return 
 func (s *stubSafeDB) MaterializePMV(context.Context, string, string) error {
 	return nil
 }
-func (s *stubSafeDB) Close() {}
+func (s *stubSafeDB) DropPMV(context.Context, string) error { return nil }
+func (s *stubSafeDB) Close()                                {}
 
 func TestPolicyGateModesAndEphemeralRunnerConfirmation(t *testing.T) {
 	var prompts atomic.Int32

@@ -1,8 +1,8 @@
 package controlplane
 
 import (
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeons/cli"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeons/cli"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/spf13/cobra"
 )
 

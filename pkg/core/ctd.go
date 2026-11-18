@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 )
 
 const (
@@ -124,7 +124,7 @@ const (
 	PillarTracer   Pillar = "tracer"
 )
 
-// Artifact represents any tangible Noun (hardware node, dataset, binary blob, script, PMV) in the DAG.
+// Artifact represents any tangible Noun (hardware node, dataset, telemetry snapshot, script, PMV) in the DAG.
 type Artifact struct {
 	ID        string            `json:"id"`
 	Kind      string            `json:"kind"` // e.g., "node", "dataset", "ephemeral_runner", "pmv"

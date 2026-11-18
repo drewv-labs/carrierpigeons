@@ -4,25 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 var ntfyHTTPClient = &http.Client{
 	Timeout: 5 * time.Second,
 }
 
-// handleHelloUpdate ingests NodeHello hardware capabilities & boot tags on `pigeons/registry/+/hello`.
-func (s *Subscriber) handleHelloUpdate(_ mqtt.Client, msg mqtt.Message) {
+// processHelloUpdate ingests NodeHello hardware capabilities & boot tags on `<root>/registry/+/hello`.
+func (s *Subscriber) processHelloUpdate(topic string, payload []byte) {
 	var hello core.NodeHello
-	if err := json.Unmarshal(msg.Payload(), &hello); err != nil {
-		log.Printf("[Registry] Malformed NodeHello on %s: %v", msg.Topic(), err)
+	if err := json.Unmarshal(payload, &hello); err != nil {
+		log.Printf("[Registry] Malformed NodeHello on %s: %v", topic, err)
 		return
 	}
 	if strings.TrimSpace(hello.NodeID) == "" {
@@ -41,33 +41,61 @@ func (s *Subscriber) handleHelloUpdate(_ mqtt.Client, msg mqtt.Message) {
 		hello.NodeID, hello.OS, hello.Arch, hello.NumCPU, tags)
 }
 
-// handleRegistryUpdate intercepts LWT / presence messages, persists presence in PostgreSQL, and triggers Ntfy alerts.
-func (s *Subscriber) handleRegistryUpdate(_ mqtt.Client, msg mqtt.Message) {
+// processRegistryUpdate intercepts LWT / presence messages, persists presence in PostgreSQL,
+// and triggers bounded Ntfy alerts strictly on genuine state transitions.
+func (s *Subscriber) processRegistryUpdate(topic string, payload []byte) {
 	// Topic structure: <root>/registry/<node_id>/status
-	parts := strings.Split(msg.Topic(), "/")
+	parts := strings.Split(topic, "/")
 	if len(parts) < 3 {
 		return
 	}
 
-	nodeID := strings.TrimPrefix(parts[len(parts)-2], "pigeoneer-")
-	status := strings.TrimSpace(string(msg.Payload()))
+	nodeID := strings.TrimSpace(parts[len(parts)-2])
+	if nodeID == "" {
+		return
+	}
+	status := strings.TrimSpace(string(payload))
+	if status != "OFFLINE" && status != "ONLINE" {
+		return
+	}
 
-	log.Printf("[Registry] %s state changed to: %s", nodeID, status)
-
-	if status == "OFFLINE" || status == "ONLINE" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	changed := true
+	if tl, ok := s.ledger.(TransitionLedger); ok {
+		prev, didChange, err := tl.UpdateNodePresenceTransition(ctx, nodeID, status)
+		if err != nil {
+			log.Printf("[Registry] Failed updating presence for %s: %v", nodeID, err)
+			changed = false
+		} else {
+			// Alert on genuine transitions (OFFLINE always alerts if changed; ONLINE alerts when recovering from OFFLINE).
+			changed = didChange && (status == "OFFLINE" || prev == "OFFLINE")
+		}
+	} else {
 		if err := s.ledger.UpdateNodePresence(ctx, nodeID, status); err != nil {
 			log.Printf("[Registry] Failed updating presence for %s: %v", nodeID, err)
+			changed = false
 		}
-		cancel()
+	}
+	cancel()
 
-		if s.ntfyEnabled && s.ntfyURL != "" {
-			go s.sendNtfyAlert(nodeID, status)
+	if changed {
+		log.Printf("[Registry] %s state changed to: %s", nodeID, status)
+	}
+
+	if changed && s.ntfyEnabled && s.ntfyURL != "" {
+		select {
+		case s.ntfySem <- struct{}{}:
+			go func() {
+				defer func() { <-s.ntfySem }()
+				s.sendNtfyAlert(nodeID, status)
+			}()
+		default:
+			log.Printf("[Ntfy] Alert concurrency limit reached; skipping duplicate notification for %s (%s)", nodeID, status)
 		}
 	}
 }
 
-// sendNtfyAlert pushes a notification to the configured Ntfy instance.
+// sendNtfyAlert pushes a notification to the configured Ntfy instance and drains the HTTP body for keep-alive reuse.
 func (s *Subscriber) sendNtfyAlert(nodeID, status string) {
 	url := strings.TrimSpace(s.ntfyURL)
 	if url == "" || url == "off" || url == "disabled" || url == "none" {
@@ -103,5 +131,6 @@ func (s *Subscriber) sendNtfyAlert(nodeID, status string) {
 		log.Printf("[Ntfy] Failed to send alert: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
 }

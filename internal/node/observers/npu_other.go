@@ -5,7 +5,7 @@ package observers
 import (
 	"context"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func observeNPUPlatform(_ context.Context, _ core.TelemetryPublisher, _ string) {

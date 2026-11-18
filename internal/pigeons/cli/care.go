@@ -1,7 +1,7 @@
 package cli
 
 import (
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeons/tui"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
 	"github.com/spf13/cobra"
 )
 

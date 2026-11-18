@@ -6,18 +6,19 @@ import (
 	"log"
 	"strings"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/mcpserver"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/mcpserver"
 )
 
 func main() {
 	var (
-		cfgPath  = flag.String("config", "", "Optional path to pigeons.toml")
-		httpAddr = flag.String("http", "", "Serve Streamable HTTP on host:port instead of stdio (e.g. 127.0.0.1:8089)")
-		dbURL    = flag.String("db-url", "", "Override Read-Only PostgreSQL DSN")
+		cfgPath   = flag.String("config", "", "Optional path to pigeons.toml")
+		httpAddr  = flag.String("http", "", "Serve Streamable HTTP on host:port instead of stdio (e.g. 127.0.0.1:8089)")
+		authToken = flag.String("auth-token", "", "Bearer token for --http Streamable HTTP mode (required on non-loopback)")
+		dbURL     = flag.String("db-url", "", "Override Read-Only PostgreSQL DSN")
 	)
 	flag.Parse()
 
@@ -35,8 +36,16 @@ func main() {
 		dsn = db.ResolveReadOnlyDBURL()
 	}
 
+	token := strings.TrimSpace(*authToken)
+	if token == "" {
+		token = wsCfg.MCPAuthToken
+	}
+
 	ctx := context.Background()
-	store, err := db.NewReadOnlyAgentStore(ctx, dsn, strings.ToLower(wsCfg.Brand.MCPName))
+	store, err := db.NewReadOnlyAgentStore(ctx, dsn, strings.ToLower(wsCfg.Brand.MCPName), db.ReadOnlyOptions{
+		AllowSuperuser: wsCfg.AllowSuperuserReadOnly,
+		MaxRows:        100,
+	})
 	if err != nil {
 		log.Fatalf("%s failed connecting to read-only ledger: %v", wsCfg.Brand.MCPName, err)
 	}
@@ -57,7 +66,9 @@ func main() {
 
 	if strings.TrimSpace(*httpAddr) != "" {
 		log.Printf("Starting %s Streamable HTTP server on %s...", wsCfg.Brand.MCPName, *httpAddr)
-		if err := mcpserver.ServeHTTP(srv, *httpAddr); err != nil {
+		if err := mcpserver.ServeHTTPWithOptions(srv, *httpAddr, mcpserver.HTTPOptions{
+			AuthToken: token,
+		}); err != nil {
 			log.Fatalf("%s HTTP server error: %v", wsCfg.Brand.MCPName, err)
 		}
 		return

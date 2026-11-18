@@ -9,10 +9,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeonmath"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeons/tui"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeonmath"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
 	"github.com/spf13/cobra"
 )
 
@@ -33,7 +32,7 @@ var mathListCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 
-		store, err := db.NewReadOnlyAgentStore(ctx, wsCfg.ReadOnlyDatabaseURL, strings.ToLower(wsCfg.Brand.MathName))
+		store, err := openReadOnlyStore(ctx, strings.ToLower(wsCfg.Brand.MathName))
 		if err != nil {
 			return err
 		}
@@ -69,7 +68,7 @@ var mathInspectCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		store, err := db.NewReadOnlyAgentStore(ctx, wsCfg.ReadOnlyDatabaseURL, strings.ToLower(wsCfg.Brand.MathName))
+		store, err := openReadOnlyStore(ctx, strings.ToLower(wsCfg.Brand.MathName))
 		if err != nil {
 			return err
 		}
@@ -108,7 +107,7 @@ var mathCreateCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 
-		store, err := db.NewReadOnlyAgentStore(ctx, wsCfg.ReadOnlyDatabaseURL, strings.ToLower(wsCfg.Brand.MathName))
+		store, err := openReadOnlyStore(ctx, strings.ToLower(wsCfg.Brand.MathName))
 		if err != nil {
 			return err
 		}

@@ -16,9 +16,10 @@ CREATE TABLE IF NOT EXISTS telemetric_ledger (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_ledger_pillar ON telemetric_ledger (pillar);
 CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_ledger_metrics_gin ON telemetric_ledger USING GIN (metrics);
+CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts ON telemetric_ledger (ingested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';
+CREATE INDEX IF NOT EXISTS idx_ledger_metrics_path_gin ON telemetric_ledger USING GIN (metrics jsonb_path_ops);
 
 CREATE TABLE IF NOT EXISTS ctd_nodes (
 	node_id TEXT PRIMARY KEY,
@@ -80,15 +81,15 @@ CREATE TABLE IF NOT EXISTS pigeonmath.pmv_catalog (
 );
 
 -- Least-Privilege Role Separation:
--- 1) ctd_ingestor: PigeonCoop COPY/INSERT ingestion role
--- 2) pigeoncare_ro: Read-Only on public CTD Ledger + isolated view management in pigeonmath
+-- 1) ctd_ingestor: PigeonCoop COPY/INSERT ingestion role (NOSUPERUSER)
+-- 2) pigeoncare_ro: Read-Only on public CTD Ledger + isolated view management in pigeonmath (NOSUPERUSER)
 DO $$
 BEGIN
 	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ctd_ingestor') THEN
-		CREATE ROLE ctd_ingestor LOGIN PASSWORD 'ctd_ingest_password';
+		CREATE ROLE ctd_ingestor NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD 'ctd_ingest_password';
 	END IF;
 	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pigeoncare_ro') THEN
-		CREATE ROLE pigeoncare_ro LOGIN PASSWORD 'pigeoncare_readonly';
+		CREATE ROLE pigeoncare_ro NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD 'pigeoncare_readonly';
 	END IF;
 END
 $$;
@@ -105,4 +106,4 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO pigeoncare_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO pigeoncare_ro;
 
 GRANT USAGE, CREATE ON SCHEMA pigeonmath TO pigeoncare_ro;
-GRANT SELECT, INSERT, UPDATE ON pigeonmath.pmv_catalog TO pigeoncare_ro;
+GRANT SELECT, INSERT, UPDATE, DELETE ON pigeonmath.pmv_catalog TO pigeoncare_ro;

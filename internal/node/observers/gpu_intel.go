@@ -6,7 +6,7 @@ import (
 	"log"
 	"os/exec"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {

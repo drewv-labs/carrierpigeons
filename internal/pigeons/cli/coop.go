@@ -7,7 +7,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/spf13/cobra"
 )
 
@@ -30,13 +29,9 @@ var coopStatusCmd = &cobra.Command{
 		defer cancel()
 
 		brokerURL := resolveBrokerURL()
-		opts := mqtt.NewClientOptions().
-			AddBroker(brokerURL).
-			SetClientID(fmt.Sprintf("%s-coop-probe-%d", wsCfg.Brand.CLIName, os.Getpid())).
-			SetConnectTimeout(3 * time.Second)
-		mClient := mqtt.NewClient(opts)
-		if tok := mClient.Connect(); tok.Wait() && tok.Error() != nil {
-			fmt.Printf("[MQTT Broker]  DEGRADED (%s: %v)\n", brokerURL, tok.Error())
+		clientID := fmt.Sprintf("%s-coop-probe-%d", wsCfg.Brand.CLIName, os.Getpid())
+		if mClient, err := dialMQTTClient(brokerURL, clientID, 3*time.Second); err != nil {
+			fmt.Printf("[MQTT Broker]  DEGRADED (%v)\n", err)
 		} else {
 			fmt.Printf("[MQTT Broker]  ONLINE   (%s)\n", brokerURL)
 			mClient.Disconnect(100)
@@ -53,10 +48,13 @@ var coopStatusCmd = &cobra.Command{
 
 		counts, err := store.QueryMaps(ctx, fmt.Sprintf(`
 			SELECT
-				(SELECT COUNT(*) FROM telemetric_ledger) AS events,
+				GREATEST(
+					COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = 'public.telemetric_ledger'::regclass), 0),
+					(SELECT COUNT(*) FROM (SELECT 1 FROM telemetric_ledger LIMIT 100000) _bounded_ledger)
+				) AS events,
 				(SELECT COUNT(*) FROM ctd_nodes) AS registered_nodes,
 				(SELECT COUNT(*) FROM ctd_artifacts) AS artifacts,
-				(SELECT COUNT(*) FROM ctd_traces) AS traces,
+				(SELECT COUNT(*) FROM (SELECT 1 FROM ctd_traces LIMIT 100000) _bounded_traces) AS traces,
 				(SELECT COUNT(*) FROM %s.pmv_catalog WHERE status = 'certified') AS certified_pmvs
 		`, wsCfg.Brand.MathSchema))
 		if err == nil && len(counts) > 0 {

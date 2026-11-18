@@ -3,7 +3,7 @@ package relay
 import (
 	"sync"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 const DefaultSpoolCapacity = 10000
@@ -61,13 +61,33 @@ func (r *RingSpool) Push(p *core.CTDPayload) bool {
 
 // PopBlocking blocks until at least one event is available or stopCh is closed.
 func (r *RingSpool) PopBlocking(stopCh <-chan struct{}) (*core.CTDPayload, bool) {
+	batch, ok := r.PopBatchBlocking(1, stopCh)
+	if !ok || len(batch) == 0 {
+		return nil, false
+	}
+	return batch[0], true
+}
+
+// PopBatchBlocking blocks until at least one event is available (or stopCh closes) and pops up to maxItems in FIFO order.
+func (r *RingSpool) PopBatchBlocking(maxItems int, stopCh <-chan struct{}) ([]*core.CTDPayload, bool) {
+	if maxItems <= 0 {
+		maxItems = 1
+	}
 	for {
 		r.mu.Lock()
 		if r.count > 0 {
-			item := r.buf[r.head]
-			r.buf[r.head] = nil // release reference for GC
-			r.head = (r.head + 1) % len(r.buf)
-			r.count--
+			n := r.count
+			if n > maxItems {
+				n = maxItems
+			}
+			out := make([]*core.CTDPayload, n)
+			capLen := len(r.buf)
+			for i := range n {
+				out[i] = r.buf[r.head]
+				r.buf[r.head] = nil // release reference for GC
+				r.head = (r.head + 1) % capLen
+				r.count--
+			}
 			hasMore := r.count > 0
 			r.mu.Unlock()
 			if hasMore {
@@ -76,7 +96,7 @@ func (r *RingSpool) PopBlocking(stopCh <-chan struct{}) (*core.CTDPayload, bool)
 				default:
 				}
 			}
-			return item, true
+			return out, true
 		}
 		r.mu.Unlock()
 
@@ -86,6 +106,24 @@ func (r *RingSpool) PopBlocking(stopCh <-chan struct{}) (*core.CTDPayload, bool)
 		case <-r.notify:
 		}
 	}
+}
+
+// DrainAll atomically extracts all currently buffered events in FIFO order (used during graceful Disconnect).
+func (r *RingSpool) DrainAll() []*core.CTDPayload {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.count == 0 {
+		return nil
+	}
+	out := make([]*core.CTDPayload, r.count)
+	capLen := len(r.buf)
+	for i := range r.count {
+		out[i] = r.buf[r.head]
+		r.buf[r.head] = nil
+		r.head = (r.head + 1) % capLen
+	}
+	r.count = 0
+	return out
 }
 
 // Len returns the current number of buffered events awaiting delivery.

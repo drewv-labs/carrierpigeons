@@ -2,15 +2,19 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeonmath"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeonmath"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -25,7 +29,13 @@ type Options struct {
 	Version   string
 }
 
-// New constructs a configured `*server.MCPServer` ready for `ServeStdio` or `NewStreamableHTTPServer`.
+// HTTPOptions configures Bearer authentication and DNS-rebinding guards for Streamable HTTP mode.
+type HTTPOptions struct {
+	AuthToken                       string
+	AllowUnauthenticatedNonLoopback bool
+}
+
+// New constructs a configured `*server.MCPServer` ready for `ServeStdio` or `ServeHTTPWithOptions`.
 func New(opts Options) *server.MCPServer {
 	bSpec := opts.Brand.MergeWithDefaults()
 	version := strings.TrimSpace(opts.Version)
@@ -202,13 +212,75 @@ func New(opts Options) *server.MCPServer {
 	return s
 }
 
+func isLoopbackOrigin(origin string) bool {
+	if strings.TrimSpace(origin) == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return config.IsLoopbackListen(u.Host)
+}
+
+// NewHTTPHandler wraps an MCPServer in a Streamable HTTP handler with Bearer token auth and DNS-rebinding guards.
+func NewHTTPHandler(s *server.MCPServer, opts HTTPOptions) http.Handler {
+	inner := server.NewStreamableHTTPServer(s)
+	expectedToken := strings.TrimSpace(opts.AuthToken)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if expectedToken != "" {
+			authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
+			const prefix = "Bearer "
+			if len(authHdr) <= len(prefix) || !strings.EqualFold(authHdr[:len(prefix)], prefix) {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="pigeonmcp"`)
+				http.Error(w, "Unauthorized: missing Bearer token", http.StatusUnauthorized)
+				return
+			}
+			got := strings.TrimSpace(authHdr[len(prefix):])
+			if subtle.ConstantTimeCompare([]byte(got), []byte(expectedToken)) != 1 {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="pigeonmcp"`)
+				http.Error(w, "Unauthorized: invalid Bearer token", http.StatusUnauthorized)
+				return
+			}
+		} else {
+			// Loopback-only mode without token: enforce Host and Origin checks to defeat browser DNS-rebinding/CSRF.
+			if !config.IsLoopbackListen(r.Host) {
+				http.Error(w, "Forbidden: non-loopback Host header rejected without auth token", http.StatusForbidden)
+				return
+			}
+			if !isLoopbackOrigin(r.Header.Get("Origin")) {
+				http.Error(w, "Forbidden: cross-origin request rejected", http.StatusForbidden)
+				return
+			}
+		}
+		inner.ServeHTTP(w, r)
+	})
+}
+
 // ServeStdio runs the MCP server over standard input/output (compatible with Zed, Antigravity, Claude Desktop/Code).
 func ServeStdio(s *server.MCPServer) error {
 	return server.ServeStdio(s)
 }
 
-// ServeHTTP runs the MCP server over Streamable HTTP at `listenAddr` (e.g., "127.0.0.1:8089").
+// ServeHTTP runs the MCP server over Streamable HTTP on a loopback address (e.g., "127.0.0.1:8089").
 func ServeHTTP(s *server.MCPServer, listenAddr string) error {
-	httpSrv := server.NewStreamableHTTPServer(s)
-	return httpSrv.Start(listenAddr)
+	return ServeHTTPWithOptions(s, listenAddr, HTTPOptions{})
+}
+
+// ServeHTTPWithOptions runs the MCP server over Streamable HTTP with Bearer authentication and timeouts.
+func ServeHTTPWithOptions(s *server.MCPServer, listenAddr string, opts HTTPOptions) error {
+	listenAddr = strings.TrimSpace(listenAddr)
+	if !config.IsLoopbackListen(listenAddr) && strings.TrimSpace(opts.AuthToken) == "" && !opts.AllowUnauthenticatedNonLoopback {
+		return fmt.Errorf(
+			"refusing unauthenticated MCP HTTP listener on non-loopback %q: configure --auth-token / PIGEONS_MCP_AUTH_TOKEN or bind 127.0.0.1",
+			listenAddr,
+		)
+	}
+	httpSrv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           NewHTTPHandler(s, opts),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	return httpSrv.ListenAndServe()
 }

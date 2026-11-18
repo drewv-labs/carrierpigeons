@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 )
 
 // BucketPoint holds 1-minute aggregated telemetry & fleet liveness counts for PigeonMath graphs.

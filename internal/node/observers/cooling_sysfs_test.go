@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func writeSysfsFile(t *testing.T, root, rel, content string) {
@@ -97,5 +97,35 @@ func TestObserveSysfsCoolingThermalDeviceFallback(t *testing.T) {
 	}
 	if got := ev.Metrics["cpu_fan_pwm_pct"]; got != 75.0 {
 		t.Fatalf("expected cpu_fan_pwm_pct=75.0 from cooling_device0, got %v", got)
+	}
+}
+
+func TestObserveSysfsThermalsAndDiscoverSysfsAMDCards(t *testing.T) {
+	sysRoot := t.TempDir()
+	// Simulate JH7110 sfctemp hwmon without thermal_zone0
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/name", "sfctemp\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp1_input", "51250\n")
+	// Discrete GPU hwmon should be ignored by host CPU thermal observer
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon1/name", "amdgpu\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon1/temp1_input", "88000\n")
+
+	ev := core.NewCTDPayload("rv64-edge-02", "host-os", "active")
+	observeSysfsThermals(sysRoot, ev)
+
+	if got := ev.Metrics["cpu_temp_c"]; got != 51.3 {
+		t.Fatalf("expected cpu_temp_c=51.3 from sfctemp hwmon, got %v", got)
+	}
+	if got := ev.Metrics["soc_temp_c"]; got != 51.3 {
+		t.Fatalf("expected soc_temp_c=51.3 from sfctemp hwmon, got %v", got)
+	}
+
+	// Simulate DRM card discovery
+	writeSysfsFile(t, sysRoot, "class/drm/card0/device/vendor", "0x1002\n")
+	writeSysfsFile(t, sysRoot, "class/drm/card0-DP-1/status", "connected\n")
+	writeSysfsFile(t, sysRoot, "class/drm/card1/device/vendor", "0x10de\n")
+
+	cards := discoverSysfsAMDCards(sysRoot)
+	if len(cards) != 1 || filepath.Base(cards[0]) != "card0" {
+		t.Fatalf("expected only AMD card0 to be discovered, got %v", cards)
 	}
 }

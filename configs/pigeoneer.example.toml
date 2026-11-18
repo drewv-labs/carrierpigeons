@@ -5,7 +5,11 @@ tags           = ["riscv64", "compute-bench", "npu-edge"]
 poll_interval  = "5s"
 spool_capacity = 10000
 broker_url     = "tcp://pigeoncoop.local:1883"
-topic_prefix   = "pigeons/ctd"
+
+[mqtt]
+username    = ""
+password    = ""
+tls_ca_file = ""
 
 [observers]
 os  = true
@@ -15,6 +19,6 @@ npu = true
 
 [runners]
 enabled              = true
-allow_ephemeral      = true
+allow_ephemeral      = false
 allowed_interpreters = ["sh", "bash", "python3"]
 max_timeout_sec      = 300

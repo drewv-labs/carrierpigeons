@@ -8,7 +8,7 @@ import (
 func TestBuildRunnerRequestChainedNodesAndBraceTags(t *testing.T) {
 	req, err := buildRunnerRequest(
 		"SyntheticComputeRnr",
-		"drew",
+		"operator",
 		false,
 		[]string{"rv64-compute-01", "rv64-vision-02"},
 		[]string{"{compute-bench}", "DataBroker,riscv64"},
@@ -33,7 +33,7 @@ func TestBuildRunnerRequestChainedNodesAndBraceTags(t *testing.T) {
 		t.Fatalf("unexpected parsed params: %+v", req.Params)
 	}
 
-	if _, err := buildRunnerRequest("SyntheticComputeRnr", "drew", false, nil, nil, nil, 0); err == nil {
+	if _, err := buildRunnerRequest("SyntheticComputeRnr", "operator", false, nil, nil, nil, 0); err == nil {
 		t.Fatal("expected missing selectors to return validation error")
 	}
 }

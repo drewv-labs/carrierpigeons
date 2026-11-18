@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/llm"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 type fakeAgentSafeStore struct {
@@ -96,6 +96,14 @@ func (f *fakeAgentSafeStore) MaterializePMV(_ context.Context, viewName, selectS
 	f.materialized[norm] = selectSQL
 	return nil
 }
+func (f *fakeAgentSafeStore) DropPMV(_ context.Context, viewName string) error {
+	norm, err := db.NormalizePMVName(viewName)
+	if err != nil {
+		return err
+	}
+	delete(f.materialized, norm)
+	return nil
+}
 func (f *fakeAgentSafeStore) Close() {}
 
 type stubOptimizerLLM struct {
@@ -133,7 +141,7 @@ func TestSubmitAndCertifyPMVCachesRawIntentAndOptimizes(t *testing.T) {
 		verifyReply:   "CERTIFIED: Preserves node_id and thermal projection.",
 	}
 
-	rec, err := eng.SubmitAndCertifyPMV(context.Background(), "drew", "thermal_summary", rawSQL, optLLM)
+	rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "thermal_summary", rawSQL, optLLM)
 	if err != nil {
 		t.Fatalf("SubmitAndCertifyPMV failed: %v", err)
 	}
@@ -171,6 +179,28 @@ func TestSubmitAndCertifyPMVFallsBackToRawIntentWhenOptimizerBreaksPlanner(t *te
 	}
 	if rec.Status != "certified" || store.materialized["pmv_node_inventory"] != rawSQL {
 		t.Fatalf("expected rawSQL fallback to materialize & certify, got %+v", rec)
+	}
+}
+
+func TestSubmitAndCertifyPMVDoesNotMaterializeOnRejection(t *testing.T) {
+	store := newFakeAgentSafeStore()
+	eng := NewEngine(store)
+
+	rawSQL := "SELECT node_id FROM ctd_nodes"
+	rejectLLM := &stubOptimizerLLM{
+		optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes LIMIT 1\n```",
+		verifyReply:   "REJECTED: Truncates inventory with unintended LIMIT 1.",
+	}
+
+	rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "broken_view", rawSQL, rejectLLM)
+	if err == nil {
+		t.Fatal("expected certification rejection error")
+	}
+	if rec == nil || rec.Status != "failed" {
+		t.Fatalf("expected draft status=failed, got %+v", rec)
+	}
+	if _, exists := store.materialized["pmv_broken_view"]; exists {
+		t.Fatal("rejected view MUST NOT be materialized in pigeonmath schema")
 	}
 }
 

@@ -7,15 +7,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/broker"
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/ingest"
-	"github.com/drewv-labs/carrier-pigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/edge"
-	"github.com/drewv-labs/carrier-pigeons/pkg/observer"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/broker"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/ingest"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/edge"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
 // Options allows downstream Go projects to customize or extend PigeonCoop when embedding it as a library.
@@ -62,6 +62,20 @@ func New(cfg config.CoopConfig, opts ...Options) *Server {
 func (s *Server) Start(ctx context.Context) error {
 	brand.SetActive(s.cfg.Brand)
 
+	if err := s.cfg.ValidateSecurity(); err != nil {
+		return err
+	}
+
+	clientTLS, err := config.BuildMQTTTLSConfig(
+		s.cfg.MQTT.TLSCAFile,
+		"",
+		"",
+		s.cfg.MQTT.TLSInsecureSkipVerify,
+	)
+	if err != nil {
+		return fmt.Errorf("configure PigeonCoop MQTT TLS client: %w", err)
+	}
+
 	// 1. Initialize or attach PostgreSQL Ledger
 	if s.opts.Store != nil {
 		s.store = s.opts.Store
@@ -95,9 +109,14 @@ func (s *Server) Start(ctx context.Context) error {
 	// 2. Start embedded pure-Go MQTT broker (unless external broker mode is selected)
 	if !strings.EqualFold(strings.TrimSpace(s.cfg.MQTT.Mode), "external") {
 		emb, err := broker.StartEmbedded(broker.EmbeddedOptions{
-			ListenAddr: s.cfg.MQTT.Listen,
-			Username:   s.cfg.MQTT.Username,
-			Password:   s.cfg.MQTT.Password,
+			ListenAddr:   s.cfg.MQTT.Listen,
+			Username:     s.cfg.MQTT.Username,
+			Password:     s.cfg.MQTT.Password,
+			EdgeUsername: s.cfg.MQTT.EdgeUsername,
+			EdgePassword: s.cfg.MQTT.EdgePassword,
+			TLSCertFile:  s.cfg.MQTT.TLSCertFile,
+			TLSKeyFile:   s.cfg.MQTT.TLSKeyFile,
+			TopicRoot:    s.cfg.Brand.TopicRoot,
 		})
 		if err != nil {
 			s.Stop()
@@ -117,6 +136,7 @@ func (s *Server) Start(ctx context.Context) error {
 		CoopNodeID: s.cfg.NodeID,
 		Username:   s.cfg.MQTT.Username,
 		Password:   s.cfg.MQTT.Password,
+		TLSConfig:  clientTLS,
 		Ingest: ingest.Options{
 			QueueSize:     s.cfg.Ingest.QueueSize,
 			BatchSize:     s.cfg.Ingest.BatchSize,
@@ -134,15 +154,19 @@ func (s *Server) Start(ctx context.Context) error {
 	// 4. Implicitly start embedded Observer + Runner runtime on the Coop host using native CoopConfig settings
 	if s.cfg.SelfObserve || s.cfg.Runners.Enabled {
 		selfCfg := config.EdgeConfig{
-			NodeID:        s.cfg.NodeID,
-			Tags:          s.cfg.Tags,
-			PollInterval:  s.cfg.PollInterval,
-			SpoolCapacity: s.cfg.SpoolCapacity,
-			BrokerURL:     s.brokerURL,
-			TopicPrefix:   s.cfg.Brand.CTDPrefix(),
-			Observers:     s.cfg.Observers,
-			Runners:       s.cfg.Runners,
-			Brand:         s.cfg.Brand,
+			NodeID:                s.cfg.NodeID,
+			Tags:                  s.cfg.Tags,
+			PollInterval:          s.cfg.PollInterval,
+			SpoolCapacity:         s.cfg.SpoolCapacity,
+			BrokerURL:             s.brokerURL,
+			TopicPrefix:           s.cfg.Brand.CTDPrefix(),
+			MQTTUsername:          s.cfg.MQTT.Username,
+			MQTTPassword:          s.cfg.MQTT.Password,
+			TLSCAFile:             s.cfg.MQTT.TLSCAFile,
+			TLSInsecureSkipVerify: s.cfg.MQTT.TLSInsecureSkipVerify,
+			Observers:             s.cfg.Observers,
+			Runners:               s.cfg.Runners,
+			Brand:                 s.cfg.Brand,
 		}
 		s.selfNode = edge.New(selfCfg, edge.Options{
 			ClientPrefix:     strings.ToLower(s.cfg.Brand.CoopName) + "-node",

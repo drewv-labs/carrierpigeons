@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeons/cli"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeons/cli"
 )
 
 func main() {

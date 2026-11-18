@@ -1,4 +1,4 @@
-module github.com/drewv-labs/carrier-pigeons
+module github.com/drewv-labs/carrierpigeons
 
 go 1.27.1
 
@@ -11,6 +11,7 @@ require (
 	github.com/mark3labs/mcp-go v1.1.1
 	github.com/mochi-mqtt/server/v2 v2.7.9
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/sys v0.36.0
 )
 
 require (
@@ -43,7 +44,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/net v0.44.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
-	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

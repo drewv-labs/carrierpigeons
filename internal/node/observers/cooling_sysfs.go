@@ -8,20 +8,23 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // nonHostCoolingDrivers lists hwmon chip names belonging to discrete GPUs, NVMe drives,
-// or PSUs so their fans are never misclassified as the host CPU / SoC cooler fan.
+// or PSUs so their fans/thermals are never misclassified as the host CPU / SoC package.
 var nonHostCoolingDrivers = map[string]bool{
-	"amdgpu":     true,
-	"radeon":     true,
-	"nouveau":    true,
-	"nvidia":     true,
-	"i915":       true,
-	"xe":         true,
-	"nvme":       true,
-	"corsairpsu": true,
+	"amdgpu":      true,
+	"radeon":      true,
+	"nouveau":     true,
+	"nvidia":      true,
+	"i915":        true,
+	"xe":          true,
+	"nvme":        true,
+	"corsairpsu":  true,
+	"drivetemp":   true,
+	"iwlwifi_1":   true,
+	"mt7915_phy0": true,
 }
 
 type fanCandidate struct {
@@ -31,6 +34,95 @@ type fanCandidate struct {
 	hasPWM   bool
 	pwmPct   float64
 	priority int
+}
+
+// observeSysfsThermals inspects /sys/class/thermal/thermal_zone* and /sys/class/hwmon/hwmon*/temp*_input
+// in-process with zero subprocess forks, emitting CPU/SoC temperatures across RISC-V (StarFive sfctemp, ESWIN),
+// ARM64, and x86 (Intel coretemp, AMD k10temp/zenpower).
+func observeSysfsThermals(sysRoot string, event *core.CTDPayload) {
+	if event == nil || sysRoot == "" {
+		return
+	}
+
+	bestTemp := -1.0
+	bestPrio := 0
+
+	consider := func(tempC float64, prio int) {
+		if tempC <= 0 || tempC > 150 || math.IsNaN(tempC) {
+			return
+		}
+		rounded := math.Round(tempC*10) / 10
+		if prio > bestPrio || (prio == bestPrio && rounded > bestTemp) {
+			bestPrio = prio
+			bestTemp = rounded
+		}
+	}
+
+	// 1. Scan /sys/class/thermal/thermal_zone*
+	tzDirs, _ := filepath.Glob(filepath.Join(sysRoot, "class", "thermal", "thermal_zone*"))
+	slices.Sort(tzDirs)
+	for i, tzDir := range tzDirs {
+		rawTemp, err := os.ReadFile(filepath.Join(tzDir, "temp"))
+		if err != nil {
+			continue
+		}
+		val, err := strconv.ParseFloat(strings.TrimSpace(string(rawTemp)), 64)
+		if err != nil {
+			continue
+		}
+		tempC := val
+		if tempC > 200 {
+			tempC = val / 1000.0
+		}
+		typeRaw, _ := os.ReadFile(filepath.Join(tzDir, "type"))
+		tzType := strings.ToLower(strings.TrimSpace(string(typeRaw)))
+		prio := 2
+		if strings.Contains(tzType, "cpu") || strings.Contains(tzType, "soc") || strings.Contains(tzType, "x86_pkg") || strings.Contains(tzType, "tctl") {
+			prio = 4
+		} else if i == 0 {
+			prio = 3
+		}
+		consider(tempC, prio)
+	}
+
+	// 2. Scan /sys/class/hwmon/hwmon*/temp*_input (catches StarFive JH7110 sfctemp, Intel coretemp, AMD k10temp)
+	hwmonDirs, _ := filepath.Glob(filepath.Join(sysRoot, "class", "hwmon", "hwmon*"))
+	slices.Sort(hwmonDirs)
+	for _, hwDir := range hwmonDirs {
+		chipRaw, _ := os.ReadFile(filepath.Join(hwDir, "name"))
+		chip := sanitizeSensorToken(string(chipRaw))
+		if nonHostCoolingDrivers[chip] {
+			continue
+		}
+		chipPrio := 1
+		switch {
+		case chip == "coretemp" || chip == "k10temp" || chip == "zenpower" || chip == "sfctemp" || chip == "pvt" ||
+			strings.Contains(chip, "cpu") || strings.Contains(chip, "soc") || strings.Contains(chip, "eswin"):
+			chipPrio = 4
+		}
+		tempInputs, _ := filepath.Glob(filepath.Join(hwDir, "temp*_input"))
+		slices.Sort(tempInputs)
+		for _, tPath := range tempInputs {
+			raw, err := os.ReadFile(tPath)
+			if err != nil {
+				continue
+			}
+			milliC, err := strconv.ParseFloat(strings.TrimSpace(string(raw)), 64)
+			if err != nil {
+				continue
+			}
+			tempC := milliC
+			if tempC > 200 {
+				tempC = milliC / 1000.0
+			}
+			consider(tempC, chipPrio)
+		}
+	}
+
+	if bestTemp > 0 {
+		event.AddMetric("soc_temp_c", bestTemp)
+		event.AddMetric("cpu_temp_c", bestTemp)
+	}
 }
 
 // observeSysfsCooling inspects Linux sysfs (/sys/class/hwmon and /sys/class/thermal)
@@ -152,7 +244,7 @@ func observeSysfsCooling(sysRoot string, event *core.CTDPayload) {
 
 func isDedicatedCoolerChip(chip string) bool {
 	switch chip {
-	case "pwmfan", "pwm_fan", "cooling_fan", "gpio_fan", "rpi_poe_fan", "es_bmcd", "cpu_fan":
+	case "pwmfan", "pwm_fan", "cooling_fan", "gpio_fan", "rpi_poe_fan", "es_bmcd", "eswin_fan_control", "cpu_fan":
 		return true
 	default:
 		return strings.Contains(chip, "pwmfan") || strings.Contains(chip, "pwm_fan") || strings.Contains(chip, "cpufan")

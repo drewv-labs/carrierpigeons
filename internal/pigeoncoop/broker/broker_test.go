@@ -8,23 +8,25 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/ingest"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/ingest"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 type memoryLedger struct {
-	mu        sync.Mutex
-	events    []*core.CTDPayload
-	tagsByID  map[string][]string
-	artifacts []core.Artifact
-	traces    []core.TraceEdge
+	mu         sync.Mutex
+	events     []*core.CTDPayload
+	tagsByID   map[string][]string
+	statusByID map[string]string
+	artifacts  []core.Artifact
+	traces     []core.TraceEdge
 }
 
 func newMemoryLedger() *memoryLedger {
 	return &memoryLedger{
-		tagsByID: make(map[string][]string),
+		tagsByID:   make(map[string][]string),
+		statusByID: make(map[string]string),
 	}
 }
 
@@ -47,16 +49,24 @@ func (m *memoryLedger) UpsertNodeHello(_ context.Context, h core.NodeHello) ([]s
 	defer m.mu.Unlock()
 	norm := core.NormalizeTags(h.BootTags)
 	m.tagsByID[h.NodeID] = norm
+	m.statusByID[h.NodeID] = "ONLINE"
 	return norm, nil
 }
 
-func (m *memoryLedger) UpdateNodePresence(_ context.Context, nodeID, _ string) error {
+func (m *memoryLedger) UpdateNodePresence(ctx context.Context, nodeID, status string) error {
+	_, _, err := m.UpdateNodePresenceTransition(ctx, nodeID, status)
+	return err
+}
+
+func (m *memoryLedger) UpdateNodePresenceTransition(_ context.Context, nodeID, status string) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.tagsByID[nodeID]; !ok {
 		m.tagsByID[nodeID] = nil
 	}
-	return nil
+	prev := m.statusByID[nodeID]
+	m.statusByID[nodeID] = status
+	return prev, prev != status, nil
 }
 
 func (m *memoryLedger) ResolveNodes(_ context.Context, sel core.RunnerSelector) ([]string, error) {
@@ -164,7 +174,7 @@ func TestEmbeddedBrokerAndRunnerRequestRouting(t *testing.T) {
 			Tags:  []string{"compute-bench"},
 		},
 		Params:      map[string]any{"duration_sec": 5},
-		RequestedBy: "drew",
+		RequestedBy: "operator",
 		RequestedAt: time.Now().UTC(),
 	}
 	rawReq, _ := json.Marshal(req)
@@ -180,5 +190,104 @@ func TestEmbeddedBrokerAndRunnerRequestRouting(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for Coop to fan out RunnerRequestCTD to resolved nodes")
 		}
+	}
+
+	// Verify node IDs prefixed with "pigeoneer-" preserve their full node_id on registry status updates.
+	regTok := cli.Publish(core.RegistryTopic("pigeoneer-01"), 1, false, []byte("ONLINE"))
+	regTok.Wait()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ledger.mu.Lock()
+		st := ledger.statusByID["pigeoneer-01"]
+		ledger.mu.Unlock()
+		if st == "ONLINE" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	ledger.mu.Lock()
+	if ledger.statusByID["pigeoneer-01"] != "ONLINE" {
+		t.Fatalf("expected pigeoneer-01 status ONLINE without prefix stripping, got %+v", ledger.statusByID)
+	}
+	ledger.mu.Unlock()
+}
+
+func TestEmbeddedBrokerAuthAndEdgeTopicACLs(t *testing.T) {
+	emb, err := StartEmbedded(EmbeddedOptions{
+		ListenAddr:   "127.0.0.1:0",
+		Username:     "coop_admin",
+		Password:     "admin_secret",
+		EdgeUsername: "edge_node",
+		EdgePassword: "edge_secret",
+		TopicRoot:    "pigeons",
+	})
+	if err != nil {
+		t.Fatalf("StartEmbedded with auth failed: %v", err)
+	}
+	defer emb.Close()
+
+	// 1. Anonymous client MUST be rejected.
+	anonCli := mqtt.NewClient(mqtt.NewClientOptions().AddBroker(emb.LocalClientURL()).SetClientID("anon-cli").SetConnectRetry(false))
+	if tok := anonCli.Connect(); tok.WaitTimeout(2*time.Second) && tok.Error() == nil {
+		anonCli.Disconnect(50)
+		t.Fatal("expected anonymous MQTT connection to fail when credentials are configured")
+	}
+
+	// 2. Admin subscriber receives telemetry and blocks forged RunnerRequestCTD from edge_node.
+	ledger := newMemoryLedger()
+	sub, err := NewSubscriberWithOptions(SubscriberOptions{
+		BrokerURL:   emb.LocalClientURL(),
+		CoopNodeID:  "coop-01",
+		Username:    "coop_admin",
+		Password:    "admin_secret",
+		NtfyEnabled: false,
+		Ingest: ingest.Options{
+			QueueSize:     64,
+			BatchSize:     1,
+			FlushInterval: 15 * time.Millisecond,
+		},
+	}, ledger)
+	if err != nil {
+		t.Fatalf("admin subscriber connect failed: %v", err)
+	}
+	defer sub.Disconnect()
+
+	// 3. Edge client can connect, publish CTD telemetry, and subscribe to its control topic,
+	//    but CANNOT publish a RunnerRequestCTD to `pigeons/requests/runner`.
+	edgeCli := mqtt.NewClient(mqtt.NewClientOptions().
+		AddBroker(emb.LocalClientURL()).
+		SetClientID("edge-01").
+		SetUsername("edge_node").
+		SetPassword("edge_secret"))
+	if tok := edgeCli.Connect(); tok.WaitTimeout(2*time.Second) && tok.Error() != nil {
+		t.Fatalf("edge client connect failed: %v", tok.Error())
+	}
+	defer edgeCli.Disconnect(50)
+
+	ev := core.NewCTDPayload("edge-01", "host-os", "healthy")
+	rawEv, _ := json.Marshal(ev)
+	if tok := edgeCli.Publish(ev.RoutingTopic("pigeons/ctd"), 1, false, rawEv); tok.Wait() && tok.Error() != nil {
+		t.Fatalf("edge telemetry publish failed: %v", tok.Error())
+	}
+
+	forgedReq := core.RunnerRequestCTD{
+		RequestID:   "forged-req-01",
+		Action:      "start",
+		Runner:      "SyntheticComputeRnr",
+		Selectors:   core.RunnerSelector{All: true},
+		RequestedBy: "attacker",
+		RequestedAt: time.Now().UTC(),
+	}
+	rawForged, _ := json.Marshal(forgedReq)
+	_ = edgeCli.Publish(core.RunnerRequestTopic(), 1, false, rawForged).WaitTimeout(500 * time.Millisecond)
+
+	time.Sleep(120 * time.Millisecond)
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if len(ledger.artifacts) != 0 {
+		t.Fatalf("expected edge_node ACL to block RunnerRequestCTD publish, got artifacts: %+v", ledger.artifacts)
+	}
+	if len(ledger.events) == 0 {
+		t.Fatal("expected edge_node telemetry event to be ingested")
 	}
 }

@@ -7,13 +7,16 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/observer"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 )
 
-const defaultPollInterval = 5 * time.Second
-const defaultCmdTimeout = 4 * time.Second
+const (
+	defaultPollInterval    = 5 * time.Second
+	defaultCmdTimeout      = 4 * time.Second
+	maxObserverStdoutBytes = 256 * 1024
+)
 
 type pollIntervalKey struct{}
 
@@ -32,6 +35,24 @@ func pollInterval(ctx context.Context) time.Duration {
 		}
 	}
 	return defaultPollInterval
+}
+
+type limitedWriter struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (l *limitedWriter) Write(p []byte) (int, error) {
+	total := len(p)
+	rem := l.max - l.buf.Len()
+	if rem <= 0 {
+		return total, nil
+	}
+	if len(p) > rem {
+		p = p[:rem]
+	}
+	_, _ = l.buf.Write(p)
+	return total, nil
 }
 
 type adaptersObserver struct{}
@@ -55,13 +76,25 @@ func ObserveAdapters(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 	go observeNet(ctx, pub, nodeID)
 }
 
-// StartConfigured launches enabled built-in hardware observers alongside any custom SDK observers.
+// StartConfigured launches enabled built-in hardware observers alongside any custom SDK observers in the default registry.
 func StartConfigured(
 	ctx context.Context,
 	nodeID string,
 	pub core.TelemetryPublisher,
 	cfg config.ObserversConfig,
 	interval time.Duration,
+) []string {
+	return StartConfiguredWithRegistry(ctx, nodeID, pub, cfg, interval, nil)
+}
+
+// StartConfiguredWithRegistry launches enabled built-in hardware observers alongside custom observers from reg.
+func StartConfiguredWithRegistry(
+	ctx context.Context,
+	nodeID string,
+	pub core.TelemetryPublisher,
+	cfg config.ObserversConfig,
+	interval time.Duration,
+	reg *observer.Registry,
 ) []string {
 	obsCtx := WithPollInterval(ctx, interval)
 	var active []string
@@ -83,12 +116,26 @@ func StartConfigured(
 		go observeNPU(obsCtx, pub, nodeID)
 	}
 
-	// Launch any custom downstream SDK observers registered outside built-in host-os/adapters.
-	for _, name := range observer.RegistryNames() {
+	var names []string
+	if reg != nil {
+		names = reg.Names()
+	} else {
+		names = observer.RegistryNames()
+	}
+	for _, name := range names {
 		if name == "host-os" || name == "adapters" {
 			continue
 		}
-		if custom, ok := observer.Get(name); ok {
+		var (
+			custom observer.Observer
+			ok     bool
+		)
+		if reg != nil {
+			custom, ok = reg.Get(name)
+		} else {
+			custom, ok = observer.Get(name)
+		}
+		if ok {
 			active = append(active, name)
 			go custom.Observe(obsCtx, nodeID, pub)
 		}
@@ -109,16 +156,17 @@ func pathExists(path string) bool {
 	return err == nil
 }
 
-// runCommand executes an external sensor binary with a strict timeout so hung drivers never deadlock observers.
+// runCommand executes an external sensor binary with a strict timeout and bounded stdout buffer so hung drivers never deadlock observers.
 func runCommand(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, name, args...)
-	var out bytes.Buffer
-	cmd.Stdout = &out
+	cmd.WaitDelay = 2 * time.Second
+	out := &limitedWriter{max: maxObserverStdoutBytes}
+	cmd.Stdout = out
 	if err := cmd.Run(); err != nil {
 		return nil, err
 	}
-	return out.Bytes(), nil
+	return out.buf.Bytes(), nil
 }

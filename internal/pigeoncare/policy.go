@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/config"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // PermissionMode emulates Google Antigravity / Zed agent autonomy tiers.

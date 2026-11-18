@@ -5,18 +5,26 @@ import (
 	"encoding/json"
 	"log"
 	"maps"
-	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 type activeRun struct {
 	id     uint64
 	cancel context.CancelFunc
+}
+
+func (c *MQTTClient) lookupRunner(name string) (runner.Runner, string, bool) {
+	if c.runnerReg != nil {
+		task, ok := c.runnerReg.Get(name)
+		return task, c.runnerReg.CanonicalKey(name), ok
+	}
+	task, ok := runner.Get(name)
+	return task, runner.CanonicalKey(name), ok
 }
 
 // ListenForRunners binds the MQTT client to the node's exclusive control topic and re-subscribes on reconnect.
@@ -57,7 +65,7 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 			action = "start"
 		}
 
-		runnerKey := strings.ToLower(strings.TrimSpace(env.Runner))
+		task, runnerKey, exists := c.lookupRunner(env.Runner)
 
 		if action == "abort" {
 			mu.Lock()
@@ -68,15 +76,14 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 			mu.Unlock()
 
 			if active {
-				log.Printf("[Runner Dispatch] ABORT SIGNAL RECEIVED: Killing %q on %s", env.Runner, nodeID)
+				log.Printf("[Runner Dispatch] ABORT SIGNAL RECEIVED: Killing %q (%s) on %s", env.Runner, runnerKey, nodeID)
 				entry.cancel()
 			} else {
-				log.Printf("[Runner Dispatch] Abort ignored: %q is not currently running.", env.Runner)
+				log.Printf("[Runner Dispatch] Abort ignored: %q (%s) is not currently running.", env.Runner, runnerKey)
 			}
 			return
 		}
 
-		task, exists := runner.Get(env.Runner)
 		if !exists {
 			log.Printf("[Runner Dispatch] Unknown runner requested: %q", env.Runner)
 			errEv := core.NewCTDPayload(nodeID, "runner:"+env.Runner, "runner-error").
@@ -92,7 +99,7 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		mu.Lock()
 		if _, active := activeRunners[runnerKey]; active {
 			mu.Unlock()
-			log.Printf("[Runner Dispatch] Runner %q is already active. Ignoring duplicate start.", env.Runner)
+			log.Printf("[Runner Dispatch] Runner %q (%s) is already active. Ignoring duplicate start.", env.Runner, runnerKey)
 			return
 		}
 
@@ -119,7 +126,7 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 				mu.Unlock()
 			}()
 
-			log.Printf("[Runner Dispatch] Executing %q (request=%s) on %s", env.Runner, env.RequestID, nodeID)
+			log.Printf("[Runner Dispatch] Executing %q (canonical=%s, request=%s) on %s", env.Runner, runnerKey, env.RequestID, nodeID)
 			if err := task.Run(runCtx, nodeID, params, pub); err != nil {
 				log.Printf("[Runner Dispatch] Runner %q failed: %v", env.Runner, err)
 			}

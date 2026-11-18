@@ -7,10 +7,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
 type BenchmarkRunner struct{}
@@ -57,7 +58,16 @@ func parseBoolParam(v any) bool {
 }
 
 func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[string]any, pub core.TelemetryPublisher) error {
+	policy := runner.PolicyFromContext(ctx)
 	durationSec := parseIntParam(params["duration_sec"], 60)
+	maxTimeout := policy.MaxTimeoutSec
+	if maxTimeout <= 0 {
+		maxTimeout = 300
+	}
+	if durationSec > maxTimeout {
+		durationSec = maxTimeout
+	}
+
 	targetSystem := parseBoolParam(params["target_system"])
 	targetNPU := parseBoolParam(params["target_npu"])
 	targetGPU := parseBoolParam(params["target_gpu"])
@@ -71,7 +81,7 @@ func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[str
 		invokedAs = b.Name()
 	}
 
-	runID := time.Now().UTC().UnixNano()
+	runID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	startedAt := time.Now()
 
 	// 1. Emit CTD Start Bookend under the Runner pillar
@@ -93,8 +103,7 @@ func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[str
 
 	// 2. Execute Hardware Workloads
 	var wg sync.WaitGroup
-	var totalHashes uint64
-	var hashMu sync.Mutex
+	var totalHashes atomic.Uint64
 
 	if targetSystem {
 		payload := []byte("carrier-pigeons-burn")
@@ -104,9 +113,7 @@ func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[str
 				defer wg.Done()
 				var local uint64
 				defer func() {
-					hashMu.Lock()
-					totalHashes += local
-					hashMu.Unlock()
+					totalHashes.Add(local)
 				}()
 				for {
 					select {
@@ -137,7 +144,7 @@ func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[str
 		WithPillar(core.PillarRunner).
 		AddMetric("run_id", runID).
 		AddMetric("elapsed_ms", time.Since(startedAt).Milliseconds()).
-		AddMetric("sha256_ops", totalHashes)
+		AddMetric("sha256_ops", totalHashes.Load())
 	if reqID != "" {
 		endEvent.AddParam("request_id", reqID)
 	}

@@ -3,7 +3,7 @@ package observers
 import (
 	"context"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // observeNet dispatches network interface telemetry observation for the target platform.

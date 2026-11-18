@@ -1,14 +1,19 @@
 # Pigeons Workstation Control Plane Configuration
 
-broker_url            = "tcp://localhost:1883"
-database_url          = "postgres://drewv:ctd_password@localhost:5432/edge_ledger"
-readonly_database_url = "postgres://pigeoncare_ro:pigeoncare_readonly@localhost:5432/edge_ledger"
+broker_url            = "tcp://127.0.0.1:1883"
+database_url          = "postgres://pigeoncoop_admin:ctd_dev_password@127.0.0.1:5432/edge_ledger"
+readonly_database_url = "postgres://pigeoncare_ro:pigeoncare_readonly@127.0.0.1:5432/edge_ledger"
 operator              = "operator"
+
+[mqtt]
+username    = ""
+password    = ""
+tls_ca_file = ""
 
 [llm]
 provider = "ollama"
 model    = "qwen2.5-coder"
-endpoint = "http://localhost:11434"
+endpoint = "http://127.0.0.1:11434"
 
 [permissions]
 # Agent execution confirmation mode:
@@ -16,7 +21,7 @@ endpoint = "http://localhost:11434"
 # - "auto_edit": Auto-approve read-only diagnostics & PigeonMath views; prompt before Runners
 # - "yolo":      Autonomous execution of diagnostics, PigeonMath views, and Ephemeral Runners
 mode                  = "default"
-allowed_runners       = ["benchmark"]
+allowed_runners       = ["benchmark", "SyntheticComputeRnr"]
 allowed_script_hashes = []
 
 [math]

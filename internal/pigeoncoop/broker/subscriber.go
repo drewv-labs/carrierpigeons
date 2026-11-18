@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,11 +11,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoncoop/ingest"
-	"github.com/drewv-labs/carrier-pigeons/pkg/brand"
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
-	"github.com/drewv-labs/carrier-pigeons/pkg/runner"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/ingest"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+const (
+	controlWorkerCount = 4
+	controlQueueCap    = 256
+	ntfyMaxConcurrency = 8
 )
 
 // Ledger defines the persistence & resolution contract required by PigeonCoop's broker router.
@@ -28,12 +35,19 @@ type Ledger interface {
 	InsertTrace(ctx context.Context, t core.TraceEdge) error
 }
 
-// SubscriberOptions configures Coop's MQTT ingestion, Ntfy alerting, and COPY batching parameters.
+// TransitionLedger is an optional extension allowing atomic presence transition detection so retained
+// reconnect messages do not spam duplicate Ntfy alerts.
+type TransitionLedger interface {
+	UpdateNodePresenceTransition(ctx context.Context, nodeID, status string) (prevStatus string, changed bool, err error)
+}
+
+// SubscriberOptions configures Coop's MQTT ingestion, Ntfy alerting, TLS, and COPY batching parameters.
 type SubscriberOptions struct {
 	BrokerURL   string
 	CoopNodeID  string
 	Username    string
 	Password    string
+	TLSConfig   *tls.Config
 	Ingest      ingest.Options
 	NtfyEnabled bool
 	NtfyURL     string
@@ -47,6 +61,10 @@ type Subscriber struct {
 	coopNodeID  string
 	ntfyEnabled bool
 	ntfyURL     string
+	ntfySem     chan struct{}
+	ctrlQueue   chan func()
+	ctrlStop    chan struct{}
+	ctrlWG      sync.WaitGroup
 	closeOnce   sync.Once
 }
 
@@ -56,14 +74,14 @@ func NewSubscriber(brokerURL string, ledger Ledger) (*Subscriber, error) {
 		BrokerURL:   brokerURL,
 		CoopNodeID:  "coop",
 		NtfyEnabled: true,
-		NtfyURL:     "http://localhost:2586/carrier-pigeons",
+		NtfyURL:     "http://127.0.0.1:2586/carrier-pigeons",
 	}, ledger)
 }
 
-// NewSubscriberWithOptions initializes Coop's batched ingestion engine and control-plane router.
+// NewSubscriberWithOptions initializes Coop's batched ingestion engine and non-blocking control-plane worker pool.
 func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber, error) {
 	if strings.TrimSpace(cfg.BrokerURL) == "" {
-		cfg.BrokerURL = "tcp://localhost:1883"
+		cfg.BrokerURL = "tcp://127.0.0.1:1883"
 	}
 	if strings.TrimSpace(cfg.CoopNodeID) == "" {
 		cfg.CoopNodeID = "coop"
@@ -75,6 +93,14 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 		coopNodeID:  cfg.CoopNodeID,
 		ntfyEnabled: cfg.NtfyEnabled,
 		ntfyURL:     cfg.NtfyURL,
+		ntfySem:     make(chan struct{}, ntfyMaxConcurrency),
+		ctrlQueue:   make(chan func(), controlQueueCap),
+		ctrlStop:    make(chan struct{}),
+	}
+
+	for range controlWorkerCount {
+		sub.ctrlWG.Add(1)
+		go sub.controlWorker()
 	}
 
 	bSpec := brand.Active()
@@ -90,6 +116,10 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 		opts.SetUsername(cfg.Username)
 		opts.SetPassword(cfg.Password)
 	}
+	if cfg.TLSConfig != nil {
+		opts.SetTLSConfig(cfg.TLSConfig)
+	}
+	opts.SetOrderMatters(false)
 	opts.SetAutoReconnect(true)
 	opts.SetConnectRetry(true)
 	opts.SetConnectRetryInterval(3 * time.Second)
@@ -99,13 +129,13 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 		if tok := client.Subscribe(telemetryTopic, 1, sub.handleTelemetry); tok.Wait() && tok.Error() != nil {
 			log.Printf("[Coop Broker] Failed subscribing to %s: %v", telemetryTopic, tok.Error())
 		}
-		if tok := client.Subscribe(helloTopic, 1, sub.handleHelloUpdate); tok.Wait() && tok.Error() != nil {
+		if tok := client.Subscribe(helloTopic, 1, sub.enqueueControl(sub.processHelloUpdate)); tok.Wait() && tok.Error() != nil {
 			log.Printf("[Coop Broker] Failed subscribing to %s: %v", helloTopic, tok.Error())
 		}
-		if tok := client.Subscribe(registryTopic, 1, sub.handleRegistryUpdate); tok.Wait() && tok.Error() != nil {
+		if tok := client.Subscribe(registryTopic, 1, sub.enqueueControl(sub.processRegistryUpdate)); tok.Wait() && tok.Error() != nil {
 			log.Printf("[Coop Broker] Failed subscribing to %s: %v", registryTopic, tok.Error())
 		}
-		if tok := client.Subscribe(runnerReqTopic, 1, sub.handleRunnerRequest); tok.Wait() && tok.Error() != nil {
+		if tok := client.Subscribe(runnerReqTopic, 1, sub.enqueueControlWithClient(sub.processRunnerRequest)); tok.Wait() && tok.Error() != nil {
 			log.Printf("[Coop Broker] Failed subscribing to %s: %v", runnerReqTopic, tok.Error())
 		}
 
@@ -115,12 +145,71 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 
 	client := mqtt.NewClient(opts)
 	if token := client.Connect(); token.WaitTimeout(5*time.Second) && token.Error() != nil {
+		close(sub.ctrlStop)
+		sub.ctrlWG.Wait()
 		sub.batcher.Close()
 		return nil, token.Error()
 	}
 
 	sub.client = client
 	return sub, nil
+}
+
+func (s *Subscriber) controlWorker() {
+	defer s.ctrlWG.Done()
+	for {
+		select {
+		case fn := <-s.ctrlQueue:
+			if fn != nil {
+				fn()
+			}
+		case <-s.ctrlStop:
+			for {
+				select {
+				case fn := <-s.ctrlQueue:
+					if fn != nil {
+						fn()
+					}
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *Subscriber) enqueueControl(handler func(topic string, payload []byte)) mqtt.MessageHandler {
+	return func(_ mqtt.Client, msg mqtt.Message) {
+		topic := msg.Topic()
+		payload := append([]byte(nil), msg.Payload()...)
+		select {
+		case <-s.ctrlStop:
+			return
+		default:
+		}
+		select {
+		case s.ctrlQueue <- func() { handler(topic, payload) }:
+		default:
+			log.Printf("[Coop Broker] Control worker queue saturated (%d); dropping control message on %s", controlQueueCap, topic)
+		}
+	}
+}
+
+func (s *Subscriber) enqueueControlWithClient(handler func(client mqtt.Client, topic string, payload []byte)) mqtt.MessageHandler {
+	return func(client mqtt.Client, msg mqtt.Message) {
+		topic := msg.Topic()
+		payload := append([]byte(nil), msg.Payload()...)
+		select {
+		case <-s.ctrlStop:
+			return
+		default:
+		}
+		select {
+		case s.ctrlQueue <- func() { handler(client, topic, payload) }:
+		default:
+			log.Printf("[Coop Broker] Control worker queue saturated (%d); dropping request on %s", controlQueueCap, topic)
+		}
+	}
 }
 
 // handleTelemetry decodes CTD wide events and pushes them into the non-blocking PostgreSQL COPY batcher.
@@ -133,10 +222,10 @@ func (s *Subscriber) handleTelemetry(_ mqtt.Client, msg mqtt.Message) {
 	s.batcher.Enqueue(&event)
 }
 
-// handleRunnerRequest resolves a RunnerRequestCTD against node/tag selectors, records lineage, and fans out envelopes.
-func (s *Subscriber) handleRunnerRequest(client mqtt.Client, msg mqtt.Message) {
+// processRunnerRequest resolves a RunnerRequestCTD against node/tag selectors, records lineage, and fans out envelopes.
+func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload []byte) {
 	var req core.RunnerRequestCTD
-	if err := json.Unmarshal(msg.Payload(), &req); err != nil {
+	if err := json.Unmarshal(payload, &req); err != nil {
 		log.Printf("[Coop Router] Invalid RunnerRequestCTD JSON dropped: %v", err)
 		return
 	}
@@ -185,22 +274,24 @@ func (s *Subscriber) handleRunnerRequest(client mqtt.Client, msg mqtt.Message) {
 	}
 	s.batcher.Enqueue(reqEvent)
 
+	env := runner.Envelope{
+		RequestID: req.RequestID,
+		Action:    action,
+		Runner:    req.Runner,
+		Params:    req.Params,
+	}
+	rawEnv, err := json.Marshal(env)
+	if err != nil {
+		return
+	}
+
+	pubTokens := make([]mqtt.Token, 0, len(targets))
 	for _, targetNode := range targets {
-		env := runner.Envelope{
-			RequestID: req.RequestID,
-			Action:    action,
-			Runner:    req.Runner,
-			Params:    req.Params,
-		}
-		rawEnv, err := json.Marshal(env)
-		if err != nil {
-			continue
-		}
-
 		controlTopic := core.ControlTopic(targetNode)
-		tok := client.Publish(controlTopic, 1, false, rawEnv)
-		tok.WaitTimeout(2 * time.Second)
-
+		pubTokens = append(pubTokens, client.Publish(controlTopic, 1, false, rawEnv))
+	}
+	for i, targetNode := range targets {
+		pubTokens[i].WaitTimeout(2 * time.Second)
 		_ = s.ledger.InsertTrace(ctx, core.TraceEdge{
 			SourceID: reqArtifactID,
 			Verb:     "dispatched_to",
@@ -227,12 +318,14 @@ func (s *Subscriber) IngestedCount() uint64 {
 	return s.batcher.IngestedCount()
 }
 
-// Disconnect drains all pending CTD batches and cleanly closes the MQTT connection.
+// Disconnect drains all pending control workers and CTD batches and cleanly closes the MQTT connection.
 func (s *Subscriber) Disconnect() {
 	s.closeOnce.Do(func() {
 		if s.client != nil {
 			s.client.Disconnect(250)
 		}
+		close(s.ctrlStop)
+		s.ctrlWG.Wait()
 		if s.batcher != nil {
 			s.batcher.Close()
 		}

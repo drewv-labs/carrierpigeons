@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 type stubRunner struct {

@@ -5,11 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
 
-	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // Runner represents any targeted remote execution task.
@@ -22,15 +23,16 @@ type Runner interface {
 type ExecutionPolicy struct {
 	AllowEphemeral      bool
 	AllowedInterpreters []string
+	AllowedScriptHashes []string
 	MaxTimeoutSec       int
 }
 
 type policyContextKey struct{}
 
-// DefaultExecutionPolicy returns safe out-of-the-box runner execution limits.
+// DefaultExecutionPolicy returns safe-by-default runner execution limits (ephemeral scripts disabled unless explicitly opted in).
 func DefaultExecutionPolicy() ExecutionPolicy {
 	return ExecutionPolicy{
-		AllowEphemeral:      true,
+		AllowEphemeral:      false,
 		AllowedInterpreters: []string{"sh", "bash", "python3"},
 		MaxTimeoutSec:       300,
 	}
@@ -51,57 +53,114 @@ func PolicyFromContext(ctx context.Context) ExecutionPolicy {
 	return DefaultExecutionPolicy()
 }
 
-var (
-	mu       sync.RWMutex
-	registry = make(map[string]Runner)
-)
+// Registry provides concurrency-safe runner registration and alias resolution for SDK instances.
+type Registry struct {
+	mu    sync.RWMutex
+	items map[string]Runner
+}
 
-// Register is called in init() functions or SDK setup to bind a runner to the node runtime.
-func Register(r Runner) {
-	if r == nil {
+// NewRegistry constructs an empty Runner Registry.
+func NewRegistry() *Registry {
+	return &Registry{
+		items: make(map[string]Runner),
+	}
+}
+
+// Clone returns an independent copy of r containing all registered runners and aliases.
+func (r *Registry) Clone() *Registry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cp := make(map[string]Runner, len(r.items))
+	maps.Copy(cp, r.items)
+	return &Registry{items: cp}
+}
+
+// Register binds a runner by its canonical Name().
+func (r *Registry) Register(task Runner) {
+	if task == nil {
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	registry[r.Name()] = r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items[task.Name()] = task
 }
 
 // RegisterAlias binds an additional lookup alias (e.g., "SyntheticComputeRnr") to an existing Runner.
-func RegisterAlias(alias string, r Runner) {
-	if r == nil || strings.TrimSpace(alias) == "" {
+func (r *Registry) RegisterAlias(alias string, task Runner) {
+	if task == nil || strings.TrimSpace(alias) == "" {
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	registry[strings.TrimSpace(alias)] = r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items[strings.TrimSpace(alias)] = task
 }
 
-// Get safely retrieves a registered runner by name (including case-insensitive alias lookup).
-func Get(name string) (Runner, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	if r, ok := registry[name]; ok {
-		return r, true
+// Get safely retrieves a registered runner by name or case-insensitive alias.
+func (r *Registry) Get(name string) (Runner, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if task, ok := r.items[name]; ok {
+		return task, true
 	}
 	lower := strings.ToLower(strings.TrimSpace(name))
-	for k, r := range registry {
+	for k, task := range r.items {
 		if strings.ToLower(k) == lower {
-			return r, true
+			return task, true
 		}
 	}
 	return nil, false
 }
 
-// RegistryNames returns a sorted list of all currently registered runners.
-func RegistryNames() []string {
-	mu.RLock()
-	defer mu.RUnlock()
-	names := make([]string, 0, len(registry))
-	for name := range registry {
+// CanonicalKey returns the canonical concurrency key (`strings.ToLower(task.Name())`) for any runner or alias.
+func (r *Registry) CanonicalKey(name string) string {
+	if task, ok := r.Get(name); ok {
+		return strings.ToLower(strings.TrimSpace(task.Name()))
+	}
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// Names returns a sorted list of all registered runner keys and aliases in r.
+func (r *Registry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.items))
+	for name := range r.items {
 		names = append(names, name)
 	}
 	slices.Sort(names)
 	return names
+}
+
+var defaultRegistry = NewRegistry()
+
+// CloneDefaultRegistry returns an isolated copy of the process-wide default Runner Registry.
+func CloneDefaultRegistry() *Registry {
+	return defaultRegistry.Clone()
+}
+
+// Register is called in init() functions or SDK setup to bind a runner to the default runtime registry.
+func Register(r Runner) {
+	defaultRegistry.Register(r)
+}
+
+// RegisterAlias binds an additional lookup alias to an existing Runner in the default registry.
+func RegisterAlias(alias string, r Runner) {
+	defaultRegistry.RegisterAlias(alias, r)
+}
+
+// Get safely retrieves a registered runner by name (including case-insensitive alias lookup).
+func Get(name string) (Runner, bool) {
+	return defaultRegistry.Get(name)
+}
+
+// CanonicalKey returns the canonical concurrency key for a runner or alias in the default registry.
+func CanonicalKey(name string) string {
+	return defaultRegistry.CanonicalKey(name)
+}
+
+// RegistryNames returns a sorted list of all currently registered runners.
+func RegistryNames() []string {
+	return defaultRegistry.Names()
 }
 
 // Envelope defines the wire protocol for MQTT control dispatches to an individual node.

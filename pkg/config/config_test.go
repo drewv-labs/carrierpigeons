@@ -3,55 +3,84 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestLoadCoopConfigHasNoExplicitPigeoneerSection(t *testing.T) {
-	examplePath := filepath.Join("..", "..", "configs", "pigeoncoop.example.toml")
-	raw, err := os.ReadFile(examplePath)
-	if err != nil {
-		t.Fatalf("failed reading %s: %v", examplePath, err)
-	}
-	if strings.Contains(strings.ToLower(string(raw)), "pigeoneer") {
-		t.Fatalf("pigeoncoop.example.toml must not reference 'pigeoneer' explicitly")
+func TestCoopConfigValidateSecurityFailClosed(t *testing.T) {
+	cfg := DefaultCoopConfig()
+	// Default binds 127.0.0.1:1883 -> allowed without auth for local dev.
+	if err := cfg.ValidateSecurity(); err != nil {
+		t.Fatalf("expected loopback default CoopConfig to pass ValidateSecurity, got %v", err)
 	}
 
-	cfg, err := LoadCoopConfig(examplePath)
-	if err != nil {
-		t.Fatalf("LoadCoopConfig failed: %v", err)
+	// Non-loopback without credentials must fail closed.
+	cfg.MQTT.Listen = "0.0.0.0:1883"
+	if err := cfg.ValidateSecurity(); err == nil {
+		t.Fatal("expected non-loopback broker without credentials to fail ValidateSecurity")
 	}
-	if !cfg.SelfObserve {
-		t.Fatal("expected SelfObserve=true by default in pigeoncoop.example.toml")
+
+	// Explicit opt-in allows anonymous lab broker.
+	cfg.MQTT.AllowInsecureAnonymous = true
+	if err := cfg.ValidateSecurity(); err != nil {
+		t.Fatalf("expected AllowInsecureAnonymous opt-in to pass, got %v", err)
 	}
-	if cfg.SpoolCapacity != 10000 {
-		t.Fatalf("expected SpoolCapacity=10000, got %d", cfg.SpoolCapacity)
-	}
-	if cfg.MQTT.Mode != "embedded" {
-		t.Fatalf("expected embedded MQTT mode, got %q", cfg.MQTT.Mode)
+
+	// Credentials without opt-in pass.
+	cfg.MQTT.AllowInsecureAnonymous = false
+	cfg.MQTT.Username = "coop-admin"
+	cfg.MQTT.Password = "strong-admin-pw"
+	if err := cfg.ValidateSecurity(); err != nil {
+		t.Fatalf("expected authenticated non-loopback broker to pass, got %v", err)
 	}
 }
 
-func TestLoadEdgeAndWorkstationExampleConfigs(t *testing.T) {
-	edgeCfg, err := LoadEdgeConfig(filepath.Join("..", "..", "configs", "pigeoneer.example.toml"))
+func TestLoadEdgeAndWorkstationBrandAndEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	edgePath := filepath.Join(dir, "edge.toml")
+	content := `
+node_id = "edge-rv64-01"
+broker_url = "tcp://10.0.0.5:1883"
+
+[brand]
+topic_root = "fleetx"
+env_prefix = "FLEETX"
+`
+	if err := os.WriteFile(edgePath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write edge.toml: %v", err)
+	}
+
+	t.Setenv("FLEETX_MQTT_USERNAME", "edge-agent")
+	t.Setenv("FLEETX_MQTT_PASSWORD", "edge-secret")
+
+	edgeCfg, err := LoadEdgeConfig(edgePath)
 	if err != nil {
 		t.Fatalf("LoadEdgeConfig failed: %v", err)
 	}
-	if edgeCfg.NodeID != "rv64-compute-01" {
-		t.Fatalf("expected rv64-compute-01, got %q", edgeCfg.NodeID)
+	if edgeCfg.Runners.AllowEphemeral {
+		t.Fatal("expected AllowEphemeral to default to false")
 	}
-	if len(edgeCfg.Tags) == 0 || edgeCfg.Tags[0] == "" {
-		t.Fatal("expected populated normalized tags in pigeoneer.example.toml")
+	if edgeCfg.TopicPrefix != "fleetx/ctd" {
+		t.Fatalf("expected TopicPrefix to follow brand topic_root 'fleetx/ctd', got %q", edgeCfg.TopicPrefix)
+	}
+	mqttAuth := edgeCfg.EffectiveMQTTAuth()
+	if mqttAuth.Username != "edge-agent" || mqttAuth.Password != "edge-secret" {
+		t.Fatalf("expected EffectiveMQTTAuth from FLEETX_MQTT_*, got user=%q pass=%q", mqttAuth.Username, mqttAuth.Password)
 	}
 
-	wsCfg, err := LoadWorkstationConfig(filepath.Join("..", "..", "configs", "pigeons.example.toml"))
+	wsPath := filepath.Join(dir, "pigeons.toml")
+	wsToml := `
+[brand]
+env_prefix = "FLEETX"
+`
+	if err := os.WriteFile(wsPath, []byte(wsToml), 0o600); err != nil {
+		t.Fatalf("write pigeons.toml: %v", err)
+	}
+	t.Setenv("FLEETX_MCP_AUTH_TOKEN", "tok-12345")
+	wsCfg, err := LoadWorkstationConfig(wsPath)
 	if err != nil {
 		t.Fatalf("LoadWorkstationConfig failed: %v", err)
 	}
-	if wsCfg.Permissions.Mode != "default" {
-		t.Fatalf("expected default permission mode, got %q", wsCfg.Permissions.Mode)
-	}
-	if wsCfg.Math.ParsedRefreshInterval().Seconds() != 60 {
-		t.Fatalf("expected 60s refresh interval, got %v", wsCfg.Math.ParsedRefreshInterval())
+	if wsCfg.MCPAuthToken != "tok-12345" {
+		t.Fatalf("expected MCPAuthToken from FLEETX_MCP_AUTH_TOKEN, got %q", wsCfg.MCPAuthToken)
 	}
 }
