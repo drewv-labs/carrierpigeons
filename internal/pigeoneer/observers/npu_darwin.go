@@ -1,6 +1,6 @@
 //go:build darwin
 
-package collectors
+package observers
 
 import (
 	"context"
@@ -13,16 +13,16 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorNPUPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeNPUPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	if os.Geteuid() != 0 {
-		log.Println("[NPU Router] macOS detected; skipping Apple ANE powermetrics collector (requires root).")
+		log.Println("[NPU Observer] macOS detected; skipping Apple ANE powermetrics observer (requires root).")
 		return
 	}
-	log.Println("[NPU Router] Apple Neural Engine detected. Booting ANE collector.")
-	go monitorNPUDarwin(ctx, pub, nodeID)
+	log.Println("[NPU Observer] Apple Neural Engine detected. Booting ANE observer.")
+	go observeNPUDarwin(ctx, pub, nodeID)
 }
 
-func monitorNPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeNPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -44,7 +44,7 @@ func monitorNPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 						AddMetric("npu_power_w", mw/1000.0)
 
 					if err := pub.Publish(event); err != nil {
-						log.Printf("[Darwin NPU] Publish failed: %v", err)
+						log.Printf("[Darwin NPU Observer] Publish failed: %v", err)
 					}
 				}
 			}

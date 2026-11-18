@@ -39,7 +39,7 @@
 
 </div>
 
-**CarrierPigeons** is a lightweight, production-ready Continuous Telemetric Documentation pipeline that collects system metrics from edge devices and reliably delivers them to centralized storage via MQTT—complete with robust state management, batch processing, and graceful lifecycle handling. Included Runner system provides both out-of-the-box & extensively custom executable functions such as stress-testing & benchmarking nodes, integrated natively in the **CarrierPigeons** system.
+**CarrierPigeons** is a lightweight, production-ready Continuous Telemetric Documentation pipeline that observes system metrics from edge devices and reliably delivers them to centralized storage via MQTT—complete with robust state management, batch processing, and graceful lifecycle handling. Included Runner system provides both out-of-the-box & extensively custom executable functions such as stress-testing & benchmarking nodes, integrated natively in the **CarrierPigeons** system.
 
 
 **Why CarrierPigeons?**
@@ -58,7 +58,7 @@ This project empowers developers to build scalable, observable infrastructure mo
 
 
 🚀 **Pigeoneer Edge Agent**
-* **Hardware-Agnostic Collectors:** Auto-detects and independently polls Nvidia, AMD, Apple, and Intel GPUs alongside Linux/OpenWrt/macOS/Windows host and network telemetry. 
+* **Hardware-Agnostic Observers:** Auto-detects and independently observes Nvidia, AMD, Apple, and Intel GPUs alongside Linux/OpenWrt/macOS/Windows host, SoC thermal, CPU cooler fan speed (`cpu_fan_rpm`, `cpu_fan_pwm_pct`), and network telemetry. 
 * **AI Accelerator Support:** Dedicated Hailo, Google Coral, & Apple ANE NPU support featuring PCIe device isolation and array scaling. 
 * **State Awareness:** Event-driven heartbeat architecture utilizing MQTT Last Will and Testament (LWT) registries.
 
@@ -101,10 +101,10 @@ Because `pigeoneer` links only the Go standard library and `paho.mqtt.golang` (e
 
 ### CPU Profile (5s Poll Interval)
 
-| Target Profile | Estimated CPU | Collector Mechanism |
+| Target Profile | Estimated CPU | Observer Mechanism |
 | :--- | :--- | :--- |
-| **Headless Linux / RISC-V SBCs** | **`< 0.05% – 0.15%` (1 hart)** | Zero subprocess forks; reads `/proc/loadavg`, `/proc/meminfo`, `/proc/net/dev`, `/sys/class/thermal`, and Coral `/sys/class/apex` directly in-process. |
-| **OpenWrt Routers** | **`~0.1% – 0.3%` (1 core)** | Two lightweight native C `ubus call` invocations per 5s window (`< 2 MiB` transient child RSS). |
+| **Headless Linux / RISC-V SBCs** | **`< 0.05% – 0.15%` (1 hart)** | Zero subprocess forks; reads `/proc/loadavg`, `/proc/meminfo`, `/proc/net/dev`, `/sys/class/thermal`, `/sys/class/hwmon` (CPU cooler RPM & PWM), and Coral `/sys/class/apex` directly in-process. |
+| **OpenWrt Routers** | **`~0.1% – 0.3%` (1 core)** | Two lightweight native C `ubus call` invocations per 5s window (`< 2 MiB` transient child RSS) plus in-process sysfs thermal/fan reads. |
 | **Discrete GPU / Hailo NPU Nodes** | **`~0.5% – 2.5%` (1 core)** | Driven by vendor CLI subprocess startup (`nvidia-smi`, `rocm-smi`, `hailortcli`); Intel GPUs use a single persistent `intel_gpu_top` JSON stream (`~0.1% – 0.3%`). |
 | **Active `benchmark` Runner** | **`100% × NumCPU()`** | On-demand synthetic stress workload (`sha256` burn) with near-zero heap allocation; completely idle unless explicitly dispatched. |
 
@@ -132,7 +132,7 @@ Because `pigeoneer` links only the Go standard library and `paho.mqtt.golang` (e
     │   ├── pigeoncoop/
     │   │   └── broker/     # MQTT subscriber, event watchdog, and LWT Ntfy registry
     │   ├── pigeoneer/
-    │   │   ├── collectors/ # Platform & accelerator sensors (Linux, OpenWrt, macOS, Windows, GPU, NPU)
+    │   │   ├── observers/  # Platform, cooling, & accelerator observers (Linux, OpenWrt, macOS, Windows, GPU, NPU)
     │   │   ├── relay/      # FIFO offline spooler, MQTT publisher, LWT, and runner dispatcher
     │   │   └── runners/    # Built-in remote execution workloads (benchmark)
     │   └── pigeons/
@@ -142,6 +142,7 @@ Because `pigeoneer` links only the Go standard library and `paho.mqtt.golang` (e
     └── pkg/
         ├── adapters/db/    # BaseDB storage contract & PostgresStore (Ledger, Artifacts, Traces)
         ├── core/           # Canonical CTDPayload (Observer, Runner, Tracer), topics, and interfaces
+        ├── observer/       # Extensible Observer registry and telemetry contract
         └── runner/         # Extensible remote Runner registry and control envelope
 ~~~
 

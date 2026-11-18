@@ -1,16 +1,17 @@
-package collectors
+package observers
 
 import (
 	"context"
 	"encoding/json"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorGPUAMD(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeGPUAMD(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -19,19 +20,23 @@ func monitorGPUAMD(ctx context.Context, pub core.TelemetryPublisher, nodeID stri
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			out, err := runCommand(ctx, defaultCmdTimeout, "rocm-smi", "--showtemp", "--showuse", "--showmeminfo", "vram", "--json")
+			out, err := runCommand(ctx, defaultCmdTimeout, "rocm-smi", "--showtemp", "--showuse", "--showfan", "--showmeminfo", "vram", "--json")
 			if err != nil {
-				log.Printf("[AMD GPU Collector] Sensor timeout: %v", err)
+				log.Printf("[AMD GPU Observer] Sensor timeout: %v", err)
 				continue
 			}
 
 			var amdData map[string]map[string]any
 			if err := json.Unmarshal(out, &amdData); err != nil {
-				log.Printf("[AMD GPU Collector] Failed to parse JSON: %v", err)
+				log.Printf("[AMD GPU Observer] Failed to parse JSON: %v", err)
 				continue
 			}
 
 			for cardName, metrics := range amdData {
+				if !strings.HasPrefix(strings.ToLower(cardName), "card") {
+					continue
+				}
+
 				tempStr, _ := metrics["Temperature (Sensor edge) (C)"].(string)
 				utilStr, _ := metrics["GPU use (%)"].(string)
 				memStr, _ := metrics["VRAM Total Used Memory (B)"].(string)
@@ -45,8 +50,19 @@ func monitorGPUAMD(ctx context.Context, pub core.TelemetryPublisher, nodeID stri
 					AddMetric("utilization_pct", util).
 					AddMetric("memory_used_mb", memBytes/1024.0/1024.0)
 
+				if fanRPMStr, ok := metrics["Fan RPM"].(string); ok {
+					if fanRPM, err := strconv.Atoi(strings.TrimSpace(fanRPMStr)); err == nil && fanRPM >= 0 {
+						event.AddMetric("fan_rpm", fanRPM)
+					}
+				}
+				if fanPctStr, ok := metrics["Fan speed (%)"].(string); ok {
+					if fanPct, err := strconv.ParseFloat(strings.TrimSpace(fanPctStr), 64); err == nil && fanPct >= 0 {
+						event.AddMetric("fan_speed_pct", fanPct)
+					}
+				}
+
 				if err := pub.Publish(event); err != nil {
-					log.Printf("[AMD GPU Collector] Publish failed for %s: %v", cardName, err)
+					log.Printf("[AMD GPU Observer] Publish failed for %s: %v", cardName, err)
 				}
 			}
 		}

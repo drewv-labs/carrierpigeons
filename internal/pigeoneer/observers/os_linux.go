@@ -1,6 +1,6 @@
 //go:build linux
 
-package collectors
+package observers
 
 import (
 	"context"
@@ -13,17 +13,17 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	if isInstalled("ubus") {
-		log.Println("[OS Router] OpenWrt host detected.")
-		monitorOSOpenWrt(ctx, pub, nodeID)
+		log.Println("[OS Observer] OpenWrt host detected.")
+		observeOSOpenWrt(ctx, pub, nodeID)
 		return
 	}
-	log.Println("[OS Router] Linux host detected.")
-	monitorOSLinux(ctx, pub, nodeID)
+	log.Println("[OS Observer] Linux host detected.")
+	observeOSLinux(ctx, pub, nodeID)
 }
 
-func monitorOSLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeOSLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -81,8 +81,11 @@ func monitorOSLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID str
 				}
 			}
 
+			// Observe CPU cooler fan speed (cpu_fan_rpm, cpu_fan_pwm_pct) and host fans via sysfs
+			observeSysfsCooling("/sys", event)
+
 			if err := pub.Publish(event); err != nil {
-				log.Printf("[OS Collector] Publish failed: %v", err)
+				log.Printf("[OS Observer] Publish failed: %v", err)
 			}
 		}
 	}

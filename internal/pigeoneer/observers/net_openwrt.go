@@ -1,6 +1,6 @@
 //go:build linux
 
-package collectors
+package observers
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorNetOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeNetOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -35,7 +35,7 @@ func monitorNetOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 
 			var devices map[string]UbusDevice
 			if err := json.Unmarshal(out, &devices); err != nil {
-				log.Printf("[Net Collector] Failed to parse ubus output: %v", err)
+				log.Printf("[Net Observer] Failed to parse ubus output: %v", err)
 				continue
 			}
 
@@ -50,7 +50,7 @@ func monitorNetOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 					AddMetric("tx_bytes", data.Statistics.TxBytes)
 
 				if err := pub.Publish(event); err != nil {
-					log.Printf("[Net Collector] Publish failed for %s: %v", componentID, err)
+					log.Printf("[Net Observer] Publish failed for %s: %v", componentID, err)
 				}
 			}
 		}

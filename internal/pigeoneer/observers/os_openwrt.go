@@ -1,17 +1,20 @@
 //go:build linux
 
-package collectors
+package observers
 
 import (
 	"context"
 	"encoding/json"
 	"log"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorOSOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeOSOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -35,7 +38,7 @@ func monitorOSOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 
 			var sysInfo UbusSystemInfo
 			if err := json.Unmarshal(out, &sysInfo); err != nil {
-				log.Printf("[OS Collector] Failed to parse ubus system info: %v", err)
+				log.Printf("[OS Observer] Failed to parse ubus system info: %v", err)
 				continue
 			}
 
@@ -44,8 +47,17 @@ func monitorOSOpenWrt(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 				AddMetric("mem_total_mb", sysInfo.Memory.Total/1024.0/1024.0).
 				AddMetric("mem_free_mb", sysInfo.Memory.Free/1024.0/1024.0)
 
+			if tempBytes, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp"); err == nil {
+				if milliC, err := strconv.ParseFloat(strings.TrimSpace(string(tempBytes)), 64); err == nil {
+					event.AddMetric("soc_temp_c", milliC/1000.0)
+				}
+			}
+
+			// Observe SoC / CPU cooler fan speed & PWM duty cycle via Linux sysfs
+			observeSysfsCooling("/sys", event)
+
 			if err := pub.Publish(event); err != nil {
-				log.Printf("[OS Collector] Publish failed: %v", err)
+				log.Printf("[OS Observer] Publish failed: %v", err)
 			}
 		}
 	}

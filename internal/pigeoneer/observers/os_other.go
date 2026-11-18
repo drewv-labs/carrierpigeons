@@ -1,6 +1,6 @@
 //go:build !linux && !darwin && !windows
 
-package collectors
+package observers
 
 import (
 	"context"
@@ -11,8 +11,8 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	log.Printf("[OS Router] Generic host collector started for %s.", runtime.GOOS)
+func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	log.Printf("[OS Observer] Generic host observer started for %s.", runtime.GOOS)
 
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
@@ -25,7 +25,7 @@ func monitorOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 			event := core.NewCTDPayload(nodeID, "host-os", "active").
 				AddMetric("num_cpu", runtime.NumCPU())
 			if err := pub.Publish(event); err != nil {
-				log.Printf("[OS Collector] Publish failed: %v", err)
+				log.Printf("[OS Observer] Publish failed: %v", err)
 			}
 		}
 	}

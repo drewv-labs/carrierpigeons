@@ -1,4 +1,4 @@
-package collectors
+package observers
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorGPUNvidia(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeGPUNvidia(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -23,11 +23,11 @@ func monitorGPUNvidia(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 				ctx,
 				defaultCmdTimeout,
 				"nvidia-smi",
-				"--query-gpu=index,temperature.gpu,utilization.gpu,memory.used,power.draw",
+				"--query-gpu=index,temperature.gpu,utilization.gpu,memory.used,power.draw,fan.speed",
 				"--format=csv,noheader,nounits",
 			)
 			if err != nil {
-				log.Printf("[Nvidia Collector] Sensor timeout: %v", err)
+				log.Printf("[Nvidia GPU Observer] Sensor timeout: %v", err)
 				continue
 			}
 
@@ -55,8 +55,14 @@ func monitorGPUNvidia(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 					AddMetric("memory_used_mb", memUsed).
 					AddMetric("power_w", powerW)
 
+				if len(fields) >= 6 {
+					if fanPct, err := strconv.ParseFloat(strings.TrimSpace(fields[5]), 64); err == nil && fanPct >= 0 {
+						event.AddMetric("fan_speed_pct", fanPct)
+					}
+				}
+
 				if err := pub.Publish(event); err != nil {
-					log.Printf("[Nvidia Collector] Publish failed for %s: %v", componentID, err)
+					log.Printf("[Nvidia GPU Observer] Publish failed for %s: %v", componentID, err)
 				}
 			}
 		}

@@ -8,10 +8,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/collectors"
 	"github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/relay"
+	"github.com/drewv-labs/carrier-pigeons/pkg/observer"
 
-	// Blank import registers built-in runners (e.g., "benchmark")
+	// Blank imports register built-in hardware observers and remote runners
+	_ "github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/observers"
 	_ "github.com/drewv-labs/carrier-pigeons/internal/pigeoneer/runners"
 )
 
@@ -56,12 +57,11 @@ func main() {
 		log.Printf("[Runner Dispatch] Initial control bind deferred until broker reconnect: %v", err)
 	}
 
-	// 3. Deploy concurrent passive hardware collectors bound to daemon lifecycle context
-	collectors.MonitorOS(ctx, mqttRelay, nodeID)
-	collectors.MonitorAdapters(ctx, mqttRelay, nodeID)
+	// 3. Deploy concurrent passive hardware observers bound to daemon lifecycle context
+	observer.StartAll(ctx, nodeID, mqttRelay)
 
 	// 4. Block until OS termination signal
-	log.Printf("Telemetry & Runner agents active for %q. Press Ctrl+C to stop.", nodeID)
+	log.Printf("Observers (%v) & Runner agents active for %q. Press Ctrl+C to stop.", observer.RegistryNames(), nodeID)
 	<-ctx.Done()
 
 	log.Println("Shutting down Pigeoneer...")

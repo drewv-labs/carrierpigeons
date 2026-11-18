@@ -1,6 +1,6 @@
 //go:build linux
 
-package collectors
+package observers
 
 import (
 	"context"
@@ -14,14 +14,14 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorNetPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeNetPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	if isInstalled("ubus") {
-		log.Println("[Net Router] OpenWrt ubus detected. Booting embedded network collector.")
-		go monitorNetOpenWrt(ctx, pub, nodeID)
+		log.Println("[Net Observer] OpenWrt ubus detected. Booting embedded network observer.")
+		go observeNetOpenWrt(ctx, pub, nodeID)
 		return
 	}
-	log.Println("[Net Router] Linux networking detected. Booting /proc/net/dev collector.")
-	go monitorNetLinux(ctx, pub, nodeID)
+	log.Println("[Net Observer] Linux networking detected. Booting /proc/net/dev observer.")
+	go observeNetLinux(ctx, pub, nodeID)
 }
 
 func isInterfaceUp(iface string) bool {
@@ -33,7 +33,7 @@ func isInterfaceUp(iface string) bool {
 	return state == "up" || state == "unknown"
 }
 
-func monitorNetLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeNetLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -83,7 +83,7 @@ func monitorNetLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 					AddMetric("tx_bytes", txBytes)
 
 				if err := pub.Publish(event); err != nil {
-					log.Printf("[Net Collector] Publish failed for %s: %v", componentID, err)
+					log.Printf("[Net Observer] Publish failed for %s: %v", componentID, err)
 				}
 			}
 		}

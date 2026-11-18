@@ -1,6 +1,6 @@
 //go:build !darwin
 
-package collectors
+package observers
 
 import (
 	"context"
@@ -8,6 +8,6 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorGPUPlatform(_ context.Context, _ core.TelemetryPublisher, _ string) bool {
+func observeGPUPlatform(_ context.Context, _ core.TelemetryPublisher, _ string) bool {
 	return false
 }

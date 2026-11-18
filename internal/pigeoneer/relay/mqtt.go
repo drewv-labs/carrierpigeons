@@ -78,7 +78,7 @@ func NewMQTTClientWithPrefix(brokerURL, nodeID, topicPrefix string) *MQTTClient 
 	return c
 }
 
-// Publish drops the payload into the spool channel without ever blocking collectors.
+// Publish drops the payload into the spool channel without ever blocking observers.
 func (c *MQTTClient) Publish(payload *core.CTDPayload) error {
 	if payload == nil {
 		return nil

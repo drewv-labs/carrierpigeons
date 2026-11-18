@@ -1,4 +1,4 @@
-package collectors
+package observers
 
 import (
 	"context"
@@ -17,7 +17,7 @@ var (
 	deviceRegex = regexp.MustCompile(`(?i)(?:Device|PCIe)\s+([0-9a-fA-F:\.]+)`)
 )
 
-func monitorNPUHailo(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeNPUHailo(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -57,7 +57,7 @@ func monitorNPUHailo(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 					AddMetric("power_w", power)
 
 				if err := pub.Publish(event); err != nil {
-					log.Printf("[Hailo Collector] Publish failed for %s: %v", componentID, err)
+					log.Printf("[Hailo NPU Observer] Publish failed for %s: %v", componentID, err)
 				}
 			}
 		}

@@ -1,10 +1,12 @@
 //go:build darwin
 
-package collectors
+package observers
 
 import (
 	"context"
 	"log"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -12,8 +14,12 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	log.Println("[OS Router] macOS/Darwin host detected.")
+var darwinSMCFanRe = regexp.MustCompile(`(?i)Fan(?:\s*(\d+))?\s*:\s*([\d\.]+)\s*rpm`)
+
+func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	log.Println("[OS Observer] macOS/Darwin host detected.")
+
+	isRoot := os.Geteuid() == 0
 
 	var memTotalMB float64
 	if out, err := runCommand(ctx, defaultCmdTimeout, "sysctl", "-n", "hw.memsize"); err == nil {
@@ -51,8 +57,38 @@ func monitorOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 				}
 			}
 
+			// Observe Apple SMC cooler fan RPM when running with root privileges
+			if isRoot {
+				if smcOut, err := runCommand(ctx, defaultCmdTimeout, "powermetrics", "--samplers", "smc", "-n", "1", "-i", "100"); err == nil {
+					matches := darwinSMCFanRe.FindAllStringSubmatch(string(smcOut), -1)
+					if len(matches) > 0 {
+						fans := make(map[string]int, len(matches))
+						firstSet := false
+						for i, m := range matches {
+							rpmFloat, err := strconv.ParseFloat(m[2], 64)
+							if err != nil {
+								continue
+							}
+							rpm := int(rpmFloat)
+							idx := m[1]
+							if idx == "" {
+								idx = strconv.Itoa(i)
+							}
+							fans["smc:fan"+idx] = rpm
+							if !firstSet {
+								event.AddMetric("cpu_fan_rpm", rpm)
+								firstSet = true
+							}
+						}
+						if len(fans) > 0 {
+							event.AddMetric("fans_rpm", fans)
+						}
+					}
+				}
+			}
+
 			if err := pub.Publish(event); err != nil {
-				log.Printf("[OS Collector] Publish failed: %v", err)
+				log.Printf("[OS Observer] Publish failed: %v", err)
 			}
 		}
 	}

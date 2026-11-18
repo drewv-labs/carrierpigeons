@@ -1,4 +1,4 @@
-package collectors
+package observers
 
 import (
 	"bytes"
@@ -8,16 +8,31 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
+	"github.com/drewv-labs/carrier-pigeons/pkg/observer"
 )
 
 const defaultPollInterval = 5 * time.Second
 const defaultCmdTimeout = 4 * time.Second
 
-// MonitorAdapters initializes all peripheral hardware sensor loops bound to ctx.
-func MonitorAdapters(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	go monitorGPU(ctx, pub, nodeID)
-	go monitorNPU(ctx, pub, nodeID)
-	go monitorNet(ctx, pub, nodeID)
+type adaptersObserver struct{}
+
+func init() {
+	observer.Register(&adaptersObserver{})
+}
+
+func (a *adaptersObserver) Name() string {
+	return "adapters"
+}
+
+func (a *adaptersObserver) Observe(ctx context.Context, nodeID string, pub core.TelemetryPublisher) {
+	ObserveAdapters(ctx, pub, nodeID)
+}
+
+// ObserveAdapters initializes all peripheral hardware observer loops bound to ctx.
+func ObserveAdapters(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	go observeGPU(ctx, pub, nodeID)
+	go observeNPU(ctx, pub, nodeID)
+	go observeNet(ctx, pub, nodeID)
 }
 
 // isInstalled checks if an executable exists in the system PATH.
@@ -32,7 +47,7 @@ func pathExists(path string) bool {
 	return err == nil
 }
 
-// runCommand executes an external sensor binary with a strict timeout so hung drivers never deadlock collectors.
+// runCommand executes an external sensor binary with a strict timeout so hung drivers never deadlock observers.
 func runCommand(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

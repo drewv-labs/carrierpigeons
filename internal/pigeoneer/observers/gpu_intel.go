@@ -1,4 +1,4 @@
-package collectors
+package observers
 
 import (
 	"context"
@@ -9,17 +9,17 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	cmd := exec.CommandContext(ctx, "intel_gpu_top", "-J", "-s", "5000")
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("[Intel Collector] Failed to open stdout pipe: %v", err)
+		log.Printf("[Intel GPU Observer] Failed to open stdout pipe: %v", err)
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("[Intel Collector] Failed to start intel_gpu_top: %v", err)
+		log.Printf("[Intel GPU Observer] Failed to start intel_gpu_top: %v", err)
 		return
 	}
 	defer func() {
@@ -29,11 +29,11 @@ func monitorGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 
 	decoder := json.NewDecoder(stdout)
 	if _, err := decoder.Token(); err != nil {
-		log.Printf("[Intel Collector] Failed to read opening JSON bracket: %v", err)
+		log.Printf("[Intel GPU Observer] Failed to read opening JSON bracket: %v", err)
 		return
 	}
 
-	log.Println("[Intel Collector] Attached to intel_gpu_top stream.")
+	log.Println("[Intel GPU Observer] Attached to intel_gpu_top stream.")
 
 	for decoder.More() {
 		select {
@@ -44,7 +44,7 @@ func monitorGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 
 		var data map[string]any
 		if err := decoder.Decode(&data); err != nil {
-			log.Printf("[Intel Collector] JSON stream decode error: %v", err)
+			log.Printf("[Intel GPU Observer] JSON stream decode error: %v", err)
 			break
 		}
 
@@ -65,11 +65,11 @@ func monitorGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 		}
 
 		if err := pub.Publish(event); err != nil {
-			log.Printf("[Intel Collector] Publish failed: %v", err)
+			log.Printf("[Intel GPU Observer] Publish failed: %v", err)
 		}
 	}
 
 	if ctx.Err() == nil {
-		log.Println("[Intel Collector] intel_gpu_top stream ended.")
+		log.Println("[Intel GPU Observer] intel_gpu_top stream ended.")
 	}
 }

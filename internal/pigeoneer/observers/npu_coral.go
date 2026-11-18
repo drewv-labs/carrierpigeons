@@ -1,4 +1,4 @@
-package collectors
+package observers
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"github.com/drewv-labs/carrier-pigeons/pkg/core"
 )
 
-func monitorNPUCoral(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+func observeNPUCoral(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
@@ -46,7 +46,7 @@ func monitorNPUCoral(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 					AddMetric("npu_temp_c", tempMilli/1000.0)
 
 				if err := pub.Publish(event); err != nil {
-					log.Printf("[Coral NPU Collector] Publish failed for %s: %v", devName, err)
+					log.Printf("[Coral NPU Observer] Publish failed for %s: %v", devName, err)
 				}
 			}
 		}
