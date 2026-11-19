@@ -31,15 +31,15 @@
 
 <div align="center">
 
-‼ Please note that this project is in **active development**. CarrierPigeons provides a standalone plug-and-play observability mesh as well as a whitelabelable Go SDK (`pkg/*`) with `PigeonMath` analytical view certification + `Pygeons` Python API (coming soon).
+‼ Please note that this project is in **active development**
 
 ## Overview
 
 </div>
 
-**CarrierPigeons** is a lightweight, heterogeneous Continuous Telemetric Documentation (CTD) mesh built **RISC-V first** (`riscv64`, `arm64`, `amd64`) across Linux, OpenWrt, macOS, and Windows. It observes hardware metrics—CPU cooler fan RPM & PWM duty, SoC thermals, load, memory, network interfaces, GPUs, and NPUs—and streams immutable CTD wide events over MQTT into a high-throughput PostgreSQL ledger.
+**CarrierPigeons** is a lightweight, heterogeneous Continuous Telemetric Documentation (CTD) mesh for `riscv64`, `arm64`, and `amd64` architectures across Linux, OpenWrt, macOS, and Windows operating systems. It observes hardware metrics—CPU cooler fan RPM & PWM duty, SoC thermals, load, memory, network interfaces, GPUs, and NPUs—and streams immutable CTD wide events over MQTT into a high-throughput PostgreSQL ledger.
 
-Transitioning beyond passive logging, CarrierPigeons pairs continuous hardware observation with an integrated **Runner** execution mesh, **PigeonMath** analytical view propagation, **PigeonCare** LLM-assisted diagnostics, and **PigeonMCP** integration for modern developer harnesses.
+Transitioning beyond passive logging, CarrierPigeons pairs continuous hardware observation with an integrated **Runner** execution dispatch & monitoring, **PigeonMath** analytical view propagation, **PigeonCare** LLM-assisted diagnostics, and **PigeonMCP** integration for modern developer AI harnesses. Development of the **Pygeons** official [uv](https://docs.astral.sh/uv/) optimized Python API will begin after the core Pigeon kit is solid which will be published to PyPI.
 
 <br>
 
