@@ -15,6 +15,7 @@ var _ AgentSafeDB = (*ReadOnlyAgentStore)(nil)
 type ReadOnlyOptions struct {
 	AllowSuperuser bool
 	MaxRows        int
+	MathSchema     string
 }
 
 // ReadOnlyAgentStore wraps a PostgresStore behind the narrow AgentSafeDB capability boundary,
@@ -53,6 +54,7 @@ func NewReadOnlyAgentStore(ctx context.Context, connStr, appActor string, opts .
 		MinConns:            1,
 		StatementTimeoutMs:  5000,
 		EnforceNonSuperuser: !roOpt.AllowSuperuser,
+		MathSchema:          roOpt.MathSchema,
 	})
 	if err != nil {
 		return nil, err

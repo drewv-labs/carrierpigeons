@@ -15,13 +15,13 @@ import (
 )
 
 func observeNetPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	if pathExists("/etc/openwrt_release") || isInstalled("ubus") {
+	if pathExists("/etc/openwrt_release") {
 		log.Println("[Net Observer] OpenWrt networking detected. Booting zero-fork /proc/net/dev observer.")
-		go observeNetOpenWrt(ctx, pub, nodeID)
+		observeNetOpenWrt(ctx, pub, nodeID)
 		return
 	}
 	log.Println("[Net Observer] Linux networking detected. Booting /proc/net/dev observer.")
-	go observeNetLinux(ctx, pub, nodeID)
+	observeNetLinux(ctx, pub, nodeID)
 }
 
 func isInterfaceUp(iface string) bool {

@@ -34,7 +34,6 @@ var rootCmd = &cobra.Command{
 			return err
 		}
 		wsCfg = loaded
-		brand.SetActive(wsCfg.Brand)
 		return nil
 	},
 	Run: func(cmd *cobra.Command, _ []string) {
@@ -103,15 +102,17 @@ func dialMQTTClient(brokerURL, clientID string, timeout time.Duration) (mqtt.Cli
 func openOperatorStore(ctx context.Context) (*db.PostgresStore, error) {
 	actor := fmt.Sprintf("%s-cli:%s", wsCfg.Brand.CLIName, wsCfg.Operator)
 	return db.NewPostgresStoreWithOptions(ctx, wsCfg.DatabaseURL, db.StoreOptions{
-		AppActor: actor,
-		MaxConns: 6,
-		MinConns: 1,
+		AppActor:   actor,
+		MaxConns:   6,
+		MinConns:   1,
+		MathSchema: wsCfg.Brand.MathSchema,
 	})
 }
 
 func openReadOnlyStore(ctx context.Context, actor string) (*db.ReadOnlyAgentStore, error) {
 	return db.NewReadOnlyAgentStore(ctx, wsCfg.ReadOnlyDatabaseURL, actor, db.ReadOnlyOptions{
 		AllowSuperuser: wsCfg.AllowSuperuserReadOnly,
+		MathSchema:     wsCfg.Brand.MathSchema,
 	})
 }
 
@@ -131,9 +132,10 @@ func publishRunnerRequest(brokerURL string, req core.RunnerRequestCTD) error {
 	}
 	defer client.Disconnect(200)
 
-	tok := client.Publish(core.RunnerRequestTopic(), 1, false, raw)
+	reqTopic := wsCfg.Brand.RunnerRequestTopic()
+	tok := client.Publish(reqTopic, 1, false, raw)
 	if !tok.WaitTimeout(4 * time.Second) {
-		return fmt.Errorf("timeout publishing RunnerRequestCTD to %s", core.RunnerRequestTopic())
+		return fmt.Errorf("timeout publishing RunnerRequestCTD to %s", reqTopic)
 	}
 	return tok.Error()
 }
@@ -186,7 +188,6 @@ func launchDashboard(initialTab tui.TabID, focusReq, faultContext, modeOverride 
 // ApplyBrand re-skins the root CLI command names and descriptions for whitelabeled SDK binaries.
 func ApplyBrand(spec brand.Spec) {
 	b := spec.MergeWithDefaults()
-	brand.SetActive(b)
 	wsCfg.Brand = b
 	rootCmd.Use = b.CLIName
 	rootCmd.Short = fmt.Sprintf("%s: The %s Control Plane CLI & TUI", b.CLIName, b.ProductName)

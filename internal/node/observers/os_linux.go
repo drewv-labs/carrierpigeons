@@ -15,7 +15,7 @@ import (
 )
 
 func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	if pathExists("/etc/openwrt_release") || isInstalled("ubus") {
+	if pathExists("/etc/openwrt_release") {
 		log.Println("[OS Observer] OpenWrt host detected (zero-fork /proc + /sys observer).")
 		observeOSOpenWrt(ctx, pub, nodeID)
 		return

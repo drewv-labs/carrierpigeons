@@ -38,7 +38,7 @@ var mathListCmd = &cobra.Command{
 		}
 		defer store.Close()
 
-		eng := pigeonmath.NewEngine(store)
+		eng := pigeonmath.NewEngineWithSchema(store, wsCfg.Brand.MathSchema)
 		views, err := eng.ListPMVs(ctx)
 		if err != nil {
 			return err
@@ -74,7 +74,7 @@ var mathInspectCmd = &cobra.Command{
 		}
 		defer store.Close()
 
-		eng := pigeonmath.NewEngine(store)
+		eng := pigeonmath.NewEngineWithSchema(store, wsCfg.Brand.MathSchema)
 		rec, err := eng.GetPMV(ctx, args[0])
 		if err != nil {
 			return err
@@ -123,7 +123,7 @@ var mathCreateCmd = &cobra.Command{
 			})
 		}
 
-		eng := pigeonmath.NewEngine(store)
+		eng := pigeonmath.NewEngineWithSchema(store, wsCfg.Brand.MathSchema)
 		rec, err := eng.SubmitAndCertifyPMV(ctx, wsCfg.Operator, args[0], args[1], optLLM)
 		if err != nil {
 			return err

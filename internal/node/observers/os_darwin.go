@@ -78,6 +78,20 @@ func readDarwinLoadAvg() (load1, load5, load15 float64, ok bool) {
 		true
 }
 
+func readDarwinAvailableMemoryMB() (float64, bool) {
+	pageSize, err := unix.SysctlUint32("hw.pagesize")
+	if err != nil || pageSize == 0 {
+		pageSize = 4096
+	}
+	freePages, err := unix.SysctlUint32("vm.page_free_count")
+	if err != nil {
+		return 0, false
+	}
+	specPages, _ := unix.SysctlUint32("vm.page_speculative_count")
+	availBytes := (uint64(freePages) + uint64(specPages)) * uint64(pageSize)
+	return math.Round((float64(availBytes)/1024.0/1024.0)*10) / 10, true
+}
+
 func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	log.Println("[OS Observer] macOS/Darwin host detected (zero-fork sysctl observer).")
 
@@ -91,6 +105,16 @@ func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 		event := core.NewCTDPayload(nodeID, "host-os", "active")
 		if memTotalMB > 0 {
 			event.AddMetric("mem_total_mb", memTotalMB)
+			if memAvailMB, ok := readDarwinAvailableMemoryMB(); ok {
+				if memAvailMB > memTotalMB {
+					memAvailMB = memTotalMB
+				}
+				memUsedMB := math.Round((memTotalMB-memAvailMB)*10) / 10
+				memUsedPct := math.Round(((memTotalMB-memAvailMB)/memTotalMB)*1000) / 10
+				event.AddMetric("mem_available_mb", memAvailMB)
+				event.AddMetric("mem_used_mb", memUsedMB)
+				event.AddMetric("mem_used_pct", memUsedPct)
+			}
 		}
 		if tv, err := unix.SysctlTimeval("kern.boottime"); err == nil && tv.Sec > 0 {
 			uptime := time.Since(time.Unix(tv.Sec, int64(tv.Usec)*1000)).Seconds()

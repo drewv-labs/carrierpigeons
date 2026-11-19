@@ -41,14 +41,14 @@ func observeGPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 
 		if match := darwinGPUPowerRe.FindStringSubmatch(output); len(match) > 1 {
 			if mw, err := strconv.ParseFloat(match[1], 64); err == nil {
-				event.AddMetric("gpu_power_w", mw/1000.0)
+				event.AddMetric("power_w", mw/1000.0)
 				metricAdded = true
 			}
 		}
 
 		if match := darwinGPUResidencyRe.FindStringSubmatch(output); len(match) > 1 {
 			if res, err := strconv.ParseFloat(match[1], 64); err == nil {
-				event.AddMetric("gpu_utilization_pct", res)
+				event.AddMetric("utilization_pct", res)
 				metricAdded = true
 			}
 		}

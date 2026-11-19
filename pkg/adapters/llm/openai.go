@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 )
 
 var _ BaseLLM = (*OpenAIAdapter)(nil)
@@ -38,22 +37,78 @@ func NewOpenAIAdapter(endpoint, apiKey, model string, tools ToolExecutor) *OpenA
 		apiKey:   apiKey,
 		model:    model,
 		tools:    tools,
-		client: &http.Client{
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 30 * time.Second,
-			},
-		},
+		client:   defaultLLMHTTPClient(),
 	}
 }
 
-func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history []Message) (string, error) {
+func (a *OpenAIAdapter) headers() map[string]string {
+	if a.apiKey == "" {
+		return nil
+	}
+	return map[string]string{"Authorization": "Bearer " + a.apiKey}
+}
+
+func buildOpenAIMessages(systemPrompt string, history []Message) []map[string]any {
 	messages := make([]map[string]any, 0, len(history)+1)
 	messages = append(messages, map[string]any{"role": "system", "content": systemPrompt})
-	for _, m := range history {
-		messages = append(messages, map[string]any{"role": m.Role, "content": m.Content})
+	for i, m := range history {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		switch role {
+		case "tool":
+			callID := strings.TrimSpace(m.ToolCallID)
+			if callID == "" {
+				callID = fmt.Sprintf("call_%d", i)
+			}
+			messages = append(messages, map[string]any{
+				"role":         "tool",
+				"tool_call_id": callID,
+				"content":      m.Content,
+			})
+		case "assistant":
+			entry := map[string]any{
+				"role":    "assistant",
+				"content": m.Content,
+			}
+			if len(m.ToolCalls) > 0 {
+				wireCalls := make([]map[string]any, 0, len(m.ToolCalls))
+				for idx, tc := range m.ToolCalls {
+					callID := strings.TrimSpace(tc.ID)
+					if callID == "" {
+						callID = fmt.Sprintf("call_%d_%d", i, idx)
+					}
+					argsStr := "{}"
+					if len(tc.Function.Arguments) > 0 {
+						if b, err := json.Marshal(tc.Function.Arguments); err == nil {
+							argsStr = string(b)
+						}
+					}
+					wireCalls = append(wireCalls, map[string]any{
+						"id":   callID,
+						"type": "function",
+						"function": map[string]any{
+							"name":      tc.Function.Name,
+							"arguments": argsStr,
+						},
+					})
+				}
+				entry["tool_calls"] = wireCalls
+			}
+			messages = append(messages, entry)
+		default:
+			if role == "" {
+				role = "user"
+			}
+			messages = append(messages, map[string]any{"role": role, "content": m.Content})
+		}
 	}
+	return messages
+}
 
-	for range 6 {
+func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history []Message) (string, error) {
+	messages := buildOpenAIMessages(systemPrompt, history)
+	var finalReply string
+
+	err := runToolLoop(defaultMaxToolTurns, "openai", func(_ int) (bool, error) {
 		payload := map[string]any{
 			"model":    a.model,
 			"messages": messages,
@@ -64,27 +119,9 @@ func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history [
 			}
 		}
 
-		body, err := json.Marshal(payload)
+		resp, err := postJSON(ctx, a.client, a.endpoint, a.headers(), payload, "OpenAI")
 		if err != nil {
-			return "", err
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewBuffer(body))
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if a.apiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+a.apiKey)
-		}
-
-		resp, err := a.client.Do(req)
-		if err != nil {
-			return "", err
-		}
-		if resp.StatusCode >= http.StatusBadRequest {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			return "", fmt.Errorf("openai HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+			return false, err
 		}
 
 		var result struct {
@@ -107,12 +144,13 @@ func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history [
 		err = json.NewDecoder(resp.Body).Decode(&result)
 		resp.Body.Close()
 		if err != nil || len(result.Choices) == 0 {
-			return "", fmt.Errorf("failed to decode openai response")
+			return false, fmt.Errorf("failed to decode openai response")
 		}
 
 		choice := result.Choices[0].Message
 		if len(choice.ToolCalls) == 0 || a.tools == nil {
-			return choice.Content, nil
+			finalReply = choice.Content
+			return true, nil
 		}
 
 		messages = append(messages, map[string]any{
@@ -121,18 +159,19 @@ func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history [
 			"tool_calls": choice.ToolCalls,
 		})
 		for _, tc := range choice.ToolCalls {
-			var parsedArgs map[string]any
-			_ = json.Unmarshal([]byte(tc.Function.Arguments), &parsedArgs)
-			obs := a.tools.Execute(ctx, tc.Function.Name, parsedArgs)
+			obs := executeToolCallRaw(ctx, a.tools, tc.Function.Name, tc.Function.Arguments)
 			messages = append(messages, map[string]any{
 				"role":         "tool",
 				"tool_call_id": tc.ID,
 				"content":      obs,
 			})
 		}
+		return false, nil
+	})
+	if err != nil {
+		return "", err
 	}
-
-	return "", fmt.Errorf("openai tool loop exceeded max turns")
+	return finalReply, nil
 }
 
 func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, history []Message) (<-chan string, error) {
@@ -140,13 +179,9 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 
 	go func() {
 		defer close(tokenChan)
-		messages := make([]map[string]any, 0, len(history)+1)
-		messages = append(messages, map[string]any{"role": "system", "content": systemPrompt})
-		for _, m := range history {
-			messages = append(messages, map[string]any{"role": m.Role, "content": m.Content})
-		}
+		messages := buildOpenAIMessages(systemPrompt, history)
 
-		for range 6 {
+		_ = runToolLoop(defaultMaxToolTurns, "openai", func(_ int) (bool, error) {
 			payload := map[string]any{
 				"model":    a.model,
 				"messages": messages,
@@ -158,33 +193,12 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				}
 			}
 
-			body, err := json.Marshal(payload)
-			if err != nil {
-				sendToken(ctx, tokenChan, fmt.Sprintf("[OpenAI encode error: %v]", err))
-				return
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewBuffer(body))
-			if err != nil {
-				sendToken(ctx, tokenChan, fmt.Sprintf("[OpenAI request error: %v]", err))
-				return
-			}
-			req.Header.Set("Content-Type", "application/json")
-			if a.apiKey != "" {
-				req.Header.Set("Authorization", "Bearer "+a.apiKey)
-			}
-
-			resp, err := a.client.Do(req)
+			resp, err := postJSON(ctx, a.client, a.endpoint, a.headers(), payload, "OpenAI")
 			if err != nil {
 				if ctx.Err() == nil {
-					sendToken(ctx, tokenChan, fmt.Sprintf("[OpenAI connection error: %v]", err))
+					sendToken(ctx, tokenChan, fmt.Sprintf("[%v]", err))
 				}
-				return
-			}
-			if resp.StatusCode >= http.StatusBadRequest {
-				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				resp.Body.Close()
-				sendToken(ctx, tokenChan, fmt.Sprintf("[OpenAI HTTP %d: %s]", resp.StatusCode, strings.TrimSpace(string(errBody))))
-				return
+				return true, nil
 			}
 
 			// Support both SSE (`text/event-stream`) and non-SSE JSON fallback servers seamlessly.
@@ -201,7 +215,7 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				}
 				if json.Unmarshal(rawBody, &nonStream) == nil && len(nonStream.Choices) > 0 {
 					sendToken(ctx, tokenChan, nonStream.Choices[0].Message.Content)
-					return
+					return true, nil
 				}
 				resp.Body = io.NopCloser(bytes.NewReader(rawBody))
 			}
@@ -247,7 +261,7 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				if delta.Content != "" {
 					if !sendToken(ctx, tokenChan, delta.Content) {
 						resp.Body.Close()
-						return
+						return true, nil
 					}
 					fullContent.WriteString(delta.Content)
 				}
@@ -272,11 +286,11 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 			resp.Body.Close()
 			if scanErr != nil && ctx.Err() == nil {
 				sendToken(ctx, tokenChan, fmt.Sprintf("\n[OpenAI stream read error: %v]", scanErr))
-				return
+				return true, nil
 			}
 
 			if len(partials) == 0 || a.tools == nil {
-				return
+				return true, nil
 			}
 
 			indices := make([]int, 0, len(partials))
@@ -315,18 +329,17 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 					callID = fmt.Sprintf("call_%d", idx)
 				}
 				if !sendToken(ctx, tokenChan, fmt.Sprintf("\n*(Running tool: %s...)*\n", p.name)) {
-					return
+					return true, nil
 				}
-				var parsedArgs map[string]any
-				_ = json.Unmarshal([]byte(p.args.String()), &parsedArgs)
-				obs := a.tools.Execute(ctx, p.name, parsedArgs)
+				obs := executeToolCallRaw(ctx, a.tools, p.name, p.args.String())
 				messages = append(messages, map[string]any{
 					"role":         "tool",
 					"tool_call_id": callID,
 					"content":      obs,
 				})
 			}
-		}
+			return false, nil
+		})
 	}()
 
 	return tokenChan, nil

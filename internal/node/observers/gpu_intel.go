@@ -5,12 +5,45 @@ import (
 	"encoding/json"
 	"log"
 	"os/exec"
+	"strconv"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	cmd := exec.CommandContext(ctx, "intel_gpu_top", "-J", "-s", "5000")
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		startedAt := time.Now()
+		runIntelGPUTopOnce(ctx, pub, nodeID)
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Since(startedAt) >= 30*time.Second {
+			backoff = time.Second
+		}
+		log.Printf("[Intel GPU Observer] intel_gpu_top exited; restarting after %s backoff.", backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
+}
+
+func runIntelGPUTopOnce(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	intervalMs := max(pollInterval(ctx).Milliseconds(), int64(250))
+	cmd := exec.CommandContext(ctx, "intel_gpu_top", "-J", "-s", strconv.FormatInt(intervalMs, 10))
+	configureProcessGroup(cmd)
+	cmd.WaitDelay = 2 * time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -23,7 +56,7 @@ func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 		return
 	}
 	defer func() {
-		_ = cmd.Process.Kill()
+		killProcessGroup(cmd)
 		_ = cmd.Wait()
 	}()
 
@@ -33,7 +66,7 @@ func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 		return
 	}
 
-	log.Println("[Intel GPU Observer] Attached to intel_gpu_top stream.")
+	log.Printf("[Intel GPU Observer] Attached to intel_gpu_top stream (interval=%dms).", intervalMs)
 
 	for decoder.More() {
 		select {

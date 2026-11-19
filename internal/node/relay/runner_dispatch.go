@@ -29,7 +29,7 @@ func (c *MQTTClient) lookupRunner(name string) (runner.Runner, string, bool) {
 
 // ListenForRunners binds the MQTT client to the node's exclusive control topic and re-subscribes on reconnect.
 func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, pub core.TelemetryPublisher) error {
-	topic := core.ControlTopic(nodeID)
+	topic := c.brand.ControlTopic(nodeID)
 
 	var (
 		mu            sync.Mutex

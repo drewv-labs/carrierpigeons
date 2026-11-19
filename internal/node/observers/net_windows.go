@@ -3,6 +3,7 @@
 package observers
 
 import (
+	"bytes"
 	"context"
 	"log"
 	"strconv"
@@ -14,91 +15,123 @@ import (
 )
 
 var (
-	modIphlpapi    = syscall.NewLazyDLL("iphlpapi.dll")
-	procGetIfTable = modIphlpapi.NewProc("GetIfTable")
+	modIphlpapi      = syscall.NewLazyDLL("iphlpapi.dll")
+	procGetIfTable2  = modIphlpapi.NewProc("GetIfTable2")
+	procFreeMibTable = modIphlpapi.NewProc("FreeMibTable")
 )
 
 const (
-	mibIfTypeLoopback = 24
-	ifOperStatusUp    = 5
-	ifOperStatusConn  = 4
-	errorInsuffBuffer = 122
-	maxInterfaceName  = 256
-	maxPhysAddressLen = 8
-	maxDescrLen       = 256
+	mibIfTypeLoopback      = 24
+	ifOperStatusUp         = 1 // RFC 2863 IF_OPER_STATUS IfOperStatusUp in MIB_IF_ROW2
+	ifMaxStringSize        = 256
+	ifMaxPhysAddressLength = 32
 )
 
-type mibIfRow struct {
-	Name            [maxInterfaceName]uint16
-	Index           uint32
-	Type            uint32
-	Mtu             uint32
-	Speed           uint32
-	PhysAddrLen     uint32
-	PhysAddr        [maxPhysAddressLen]byte
-	AdminStatus     uint32
-	OperStatus      uint32
-	LastChange      uint32
-	InOctets        uint32
-	InUcastPkts     uint32
-	InNUcastPkts    uint32
-	InDiscards      uint32
-	InErrors        uint32
-	InUnknownProtos uint32
-	OutOctets       uint32
-	OutUcastPkts    uint32
-	OutNUcastPkts   uint32
-	OutDiscards     uint32
-	OutErrors       uint32
-	OutQLen         uint32
-	DescrLen        uint32
-	Descr           [maxDescrLen]byte
+type winGUID struct {
+	Data1 uint32
+	Data2 uint16
+	Data3 uint16
+	Data4 [8]byte
+}
+
+// mibIfRow2 matches Windows netioapi.h MIB_IF_ROW2 (64-bit byte/packet counters).
+type mibIfRow2 struct {
+	InterfaceLuid               uint64
+	InterfaceIndex              uint32
+	InterfaceGuid               winGUID
+	Alias                       [ifMaxStringSize + 1]uint16
+	Description                 [ifMaxStringSize + 1]uint16
+	PhysicalAddressLength       uint32
+	PhysicalAddress             [ifMaxPhysAddressLength]byte
+	PermanentPhysicalAddress    [ifMaxPhysAddressLength]byte
+	Mtu                         uint32
+	Type                        uint32
+	TunnelType                  uint32
+	MediaType                   uint32
+	PhysicalMediumType          uint32
+	AccessType                  uint32
+	DirectionType               uint32
+	InterfaceAndOperStatusFlags byte
+	_                           [3]byte
+	OperStatus                  uint32
+	AdminStatus                 uint32
+	MediaConnectState           uint32
+	NetworkGuid                 winGUID
+	ConnectionType              uint32
+	_                           uint32
+	TransmitLinkSpeed           uint64
+	ReceiveLinkSpeed            uint64
+	InOctets                    uint64
+	InUcastPkts                 uint64
+	InNUcastPkts                uint64
+	InDiscards                  uint64
+	InErrors                    uint64
+	InUnknownProtos             uint64
+	InUcastOctets               uint64
+	InMulticastOctets           uint64
+	InBroadcastOctets           uint64
+	OutOctets                   uint64
+	OutUcastPkts                uint64
+	OutNUcastPkts               uint64
+	OutDiscards                 uint64
+	OutErrors                   uint64
+	OutUcastOctets              uint64
+	OutMulticastOctets          uint64
+	OutBroadcastOctets          uint64
+	OutQLen                     uint64
+}
+
+type mibIfTable2 struct {
+	NumEntries uint32
+	_          uint32
+	Table      [1]mibIfRow2
 }
 
 func observeNetPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	log.Println("[Net Observer] Windows networking detected (zero-fork Win32 GetIfTable observer).")
-	go observeNetWindows(ctx, pub, nodeID)
+	log.Println("[Net Observer] Windows networking detected (zero-fork Win32 GetIfTable2 64-bit observer).")
+	observeNetWindows(ctx, pub, nodeID)
 }
 
 func emitWindowsNetSamples(pub core.TelemetryPublisher, nodeID string) {
-	var size uint32
-	r, _, _ := procGetIfTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
-	if r != errorInsuffBuffer || size == 0 || size > 4*1024*1024 {
+	var table *mibIfTable2
+	r, _, _ := procGetIfTable2.Call(uintptr(unsafe.Pointer(&table)))
+	if r != 0 || table == nil {
 		return
 	}
 
-	buf := make([]byte, size)
-	r, _, _ = procGetIfTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
-	if r != 0 || len(buf) < 4 {
+	numEntries := int(table.NumEntries)
+	if numEntries <= 0 || numEntries > 4096 {
+		procFreeMibTable.Call(uintptr(unsafe.Pointer(table)))
 		return
 	}
 
-	numEntries := *(*uint32)(unsafe.Pointer(&buf[0]))
-	rowSize := uintptr(unsafe.Sizeof(mibIfRow{}))
-	baseOffset := unsafe.Sizeof(uint32(0))
+	// Copy into a Go-allocated, properly aligned []mibIfRow2 slice before freeing the Win32 table.
+	rows := make([]mibIfRow2, numEntries)
+	copy(rows, unsafe.Slice(&table.Table[0], numEntries))
+	procFreeMibTable.Call(uintptr(unsafe.Pointer(table)))
 
-	for i := range numEntries {
-		offset := baseOffset + uintptr(i)*rowSize
-		if offset+rowSize > uintptr(len(buf)) {
-			break
-		}
-		row := (*mibIfRow)(unsafe.Pointer(&buf[offset]))
+	for i := range rows {
+		row := &rows[i]
 		if row.Type == mibIfTypeLoopback {
 			continue
 		}
-		if row.OperStatus != ifOperStatusUp && row.OperStatus != ifOperStatusConn {
+		if row.OperStatus != ifOperStatusUp {
 			continue
 		}
 		if row.InOctets == 0 && row.OutOctets == 0 {
 			continue
 		}
 
-		comp := "net-eth" + strconv.FormatUint(uint64(row.Index), 10)
+		comp := "net-eth" + strconv.FormatUint(uint64(row.InterfaceIndex), 10)
 		ev := core.NewCTDPayload(nodeID, comp, "active").
 			AddMetric("rx_bytes", float64(row.InOctets)).
-			AddMetric("tx_bytes", float64(row.OutOctets))
-		if row.DescrLen > 0 && int(row.DescrLen) <= len(row.Descr) {
-			ev.AddParam("description", string(row.Descr[:row.DescrLen]))
+			AddMetric("tx_bytes", float64(row.OutOctets)).
+			AddMetric("rx_packets", float64(row.InUcastPkts+row.InNUcastPkts)).
+			AddMetric("tx_packets", float64(row.OutUcastPkts+row.OutNUcastPkts))
+
+		desc := string(bytes.TrimRight([]byte(syscall.UTF16ToString(row.Description[:])), "\x00"))
+		if desc != "" {
+			ev.AddParam("description", desc)
 		}
 		if err := pub.Publish(ev); err != nil {
 			log.Printf("[Windows Net Observer] Publish failed for %s: %v", comp, err)

@@ -2,8 +2,11 @@ package coop
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 
@@ -21,6 +24,7 @@ import (
 // Options allows downstream Go projects to customize or extend PigeonCoop when embedding it as a library.
 type Options struct {
 	Store            db.BaseDB
+	Brand            brand.Spec
 	ProvisionRoles   bool
 	IngestPassword   string
 	ReadOnlyPassword string
@@ -46,12 +50,15 @@ type Server struct {
 
 // New constructs a configured PigeonCoop Server ready to Start(ctx).
 func New(cfg config.CoopConfig, opts ...Options) *Server {
-	cfg.Brand = cfg.Brand.MergeWithDefaults()
-	cfg.Tags = core.NormalizeTags(cfg.Tags)
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	if opt.Brand != (brand.Spec{}) {
+		cfg.Brand = opt.Brand
+	}
+	cfg.Brand = cfg.Brand.MergeWithDefaults()
+	cfg.Tags = core.NormalizeTags(cfg.Tags)
 	return &Server{
 		cfg:  cfg,
 		opts: opt,
@@ -60,20 +67,52 @@ func New(cfg config.CoopConfig, opts ...Options) *Server {
 
 // Start boots the PostgreSQL schema, MQTT broker, batched CTD ingestor, and implicit self-observation/runners.
 func (s *Server) Start(ctx context.Context) error {
-	brand.SetActive(s.cfg.Brand)
-
 	if err := s.cfg.ValidateSecurity(); err != nil {
 		return err
 	}
 
+	isExternal := strings.EqualFold(strings.TrimSpace(s.cfg.MQTT.Mode), "external")
+	clientCertFile := ""
+	clientKeyFile := ""
+	if isExternal {
+		clientCertFile = s.cfg.MQTT.TLSCertFile
+		clientKeyFile = s.cfg.MQTT.TLSKeyFile
+	}
+
 	clientTLS, err := config.BuildMQTTTLSConfig(
 		s.cfg.MQTT.TLSCAFile,
-		"",
-		"",
+		clientCertFile,
+		clientKeyFile,
 		s.cfg.MQTT.TLSInsecureSkipVerify,
 	)
 	if err != nil {
 		return fmt.Errorf("configure PigeonCoop MQTT TLS client: %w", err)
+	}
+
+	// In embedded TLS mode without an explicit CA file, trust the embedded broker's leaf cert
+	// so internal loopback subscribers connect securely without requiring TLSInsecureSkipVerify.
+	selfCAFile := s.cfg.MQTT.TLSCAFile
+	if !isExternal && strings.TrimSpace(s.cfg.MQTT.TLSCertFile) != "" && strings.TrimSpace(s.cfg.MQTT.TLSKeyFile) != "" && strings.TrimSpace(s.cfg.MQTT.TLSCAFile) == "" {
+		pemBytes, readErr := os.ReadFile(s.cfg.MQTT.TLSCertFile)
+		if readErr != nil {
+			return fmt.Errorf("read embedded MQTT TLS cert %s for loopback trust: %w", s.cfg.MQTT.TLSCertFile, readErr)
+		}
+		if clientTLS == nil {
+			clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		pool := clientTLS.RootCAs
+		if pool == nil {
+			if sysPool, poolErr := x509.SystemCertPool(); poolErr == nil && sysPool != nil {
+				pool = sysPool
+			} else {
+				pool = x509.NewCertPool()
+			}
+		}
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			return fmt.Errorf("no valid PEM certificates in embedded MQTT TLS cert %s", s.cfg.MQTT.TLSCertFile)
+		}
+		clientTLS.RootCAs = pool
+		selfCAFile = s.cfg.MQTT.TLSCertFile
 	}
 
 	// 1. Initialize or attach PostgreSQL Ledger
@@ -81,9 +120,10 @@ func (s *Server) Start(ctx context.Context) error {
 		s.store = s.opts.Store
 	} else {
 		pgStore, err := db.NewPostgresStoreWithOptions(ctx, s.cfg.Database.URL, db.StoreOptions{
-			AppActor: strings.ToLower(s.cfg.Brand.CoopName) + "-ingestor",
-			MaxConns: s.cfg.Database.MaxConns,
-			MinConns: s.cfg.Database.MinConns,
+			AppActor:   strings.ToLower(s.cfg.Brand.CoopName) + "-ingestor",
+			MaxConns:   s.cfg.Database.MaxConns,
+			MinConns:   s.cfg.Database.MinConns,
+			MathSchema: s.cfg.Brand.MathSchema,
 		})
 		if err != nil {
 			return fmt.Errorf("connect PostgreSQL ledger: %w", err)
@@ -107,16 +147,17 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// 2. Start embedded pure-Go MQTT broker (unless external broker mode is selected)
-	if !strings.EqualFold(strings.TrimSpace(s.cfg.MQTT.Mode), "external") {
+	if !isExternal {
 		emb, err := broker.StartEmbedded(broker.EmbeddedOptions{
-			ListenAddr:   s.cfg.MQTT.Listen,
-			Username:     s.cfg.MQTT.Username,
-			Password:     s.cfg.MQTT.Password,
-			EdgeUsername: s.cfg.MQTT.EdgeUsername,
-			EdgePassword: s.cfg.MQTT.EdgePassword,
-			TLSCertFile:  s.cfg.MQTT.TLSCertFile,
-			TLSKeyFile:   s.cfg.MQTT.TLSKeyFile,
-			TopicRoot:    s.cfg.Brand.TopicRoot,
+			ListenAddr:       s.cfg.MQTT.Listen,
+			Username:         s.cfg.MQTT.Username,
+			Password:         s.cfg.MQTT.Password,
+			EdgeUsername:     s.cfg.MQTT.EdgeUsername,
+			EdgePassword:     s.cfg.MQTT.EdgePassword,
+			EdgeClientPrefix: strings.ToLower(s.cfg.Brand.EdgeName),
+			TLSCertFile:      s.cfg.MQTT.TLSCertFile,
+			TLSKeyFile:       s.cfg.MQTT.TLSKeyFile,
+			TopicRoot:        s.cfg.Brand.TopicRoot,
 		})
 		if err != nil {
 			s.Stop()
@@ -144,6 +185,7 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 		NtfyEnabled: s.cfg.Ntfy.Enabled,
 		NtfyURL:     s.cfg.Ntfy.URL,
+		Brand:       s.cfg.Brand,
 	}, s.store)
 	if err != nil {
 		s.Stop()
@@ -162,13 +204,16 @@ func (s *Server) Start(ctx context.Context) error {
 			TopicPrefix:           s.cfg.Brand.CTDPrefix(),
 			MQTTUsername:          s.cfg.MQTT.Username,
 			MQTTPassword:          s.cfg.MQTT.Password,
-			TLSCAFile:             s.cfg.MQTT.TLSCAFile,
+			TLSCAFile:             selfCAFile,
+			TLSCertFile:           clientCertFile,
+			TLSKeyFile:            clientKeyFile,
 			TLSInsecureSkipVerify: s.cfg.MQTT.TLSInsecureSkipVerify,
 			Observers:             s.cfg.Observers,
 			Runners:               s.cfg.Runners,
 			Brand:                 s.cfg.Brand,
 		}
 		s.selfNode = edge.New(selfCfg, edge.Options{
+			Brand:            s.cfg.Brand,
 			ClientPrefix:     strings.ToLower(s.cfg.Brand.CoopName) + "-node",
 			Username:         s.cfg.MQTT.Username,
 			Password:         s.cfg.MQTT.Password,

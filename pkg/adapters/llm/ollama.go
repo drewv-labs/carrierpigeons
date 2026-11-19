@@ -2,14 +2,11 @@ package llm
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
-	"time"
 )
 
 var _ BaseLLM = (*OllamaAdapter)(nil)
@@ -33,11 +30,7 @@ func NewOllamaAdapter(endpoint, model string, tools ToolExecutor) *OllamaAdapter
 		endpoint: endpoint + "/api/chat",
 		model:    model,
 		tools:    tools,
-		client: &http.Client{
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 30 * time.Second,
-			},
-		},
+		client:   defaultLLMHTTPClient(),
 	}
 }
 
@@ -66,7 +59,7 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 		messages = append(messages, Message{Role: "system", Content: systemPrompt})
 		messages = append(messages, history...)
 
-		for range 8 {
+		_ = runToolLoop(defaultOllamaMaxTurn, "ollama", func(_ int) (bool, error) {
 			payload := map[string]any{
 				"model":    a.model,
 				"messages": messages,
@@ -78,32 +71,12 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				}
 			}
 
-			body, err := json.Marshal(payload)
-			if err != nil {
-				sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama encode error: %v]", err))
-				return
-			}
-
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewBuffer(body))
-			if err != nil {
-				sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama request error: %v]", err))
-				return
-			}
-			req.Header.Set("Content-Type", "application/json")
-
-			resp, err := a.client.Do(req)
+			resp, err := postJSON(ctx, a.client, a.endpoint, nil, payload, "Ollama")
 			if err != nil {
 				if ctx.Err() == nil {
-					sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama connection error: %v]", err))
+					sendToken(ctx, tokenChan, fmt.Sprintf("[%v]", err))
 				}
-				return
-			}
-
-			if resp.StatusCode >= http.StatusBadRequest {
-				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				resp.Body.Close()
-				sendToken(ctx, tokenChan, fmt.Sprintf("[Ollama HTTP %d: %s]", resp.StatusCode, strings.TrimSpace(string(errBody))))
-				return
+				return true, nil
 			}
 
 			scanner := bufio.NewScanner(resp.Body)
@@ -120,7 +93,7 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 					if chunk.Message.Content != "" {
 						if !sendToken(ctx, tokenChan, chunk.Message.Content) {
 							resp.Body.Close()
-							return
+							return true, nil
 						}
 						fullContent.WriteString(chunk.Message.Content)
 					}
@@ -133,11 +106,11 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 			resp.Body.Close()
 			if scanErr != nil && ctx.Err() == nil {
 				sendToken(ctx, tokenChan, fmt.Sprintf("\n[Ollama stream error: %v]", scanErr))
-				return
+				return true, nil
 			}
 
 			if len(toolCalls) == 0 || a.tools == nil {
-				return
+				return true, nil
 			}
 
 			messages = append(messages, Message{
@@ -148,15 +121,17 @@ func (a *OllamaAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 
 			for _, tc := range toolCalls {
 				if !sendToken(ctx, tokenChan, fmt.Sprintf("\n*(Running tool: %s...)*\n", tc.Function.Name)) {
-					return
+					return true, nil
 				}
 				observation := a.tools.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
 				messages = append(messages, Message{
-					Role:    "tool",
-					Content: observation,
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    observation,
 				})
 			}
-		}
+			return false, nil
+		})
 	}()
 
 	return tokenChan, nil

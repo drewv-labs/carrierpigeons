@@ -104,4 +104,27 @@ func TestMCPHTTPAuthAndDNSRebindingProtection(t *testing.T) {
 	if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
 		t.Fatalf("expected authenticated MCP request to pass auth middleware, got %d", rec.Code)
 	}
+
+	// EnforceLoopbackHost rejects non-loopback Host even when Bearer auth token is present.
+	loopbackAuthed := NewHTTPHandler(srv, HTTPOptions{
+		AuthToken:           "super-secret-mcp-token",
+		EnforceLoopbackHost: true,
+	})
+	rebindReq := httptest.NewRequest(http.MethodPost, "http://evil.attacker.invalid/mcp", strings.NewReader(initBody))
+	rebindReq.Host = "evil.attacker.invalid:8089"
+	rebindReq.Header.Set("Authorization", "Bearer super-secret-mcp-token")
+	rec = httptest.NewRecorder()
+	loopbackAuthed.ServeHTTP(rec, rebindReq)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for non-loopback Host when EnforceLoopbackHost=true, got %d", rec.Code)
+	}
+
+	// Default MCP server does NOT register create_pigeonmath_view unless AllowWriteViews is explicitly enabled.
+	if srv.GetTool("create_pigeonmath_view") != nil {
+		t.Fatal("expected create_pigeonmath_view to be omitted when AllowWriteViews is false")
+	}
+	writeSrv := New(ServerOptions{Store: stubAgentSafeDB{}, AllowWriteViews: true})
+	if writeSrv.GetTool("create_pigeonmath_view") == nil {
+		t.Fatal("expected create_pigeonmath_view to be registered when AllowWriteViews is true")
+	}
 }

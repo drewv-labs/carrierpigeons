@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS telemetric_ledger (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id, component, event_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts ON telemetric_ledger (ingested_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';

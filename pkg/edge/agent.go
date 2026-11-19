@@ -21,6 +21,7 @@ import (
 
 // Options customizes an embedded or standalone Edge Agent instance for SDK callers.
 type Options struct {
+	Brand            brand.Spec
 	ClientPrefix     string
 	Username         string
 	Password         string
@@ -47,15 +48,17 @@ type Agent struct {
 
 // New creates a configured Edge Agent ready to Start(ctx) using isolated per-instance Observer & Runner registries.
 func New(cfg config.EdgeConfig, opts ...Options) *Agent {
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if opt.Brand != (brand.Spec{}) {
+		cfg.Brand = opt.Brand
+	}
 	cfg.Brand = cfg.Brand.MergeWithDefaults()
 	cfg.Tags = core.NormalizeTags(cfg.Tags)
 	if strings.TrimSpace(cfg.TopicPrefix) == "" {
 		cfg.TopicPrefix = cfg.Brand.CTDPrefix()
-	}
-
-	var opt Options
-	if len(opts) > 0 {
-		opt = opts[0]
 	}
 
 	obsReg := opt.ObserverRegistry
@@ -84,8 +87,6 @@ func New(cfg config.EdgeConfig, opts ...Options) *Agent {
 
 // Start connects (or spools offline) to the MQTT broker, binds Runner control topics, and launches Observers.
 func (a *Agent) Start(parentCtx context.Context) error {
-	brand.SetActive(a.cfg.Brand)
-
 	mqttAuth := a.cfg.EffectiveMQTTAuth()
 	username := strings.TrimSpace(a.opts.Username)
 	if username == "" {
@@ -121,6 +122,7 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		NodeID:         a.cfg.NodeID,
 		ClientPrefix:   a.opts.ClientPrefix,
 		TopicPrefix:    a.cfg.TopicPrefix,
+		Brand:          a.cfg.Brand,
 		SpoolCapacity:  a.cfg.SpoolCapacity,
 		BootTags:       a.cfg.Tags,
 		Username:       username,

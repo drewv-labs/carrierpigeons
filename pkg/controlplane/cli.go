@@ -6,14 +6,39 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// ControlPlane holds an instance-scoped BrandSpec for embedding the Pigeons CLI/TUI control plane.
+type ControlPlane struct {
+	brand brand.Spec
+}
+
+// New constructs an instance-scoped ControlPlane configured with spec without mutating global brand state.
+func New(spec brand.Spec) *ControlPlane {
+	return &ControlPlane{brand: spec.MergeWithDefaults()}
+}
+
+// Brand returns the ControlPlane instance's effective BrandSpec.
+func (c *ControlPlane) Brand() brand.Spec {
+	return c.brand
+}
+
+// RootCommand returns the Pigeons CLI/TUI command tree customized with this ControlPlane's BrandSpec.
+func (c *ControlPlane) RootCommand() *cobra.Command {
+	cli.ApplyBrand(c.brand)
+	return cli.RootCommand()
+}
+
+// Execute runs the Pigeons CLI/TUI workstation control plane with this ControlPlane's BrandSpec.
+func (c *ControlPlane) Execute() {
+	cli.ApplyBrand(c.brand)
+	cli.Execute()
+}
+
 // RootCommand returns the Pigeons CLI/TUI command tree customized with a whitelabel BrandSpec.
 func RootCommand(spec brand.Spec) *cobra.Command {
-	cli.ApplyBrand(spec)
-	return cli.RootCommand()
+	return New(spec).RootCommand()
 }
 
 // ExecuteWithBrand runs the Pigeons CLI/TUI workstation control plane under a downstream BrandSpec.
 func ExecuteWithBrand(spec brand.Spec) {
-	cli.ApplyBrand(spec)
-	cli.Execute()
+	New(spec).Execute()
 }

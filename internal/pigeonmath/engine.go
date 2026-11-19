@@ -42,10 +42,15 @@ type Engine struct {
 	mathSchema string
 }
 
-// NewEngine constructs a PigeonMath Engine bound to an AgentSafeDB handle.
+// NewEngine constructs a PigeonMath Engine bound to an AgentSafeDB handle using the active math schema.
 func NewEngine(store db.AgentSafeDB) *Engine {
-	schema := brand.Active().MathSchema
-	if strings.TrimSpace(schema) == "" {
+	return NewEngineWithSchema(store, brand.Active().MathSchema)
+}
+
+// NewEngineWithSchema constructs a PigeonMath Engine scoped to a specific PostgreSQL analytical schema.
+func NewEngineWithSchema(store db.AgentSafeDB, mathSchema string) *Engine {
+	schema := strings.TrimSpace(mathSchema)
+	if schema == "" || db.ValidateSchemaIdentifier(schema) != nil {
 		schema = "pigeonmath"
 	}
 	return &Engine{

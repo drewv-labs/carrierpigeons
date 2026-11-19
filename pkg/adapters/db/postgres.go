@@ -4,7 +4,9 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -16,6 +18,7 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -26,11 +29,20 @@ const DefaultPostgresURL = "postgres://pigeoncoop_admin:ctd_dev_password@127.0.0
 const DefaultReadOnlyMaxRows = 500
 
 var (
-	validIdentifier    = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+	validIdentifier    = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
 	validPMVIdentifier = regexp.MustCompile(`^pmv_[a-z0-9_]+$`)
 	dollarTagStartRe   = regexp.MustCompile(`^\$[a-zA-Z0-9_]*\$`)
-	forbiddenViewDMLRe = regexp.MustCompile(`(?i)\b(into|insert|update|delete|drop|alter|truncate|grant|revoke|copy|call|do|create|execute|set|reset|listen|notify|prepare|deallocate|lock|vacuum|analyze|cluster|reindex|refresh|discard|load|security|reassign|pg_sleep|pg_sleep_for|pg_sleep_until|lo_import|lo_export|lo_unlink|lo_put|lo_from_bytea|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|dblink|dblink_exec|dblink_connect)\b`)
+	forbiddenRowLockRe = regexp.MustCompile(`(?i)\bfor\s+(?:no\s+key\s+update|key\s+share|update|share)\b`)
+	forbiddenViewDMLRe = regexp.MustCompile(`(?i)\b(into|insert|update|delete|drop|alter|truncate|grant|revoke|copy|call|do|create|execute|set|reset|listen|notify|prepare|deallocate|lock|vacuum|analyze|cluster|reindex|refresh|discard|load|security|reassign|pg_sleep|pg_sleep_for|pg_sleep_until|pg_advisory_lock|pg_advisory_lock_shared|pg_try_advisory_lock|pg_try_advisory_lock_shared|pg_advisory_xact_lock|pg_advisory_xact_lock_shared|pg_try_advisory_xact_lock|pg_try_advisory_xact_lock_shared|lo_import|lo_export|lo_unlink|lo_put|lo_from_bytea|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|dblink|dblink_exec|dblink_connect)\b`)
 )
+
+// ValidateSchemaIdentifier enforces PostgreSQL unquoted identifier rules (max 63 bytes) before DDL interpolation.
+func ValidateSchemaIdentifier(schema string) error {
+	if !validIdentifier.MatchString(schema) {
+		return fmt.Errorf("invalid PostgreSQL schema identifier %q (must match ^[a-zA-Z_][a-zA-Z0-9_]{0,62}$)", schema)
+	}
+	return nil
+}
 
 var _ BaseDB = (*PostgresStore)(nil)
 
@@ -89,9 +101,52 @@ func NormalizePMVName(raw string) (string, error) {
 	return name, nil
 }
 
+func isSQLIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$' || b >= 0x80
+}
+
+func consumeSingleQuotedLiteral(sql string, quoteIdx int, backslashEscape bool) (int, error) {
+	n := len(sql)
+	i := quoteIdx + 1
+	for i < n {
+		if backslashEscape && sql[i] == '\\' {
+			if i+1 >= n {
+				return 0, fmt.Errorf("unterminated SQL string literal")
+			}
+			i += 2
+			continue
+		}
+		if sql[i] == '\'' {
+			if i+1 < n && sql[i+1] == '\'' {
+				i += 2
+				continue
+			}
+			return i + 1, nil
+		}
+		i++
+	}
+	return 0, fmt.Errorf("unterminated SQL string literal")
+}
+
+func consumeDoubleQuotedIdent(sql string, quoteIdx int) (int, error) {
+	n := len(sql)
+	i := quoteIdx + 1
+	for i < n {
+		if sql[i] == '"' {
+			if i+1 < n && sql[i+1] == '"' {
+				i += 2
+				continue
+			}
+			return i + 1, nil
+		}
+		i++
+	}
+	return 0, fmt.Errorf("unterminated SQL quoted identifier")
+}
+
 // stripSQLLiteralsAndComments replaces SQL string literals, quoted identifiers, dollar-quoted strings,
-// and comments with whitespace so keyword/semicolon validation never misfires on literal string data
-// while still rejecting any unclosed literal or comment tricks.
+// Unicode string literals/identifiers, and comments with whitespace so keyword/semicolon validation never
+// misfires on literal string data while still rejecting any unclosed literal or comment tricks.
 func stripSQLLiteralsAndComments(sql string) (string, error) {
 	var out strings.Builder
 	out.Grow(len(sql))
@@ -132,54 +187,58 @@ func stripSQLLiteralsAndComments(sql string) (string, error) {
 			continue
 		}
 
-		// Single-quoted string literal (including E'...' backslash escapes and '' SQL escapes)
-		if ch == '\'' {
-			escaped := i > 0 && (sql[i-1] == 'e' || sql[i-1] == 'E')
+		// PostgreSQL escape string literal: E'...' or e'...' (only when preceded by non-identifier char or start)
+		if (ch == 'e' || ch == 'E') && (i == 0 || !isSQLIdentChar(sql[i-1])) && i+1 < n && sql[i+1] == '\'' {
+			nextIdx, err := consumeSingleQuotedLiteral(sql, i+1, true)
+			if err != nil {
+				return "", err
+			}
 			out.WriteString(" '' ")
-			i++
-			closed := false
-			for i < n {
-				if escaped && sql[i] == '\\' {
-					i += 2
-					continue
+			i = nextIdx
+			continue
+		}
+
+		// PostgreSQL Unicode escape string literal (U&'...') and Unicode quoted identifier (U&"...")
+		if (ch == 'u' || ch == 'U') && (i == 0 || !isSQLIdentChar(sql[i-1])) && i+2 < n && sql[i+1] == '&' {
+			if sql[i+2] == '\'' {
+				nextIdx, err := consumeSingleQuotedLiteral(sql, i+2, false)
+				if err != nil {
+					return "", err
 				}
-				if sql[i] == '\'' {
-					if i+1 < n && sql[i+1] == '\'' {
-						i += 2
-						continue
-					}
-					i++
-					closed = true
-					break
+				out.WriteString(" '' ")
+				i = nextIdx
+				continue
+			}
+			if sql[i+2] == '"' {
+				nextIdx, err := consumeDoubleQuotedIdent(sql, i+2)
+				if err != nil {
+					return "", err
 				}
-				i++
+				out.WriteString(" _ident ")
+				i = nextIdx
+				continue
 			}
-			if !closed {
-				return "", fmt.Errorf("unterminated SQL string literal")
+		}
+
+		// Standard single-quoted string literal ('' SQL escapes only)
+		if ch == '\'' {
+			nextIdx, err := consumeSingleQuotedLiteral(sql, i, false)
+			if err != nil {
+				return "", err
 			}
+			out.WriteString(" '' ")
+			i = nextIdx
 			continue
 		}
 
 		// Double-quoted SQL identifier: "..."
 		if ch == '"' {
+			nextIdx, err := consumeDoubleQuotedIdent(sql, i)
+			if err != nil {
+				return "", err
+			}
 			out.WriteString(" _ident ")
-			i++
-			closed := false
-			for i < n {
-				if sql[i] == '"' {
-					if i+1 < n && sql[i+1] == '"' {
-						i += 2
-						continue
-					}
-					i++
-					closed = true
-					break
-				}
-				i++
-			}
-			if !closed {
-				return "", fmt.Errorf("unterminated SQL quoted identifier")
-			}
+			i = nextIdx
 			continue
 		}
 
@@ -227,6 +286,9 @@ func ValidateSelectOnlySQL(rawSQL string) (string, error) {
 	lower := strings.ToLower(stripped)
 	if !strings.HasPrefix(lower, "select") && !strings.HasPrefix(lower, "with") {
 		return "", fmt.Errorf("SQL must start with SELECT or WITH")
+	}
+	if match := forbiddenRowLockRe.FindString(stripped); match != "" {
+		return "", fmt.Errorf("forbidden row-locking clause %q in analytical query", match)
 	}
 	if match := forbiddenViewDMLRe.FindString(stripped); match != "" {
 		return "", fmt.Errorf("forbidden mutating or session-altering keyword %q in analytical query", match)
@@ -330,8 +392,12 @@ func NewPostgresStoreWithOptions(ctx context.Context, connStr string, opts Store
 	if schema == "" {
 		schema = brand.Active().MathSchema
 	}
-	if !validIdentifier.MatchString(schema) {
+	if schema == "" {
 		schema = "pigeonmath"
+	}
+	if err := ValidateSchemaIdentifier(schema); err != nil {
+		pool.Close()
+		return nil, err
 	}
 
 	return &PostgresStore{pool: pool, mathSchema: schema}, nil
@@ -372,6 +438,7 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	DROP INDEX IF EXISTS idx_ledger_pillar;
 	DROP INDEX IF EXISTS idx_ledger_metrics_gin;
 	CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id, component, event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts ON telemetric_ledger (ingested_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';
@@ -430,8 +497,8 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 
 // EnsureMathSchema creates the isolated `pigeonmath` analytical schema and `pmv_catalog` intent cache.
 func (s *PostgresStore) EnsureMathSchema(ctx context.Context) error {
-	if !validIdentifier.MatchString(s.mathSchema) {
-		return fmt.Errorf("invalid math schema identifier: %s", s.mathSchema)
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return err
 	}
 	var exists bool
 	if err := s.pool.QueryRow(ctx, `
@@ -462,21 +529,68 @@ func (s *PostgresStore) EnsureMathSchema(ctx context.Context) error {
 	return err
 }
 
-// ProvisionRoles idempotently configures least-privilege PostgreSQL roles:
-// - `ctd_ingestor`: Write/COPY access for PigeonCoop ingestion.
-// - `pigeoncare_ro`: Strictly Read-Only on `public.*` + isolated view creation in `pigeonmath`.
-func (s *PostgresStore) ProvisionRoles(ctx context.Context, ingestPassword, readOnlyPassword string) error {
+func isLoopbackPGHost(host string) bool {
+	h := strings.Trim(strings.TrimSpace(host), "[]")
+	if h == "" || strings.HasPrefix(h, "/") || strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func isDefaultRolePassword(pw string) bool {
+	switch pw {
+	case "ctd_dev_password", "ctd_ingest_password", "pigeoncare_readonly":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateProvisionRolePasswords(host, ingestPassword, readOnlyPassword string) (string, string, error) {
 	if ingestPassword == "" {
 		ingestPassword = strings.TrimSpace(os.Getenv("CTD_INGESTOR_PASSWORD"))
-	}
-	if ingestPassword == "" {
-		ingestPassword = "ctd_ingest_password"
 	}
 	if readOnlyPassword == "" {
 		readOnlyPassword = strings.TrimSpace(os.Getenv("PIGEONCARE_RO_PASSWORD"))
 	}
+
+	if !isLoopbackPGHost(host) {
+		if ingestPassword == "" || isDefaultRolePassword(ingestPassword) {
+			return "", "", fmt.Errorf("refusing to provision ctd_ingestor with empty or default password on non-loopback PostgreSQL host %q", host)
+		}
+		if readOnlyPassword == "" || isDefaultRolePassword(readOnlyPassword) {
+			return "", "", fmt.Errorf("refusing to provision pigeoncare_ro with empty or default password on non-loopback PostgreSQL host %q", host)
+		}
+		return ingestPassword, readOnlyPassword, nil
+	}
+
+	if ingestPassword == "" {
+		ingestPassword = "ctd_ingest_password"
+	}
 	if readOnlyPassword == "" {
 		readOnlyPassword = "pigeoncare_readonly"
+	}
+	return ingestPassword, readOnlyPassword, nil
+}
+
+// ProvisionRoles idempotently configures least-privilege PostgreSQL roles:
+// - `ctd_ingestor`: Write/COPY access for PigeonCoop ingestion.
+// - `pigeoncare_ro`: Strictly Read-Only on `public.*` + isolated view creation in `pigeonmath`.
+func (s *PostgresStore) ProvisionRoles(ctx context.Context, ingestPassword, readOnlyPassword string) error {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return err
+	}
+	host := ""
+	if s.pool != nil && s.pool.Config() != nil && s.pool.Config().ConnConfig != nil {
+		host = s.pool.Config().ConnConfig.Host
+	}
+	var err error
+	ingestPassword, readOnlyPassword, err = validateProvisionRolePasswords(host, ingestPassword, readOnlyPassword)
+	if err != nil {
+		return err
 	}
 	escapeLit := func(v string) string {
 		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
@@ -513,7 +627,7 @@ func (s *PostgresStore) ProvisionRoles(ctx context.Context, ingestPassword, read
 	GRANT SELECT, INSERT, UPDATE, DELETE ON %[3]s.pmv_catalog TO pigeoncare_ro;
 	`, escapeLit(ingestPassword), escapeLit(readOnlyPassword), s.mathSchema)
 
-	_, err := s.pool.Exec(ctx, sql)
+	_, err = s.pool.Exec(ctx, sql)
 	return err
 }
 
@@ -522,6 +636,39 @@ func marshalObjectOrEmpty[K comparable, V any](m map[K]V) ([]byte, error) {
 		return []byte("{}"), nil
 	}
 	return json.Marshal(m)
+}
+
+func payloadMetricsJSON(p *core.CTDPayload) ([]byte, error) {
+	if raw := p.RawMetrics(); len(raw) > 0 {
+		return raw, nil
+	}
+	return marshalObjectOrEmpty(p.Metrics)
+}
+
+func payloadParamsJSON(p *core.CTDPayload) ([]byte, error) {
+	if raw := p.RawParams(); len(raw) > 0 {
+		return raw, nil
+	}
+	return marshalObjectOrEmpty(p.Params)
+}
+
+// isBisectablePGError reports whether a PostgreSQL batch error stems from a row-level data or
+// constraint violation (SQLSTATE 22xxx / 23xxx) where binary subdivision can isolate a poison row.
+// Connection failures (08xxx), cancellations/operator intervention (57xxx), serialization failures
+// (40001), and deadlocks (40P01) must abort immediately without triggering bisection storms.
+func isBisectablePGError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	code := pgErr.Code
+	if strings.HasPrefix(code, "08") || strings.HasPrefix(code, "57") || code == "40001" || code == "40P01" {
+		return false
+	}
+	return strings.HasPrefix(code, "22") || strings.HasPrefix(code, "23")
 }
 
 // InsertEvent writes a single CTD envelope and shreds embedded Artifacts/Traces.
@@ -538,11 +685,11 @@ func (s *PostgresStore) InsertEvent(ctx context.Context, p *core.CTDPayload) err
 		ts = time.Now().UTC()
 	}
 
-	metricsJSON, err := marshalObjectOrEmpty(p.Metrics)
+	metricsJSON, err := payloadMetricsJSON(p)
 	if err != nil {
 		return fmt.Errorf("marshal metrics: %w", err)
 	}
-	paramsJSON, err := marshalObjectOrEmpty(p.Params)
+	paramsJSON, err := payloadParamsJSON(p)
 	if err != nil {
 		return fmt.Errorf("marshal params: %w", err)
 	}
@@ -573,7 +720,7 @@ func (s *PostgresStore) InsertEvent(ctx context.Context, p *core.CTDPayload) err
 
 // BatchInsertEvents streams wide events into `telemetric_ledger` using PostgreSQL's binary
 // `COPY FROM STDIN` protocol (`pgx.CopyFrom`) and flushes any attached Artifacts/Traces in a single pipelined batch.
-// If binary COPY fails due to a malformed payload, it recursively bisects the batch (`O(log B)`) to isolate poison rows.
+// If binary COPY fails due to a row-level data/constraint violation, it recursively bisects (`O(log B)`) to isolate poison rows.
 func (s *PostgresStore) BatchInsertEvents(ctx context.Context, payloads []*core.CTDPayload) (int64, error) {
 	valid := make([]*core.CTDPayload, 0, len(payloads))
 	for _, p := range payloads {
@@ -588,6 +735,9 @@ func (s *PostgresStore) BatchInsertEvents(ctx context.Context, payloads []*core.
 }
 
 func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payloads []*core.CTDPayload) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if len(payloads) == 0 {
 		return 0, nil
 	}
@@ -599,6 +749,7 @@ func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payload
 	}
 
 	now := time.Now().UTC()
+	alignedPayloads := make([]*core.CTDPayload, 0, len(payloads))
 	copyRows := make([][]any, 0, len(payloads))
 	nodeLastSeen := make(map[string]time.Time, 16)
 	var artifacts []*core.Artifact
@@ -613,15 +764,16 @@ func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payload
 		if ts.IsZero() {
 			ts = now
 		}
-		metricsJSON, err := marshalObjectOrEmpty(p.Metrics)
+		metricsJSON, err := payloadMetricsJSON(p)
 		if err != nil {
 			continue
 		}
-		paramsJSON, err := marshalObjectOrEmpty(p.Params)
+		paramsJSON, err := payloadParamsJSON(p)
 		if err != nil {
 			continue
 		}
 
+		alignedPayloads = append(alignedPayloads, p)
 		copyRows = append(copyRows, []any{
 			p.NodeID,
 			string(pillar),
@@ -659,11 +811,20 @@ func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payload
 	if err == nil {
 		return copied, nil
 	}
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	if !isBisectablePGError(err) {
+		return 0, err
+	}
+	if len(alignedPayloads) == 1 {
+		return 0, err
+	}
 
 	// Binary-bisect poison-row isolation (O(log B) roundtrips instead of O(B) sequential transactions).
-	mid := len(payloads) / 2
-	leftCount, leftErr := s.batchInsertDivideAndConquer(ctx, payloads[:mid])
-	rightCount, rightErr := s.batchInsertDivideAndConquer(ctx, payloads[mid:])
+	mid := len(alignedPayloads) / 2
+	leftCount, leftErr := s.batchInsertDivideAndConquer(ctx, alignedPayloads[:mid])
+	rightCount, rightErr := s.batchInsertDivideAndConquer(ctx, alignedPayloads[mid:])
 	if rightErr != nil {
 		return leftCount + rightCount, rightErr
 	}
@@ -696,36 +857,79 @@ func (s *PostgresStore) execCopyBatch(
 	var batch pgx.Batch
 	queued := 0
 
-	for nodeID, ts := range nodeLastSeen {
+	if len(nodeLastSeen) > 0 {
+		nodeIDs := make([]string, 0, len(nodeLastSeen))
+		for nodeID := range nodeLastSeen {
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+		slices.Sort(nodeIDs)
+		timestamps := make([]time.Time, len(nodeIDs))
+		for i, nodeID := range nodeIDs {
+			timestamps[i] = nodeLastSeen[nodeID]
+		}
 		batch.Queue(`
-			INSERT INTO ctd_nodes (node_id, status, last_seen, updated_at, updated_by)
-			VALUES ($1, 'ONLINE', $2, NOW(), SESSION_USER)
-			ON CONFLICT (node_id) DO UPDATE SET
-				last_seen = GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen),
-				updated_at = NOW()
-		`, nodeID, ts)
+			INSERT INTO ctd_nodes (node_id, last_seen, updated_at)
+			SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $2::timestamptz[])
+			ON CONFLICT (node_id) DO UPDATE
+			SET last_seen = GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen),
+			    updated_at = EXCLUDED.updated_at
+		`, nodeIDs, timestamps)
 		queued++
 	}
 
-	for _, a := range artifacts {
-		if a == nil {
-			continue
+	if len(artifacts) > 0 {
+		dedupArtifacts := make(map[string]*core.Artifact, len(artifacts))
+		artifactIDs := make([]string, 0, len(artifacts))
+		for _, a := range artifacts {
+			if a == nil || a.ID == "" {
+				continue
+			}
+			if existing, ok := dedupArtifacts[a.ID]; ok {
+				if a.Kind != "" {
+					existing.Kind = a.Kind
+				}
+				if a.NodeID != "" {
+					existing.NodeID = a.NodeID
+				}
+				if len(a.Meta) > 0 {
+					if existing.Meta == nil {
+						existing.Meta = make(map[string]string, len(a.Meta))
+					}
+					for k, v := range a.Meta {
+						existing.Meta[k] = v
+					}
+				}
+			} else {
+				cp := *a
+				if len(a.Meta) > 0 {
+					cp.Meta = make(map[string]string, len(a.Meta))
+					for k, v := range a.Meta {
+						cp.Meta[k] = v
+					}
+				}
+				dedupArtifacts[a.ID] = &cp
+				artifactIDs = append(artifactIDs, a.ID)
+			}
 		}
-		metaJSON, mErr := marshalObjectOrEmpty(a.Meta)
-		if mErr != nil {
-			return 0, fmt.Errorf("marshal artifact meta: %w", mErr)
+		slices.Sort(artifactIDs)
+		for _, id := range artifactIDs {
+			a := dedupArtifacts[id]
+			metaJSON, mErr := marshalObjectOrEmpty(a.Meta)
+			if mErr != nil {
+				return 0, fmt.Errorf("marshal artifact meta: %w", mErr)
+			}
+			batch.Queue(`
+				INSERT INTO ctd_artifacts (id, kind, node_id, meta, created_at, updated_at, updated_by)
+				VALUES ($1, $2, NULLIF($3, ''), $4, $5, NOW(), SESSION_USER)
+				ON CONFLICT (id) DO UPDATE SET
+					kind = EXCLUDED.kind,
+					node_id = COALESCE(EXCLUDED.node_id, ctd_artifacts.node_id),
+					meta = ctd_artifacts.meta || EXCLUDED.meta,
+					updated_at = NOW(),
+					updated_by = SESSION_USER
+			`, a.ID, a.Kind, a.NodeID, metaJSON, a.CreatedAt)
+			queued++
 		}
-		batch.Queue(`
-			INSERT INTO ctd_artifacts (id, kind, node_id, meta, created_at, updated_at, updated_by)
-			VALUES ($1, $2, NULLIF($3, ''), $4, $5, NOW(), SESSION_USER)
-			ON CONFLICT (id) DO UPDATE SET
-				kind = EXCLUDED.kind,
-				node_id = COALESCE(EXCLUDED.node_id, ctd_artifacts.node_id),
-				meta = ctd_artifacts.meta || EXCLUDED.meta,
-				updated_at = NOW(),
-				updated_by = SESSION_USER
-		`, a.ID, a.Kind, a.NodeID, metaJSON, a.CreatedAt)
-		queued++
 	}
 
 	for _, t := range traces {
@@ -1213,17 +1417,23 @@ func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, ma
 
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE lineage AS (
-			SELECT source_id, verb, target_id, COALESCE(node_id, '') AS node_id, COALESCE(run_id, '') AS run_id, meta, event_timestamp, 1 AS depth
+			SELECT id, source_id, verb, target_id, COALESCE(node_id, '') AS node_id, COALESCE(run_id, '') AS run_id, meta, event_timestamp, 1 AS depth, ARRAY[id::text] AS visited_edges
 			FROM ctd_traces
 			WHERE source_id = $1 OR target_id = $1
-			UNION
-			SELECT t.source_id, t.verb, t.target_id, COALESCE(t.node_id, ''), COALESCE(t.run_id, ''), t.meta, t.event_timestamp, l.depth + 1
+			UNION ALL
+			SELECT t.id, t.source_id, t.verb, t.target_id, COALESCE(t.node_id, ''), COALESCE(t.run_id, ''), t.meta, t.event_timestamp, l.depth + 1, l.visited_edges || t.id::text
 			FROM ctd_traces t
 			INNER JOIN lineage l ON (t.source_id = l.target_id OR t.target_id = l.source_id)
 			WHERE l.depth < $2
+			  AND NOT (t.id::text = ANY(l.visited_edges))
 		)
-		SELECT DISTINCT source_id, verb, target_id, node_id, run_id, meta, event_timestamp
-		FROM lineage
+		SELECT source_id, verb, target_id, node_id, run_id, meta, event_timestamp
+		FROM (
+			SELECT DISTINCT ON (id) id, source_id, verb, target_id, node_id, run_id, meta, event_timestamp
+			FROM lineage
+			ORDER BY id
+			LIMIT 2500
+		) bounded
 		ORDER BY event_timestamp ASC
 	`, artifactID, maxDepth)
 	if err != nil {
@@ -1531,9 +1741,12 @@ func (s *PostgresStore) ListPMVs(ctx context.Context) ([]PMVRecord, error) {
 	return out, rows.Err()
 }
 
-// MaterializePMV atomically creates or replaces `pigeonmath.pmv_<slug>` inside a transaction
-// so column schema evolutions across versions succeed without SQLSTATE 42P16 errors.
+// MaterializePMV atomically creates or replaces `<mathSchema>.pmv_<slug>` with `security_invoker = true`
+// inside a bounded-timeout transaction so column schema evolutions succeed without privilege hijacking or partial drops.
 func (s *PostgresStore) MaterializePMV(ctx context.Context, viewName string, selectSQL string) error {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return err
+	}
 	normName, err := NormalizePMVName(viewName)
 	if err != nil {
 		return err
@@ -1549,24 +1762,36 @@ func (s *PostgresStore) MaterializePMV(ctx context.Context, viewName string, sel
 	}
 	defer tx.Rollback(ctx)
 
-	dropSQL := fmt.Sprintf("DROP VIEW IF EXISTS %s.%s", s.mathSchema, normName)
-	if _, err := tx.Exec(ctx, dropSQL); err != nil {
-		// If dependent views exist, fall back to in-place CREATE OR REPLACE VIEW.
-		_ = tx.Rollback(ctx)
-		replaceDDL := fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS %s", s.mathSchema, normName, cleanedSQL)
-		_, replaceErr := s.pool.Exec(ctx, replaceDDL)
-		return replaceErr
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '5000ms'"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "SAVEPOINT pmv_replace"); err != nil {
+		return err
 	}
 
-	createSQL := fmt.Sprintf("CREATE VIEW %s.%s AS %s", s.mathSchema, normName, cleanedSQL)
-	if _, err := tx.Exec(ctx, createSQL); err != nil {
-		return err
+	replaceSQL := fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s WITH (security_invoker = true) AS %s", s.mathSchema, normName, cleanedSQL)
+	if _, err := tx.Exec(ctx, replaceSQL); err != nil {
+		// View signature change (e.g., SQLSTATE 42P16): roll back to savepoint and drop+recreate atomically within the same tx.
+		if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT pmv_replace"); rbErr != nil {
+			return fmt.Errorf("replace view failed (%v); savepoint rollback failed: %w", err, rbErr)
+		}
+		dropSQL := fmt.Sprintf("DROP VIEW IF EXISTS %s.%s", s.mathSchema, normName)
+		if _, dropErr := tx.Exec(ctx, dropSQL); dropErr != nil {
+			return fmt.Errorf("replace view failed (%v); drop view failed: %w", err, dropErr)
+		}
+		createSQL := fmt.Sprintf("CREATE VIEW %s.%s WITH (security_invoker = true) AS %s", s.mathSchema, normName, cleanedSQL)
+		if _, createErr := tx.Exec(ctx, createSQL); createErr != nil {
+			return createErr
+		}
 	}
 	return tx.Commit(ctx)
 }
 
 // DropPMV removes a view inside the isolated `pigeonmath` schema if present.
 func (s *PostgresStore) DropPMV(ctx context.Context, viewName string) error {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return err
+	}
 	normName, err := NormalizePMVName(viewName)
 	if err != nil {
 		return err

@@ -48,7 +48,7 @@ func NewService(opts Options) *Service {
 
 	svc := &Service{
 		store:      opts.Store,
-		math:       pigeonmath.NewEngine(opts.Store),
+		math:       pigeonmath.NewEngineWithSchema(opts.Store, bSpec.MathSchema),
 		gate:       gate,
 		dispatcher: opts.Dispatcher,
 		brand:      bSpec,

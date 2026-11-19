@@ -22,11 +22,31 @@ services:
     image: eclipse-mosquitto:2
     container_name: pigeon-broker
     profiles: ["external-mqtt"]
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:-pigeoncoop}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-ctd_mqtt_dev_password}
+      MQTT_EDGE_USERNAME: ${MQTT_EDGE_USERNAME:-pigeoneer}
+      MQTT_EDGE_PASSWORD: ${MQTT_EDGE_PASSWORD:-ctd_edge_dev_password}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /mosquitto/data/passwd ]; then
+          touch /mosquitto/data/passwd
+          chmod 0600 /mosquitto/data/passwd
+          mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_USERNAME}" "$${MQTT_PASSWORD}"
+          if [ -n "$${MQTT_EDGE_USERNAME}" ] && [ "$${MQTT_EDGE_USERNAME}" != "$${MQTT_USERNAME}" ]; then
+            mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_EDGE_USERNAME}" "$${MQTT_EDGE_PASSWORD}"
+          fi
+          chown mosquitto:mosquitto /mosquitto/data/passwd 2>/dev/null || true
+        fi
+        exec /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
     ports:
       - "${PIGEONS_BIND_IP:-127.0.0.1}:1883:1883"
       - "${PIGEONS_BIND_IP:-127.0.0.1}:9001:9001"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - pigeon_mqtt_data:/mosquitto/data
     restart: unless-stopped
     networks:
       - pigeon-net
@@ -53,3 +73,4 @@ networks:
 
 volumes:
   pigeon_db_data:
+  pigeon_mqtt_data:

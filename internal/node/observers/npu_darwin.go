@@ -37,7 +37,7 @@ func observeNPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 		if match := darwinANEPowerRe.FindStringSubmatch(out); len(match) > 1 {
 			if mw, err := strconv.ParseFloat(match[1], 64); err == nil && mw >= 0 {
 				event := core.NewCTDPayload(nodeID, "npu-ane", "active").
-					AddMetric("npu_power_w", mw/1000.0)
+					AddMetric("power_w", mw/1000.0)
 				if err := pub.Publish(event); err != nil {
 					log.Printf("[Darwin NPU Observer] Publish failed: %v", err)
 				}

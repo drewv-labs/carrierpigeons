@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -14,12 +15,16 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 // DefaultPostgresURL is the local development fallback DSN matching deployments/compose.
 const DefaultPostgresURL = "postgres://pigeoncoop_admin:ctd_dev_password@127.0.0.1:5432/edge_ledger"
+
+// DefaultHealthyWindow is the canonical cluster health staleness threshold shared across CLI, TUI, and MCP.
+const DefaultHealthyWindow = 3 * time.Minute
 
 // ObserversConfig toggles built-in hardware observers.
 type ObserversConfig struct {
@@ -126,9 +131,10 @@ func IsLoopbackListen(addr string) bool {
 
 // CoopDBConfig configures PostgreSQL ledger pooling on PigeonCoop.
 type CoopDBConfig struct {
-	URL      string `toml:"url"`
-	MaxConns int32  `toml:"max_conns"`
-	MinConns int32  `toml:"min_conns"`
+	URL                   string `toml:"url"`
+	MaxConns              int32  `toml:"max_conns"`
+	MinConns              int32  `toml:"min_conns"`
+	AllowInsecureDefaults bool   `toml:"allow_insecure_defaults"`
 }
 
 // IngestConfig tunes the high-throughput MQTT -> PostgreSQL COPY batch engine.
@@ -176,6 +182,27 @@ func (c CoopConfig) ParsedPollInterval() time.Duration {
 	return 5 * time.Second
 }
 
+func isKnownDefaultDBPassword(pw string) bool {
+	switch pw {
+	case "ctd_dev_password", "ctd_ingest_password", "pigeoncare_readonly":
+		return true
+	default:
+		return false
+	}
+}
+
+func isURLHostLoopback(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return true
+	}
+	return IsLoopbackListen(host)
+}
+
 // ValidateSecurity enforces fail-closed security invariants before starting network listeners.
 func (c CoopConfig) ValidateSecurity() error {
 	isExternal := strings.EqualFold(strings.TrimSpace(c.MQTT.Mode), "external")
@@ -186,6 +213,20 @@ func (c CoopConfig) ValidateSecurity() error {
 				"refusing insecure startup: embedded MQTT listens on non-loopback %q without mqtt.username/password configured (set mqtt credentials, bind 127.0.0.1:1883, or set mqtt.allow_insecure_anonymous=true for isolated lab networks)",
 				c.MQTT.Listen,
 			)
+		}
+	}
+
+	if dbURL := strings.TrimSpace(c.Database.URL); dbURL != "" && !c.Database.AllowInsecureDefaults {
+		if u, err := url.Parse(dbURL); err == nil {
+			host := strings.TrimSpace(u.Hostname())
+			if host != "" && !IsLoopbackListen(host) && u.User != nil {
+				if pw, ok := u.User.Password(); ok && isKnownDefaultDBPassword(pw) {
+					return fmt.Errorf(
+						"refusing insecure startup: database.url targets non-loopback host %q with a default development password (rotate credentials or set database.allow_insecure_defaults=true explicitly)",
+						host,
+					)
+				}
+			}
 		}
 	}
 	return nil
@@ -583,12 +624,24 @@ func LoadCoopConfig(explicitPath string) (CoopConfig, error) {
 	if v := prefixedEnv(bp, "DB_URL", "PIGEONCOOP_DB_URL", "PIGEONS_DB_URL", "DATABASE_URL"); v != "" {
 		cfg.Database.URL = v
 	}
+	if v := prefixedEnv(bp, "ALLOW_INSECURE_DEFAULTS", "PIGEONCOOP_ALLOW_INSECURE_DEFAULTS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Database.AllowInsecureDefaults = b
+		}
+	}
 	if v := prefixedEnv(bp, "NTFY_URL", "PIGEONCOOP_NTFY_URL", "NTFY_URL"); v != "" {
 		if v == "off" || v == "disabled" || v == "none" {
 			cfg.Ntfy.Enabled = false
 		} else {
 			cfg.Ntfy.URL = v
 		}
+	}
+
+	if err := core.ValidateTopicToken(cfg.NodeID); err != nil {
+		return cfg, fmt.Errorf("invalid coop node_id: %w", err)
+	}
+	if err := core.ValidateTopicToken(cfg.Brand.TopicRoot); err != nil {
+		return cfg, fmt.Errorf("invalid brand topic_root: %w", err)
 	}
 
 	cfg.Tags = core.NormalizeTags(cfg.Tags)
@@ -647,10 +700,20 @@ func LoadEdgeConfig(explicitPath string) (EdgeConfig, error) {
 		cfg.TLSKeyFile = v
 		cfg.MQTT.TLSKeyFile = v
 	}
+	if v := prefixedEnv(bp, "MQTT_TLS_INSECURE_SKIP_VERIFY", "PIGEONEER_MQTT_TLS_INSECURE_SKIP_VERIFY", "PIGEONS_MQTT_TLS_INSECURE_SKIP_VERIFY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.TLSInsecureSkipVerify = b
+			cfg.MQTT.TLSInsecureSkipVerify = b
+		}
+	}
 	if v := prefixedEnv(bp, "ALLOW_EPHEMERAL", "PIGEONEER_ALLOW_EPHEMERAL"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.Runners.AllowEphemeral = b
 		}
+	}
+
+	if err := core.ValidateTopicToken(cfg.NodeID); err != nil {
+		return cfg, fmt.Errorf("invalid edge node_id: %w", err)
 	}
 
 	cfg.Tags = core.NormalizeTags(cfg.Tags)
@@ -690,11 +753,33 @@ func LoadWorkstationConfig(explicitPath string) (WorkstationConfig, error) {
 		cfg.TLSCAFile = v
 		cfg.MQTT.TLSCAFile = v
 	}
+	if v := prefixedEnv(bp, "MQTT_TLS_CERT", "PIGEONS_MQTT_TLS_CERT"); v != "" {
+		cfg.TLSCertFile = v
+		cfg.MQTT.TLSCertFile = v
+	}
+	if v := prefixedEnv(bp, "MQTT_TLS_KEY", "PIGEONS_MQTT_TLS_KEY"); v != "" {
+		cfg.TLSKeyFile = v
+		cfg.MQTT.TLSKeyFile = v
+	}
+	if v := prefixedEnv(bp, "MQTT_TLS_INSECURE_SKIP_VERIFY", "PIGEONS_MQTT_TLS_INSECURE_SKIP_VERIFY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.TLSInsecureSkipVerify = b
+			cfg.MQTT.TLSInsecureSkipVerify = b
+		}
+	}
 	if v := prefixedEnv(bp, "DB_URL", "PIGEONS_DB_URL", "PIGEONCOOP_DB_URL", "DATABASE_URL"); v != "" {
 		cfg.DatabaseURL = v
 	}
+	roFromEnv := false
 	if v := prefixedEnv(bp, "RO_DB_URL", "PIGEONS_RO_DB_URL", "PIGEONCARE_DB_URL", "PIGEONMCP_DB_URL"); v != "" {
 		cfg.ReadOnlyDatabaseURL = v
+		roFromEnv = true
+	}
+	if !roFromEnv && strings.TrimSpace(cfg.DatabaseURL) != "" {
+		ro := strings.TrimSpace(cfg.ReadOnlyDatabaseURL)
+		if ro == "" || (isURLHostLoopback(ro) && !isURLHostLoopback(cfg.DatabaseURL)) {
+			cfg.ReadOnlyDatabaseURL = db.DeriveReadOnlyURLFromAdmin(cfg.DatabaseURL, "")
+		}
 	}
 	if v := prefixedEnv(bp, "ALLOW_SUPERUSER_RO", "PIGEONS_ALLOW_SUPERUSER_RO"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

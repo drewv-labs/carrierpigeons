@@ -11,6 +11,7 @@ require (
 	github.com/mark3labs/mcp-go v1.1.1
 	github.com/mochi-mqtt/server/v2 v2.7.9
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/net v0.44.0
 	golang.org/x/sys v0.36.0
 )
 
@@ -42,7 +43,6 @@ require (
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	golang.org/x/net v0.44.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

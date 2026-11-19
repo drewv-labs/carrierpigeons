@@ -4,12 +4,33 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 )
+
+var validTopicTokenRe = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,128}$`)
+
+// ValidateTopicToken enforces safe MQTT topic-segment identifiers (node IDs, pillars, components, tags, runner names).
+// Explicitly rejects wildcards (+, #), path separators (/), NUL bytes, whitespace, and control characters.
+func ValidateTopicToken(token string) error {
+	if token == "" {
+		return fmt.Errorf("topic token cannot be empty")
+	}
+	for i := 0; i < len(token); i++ {
+		b := token[i]
+		if b == '/' || b == '+' || b == '#' || b == 0x00 || b <= 0x20 || b == 0x7f {
+			return fmt.Errorf("topic token %q contains forbidden character %q", token, b)
+		}
+	}
+	if !validTopicTokenRe.MatchString(token) {
+		return fmt.Errorf("topic token %q must match ^[a-zA-Z0-9._:-]{1,128}$", token)
+	}
+	return nil
+}
 
 const (
 	// DefaultTopicPrefix is the canonical MQTT namespace for CTD wide events.
@@ -103,14 +124,29 @@ func (r RunnerRequestCTD) Validate() error {
 	if strings.TrimSpace(r.RequestID) == "" {
 		return fmt.Errorf("missing request_id")
 	}
-	if strings.TrimSpace(r.Runner) == "" {
-		return fmt.Errorf("missing runner name")
+	if err := ValidateTopicToken(r.Runner); err != nil {
+		return fmt.Errorf("invalid runner name: %w", err)
+	}
+	if r.RequestedBy != "" {
+		if err := ValidateTopicToken(r.RequestedBy); err != nil {
+			return fmt.Errorf("invalid requested_by: %w", err)
+		}
 	}
 	if r.Action != "" && r.Action != "start" && r.Action != "abort" {
 		return fmt.Errorf("invalid runner request action: %s", r.Action)
 	}
 	if r.Selectors.IsEmpty() {
 		return fmt.Errorf("runner request requires at least one selector (--all, --node, or --tag)")
+	}
+	for _, n := range r.Selectors.Nodes {
+		if err := ValidateTopicToken(n); err != nil {
+			return fmt.Errorf("invalid selector node: %w", err)
+		}
+	}
+	for _, tag := range r.Selectors.Tags {
+		if err := ValidateTopicToken(tag); err != nil {
+			return fmt.Errorf("invalid selector tag: %w", err)
+		}
 	}
 	return nil
 }
@@ -156,6 +192,126 @@ type CTDPayload struct {
 	Params         map[string]string `json:"params,omitempty"`
 	Artifact       *Artifact         `json:"artifact,omitempty"`
 	Trace          *TraceEdge        `json:"trace,omitempty"`
+
+	rawMetrics json.RawMessage
+	rawParams  json.RawMessage
+}
+
+type wireCTDPayload struct {
+	EventID        string          `json:"event_id,omitempty"`
+	NodeID         string          `json:"node_id"`
+	Pillar         Pillar          `json:"pillar"`
+	Component      string          `json:"component"`
+	Status         string          `json:"status"`
+	EventTimestamp time.Time       `json:"event_timestamp"`
+	Metrics        json.RawMessage `json:"metrics,omitempty"`
+	Params         json.RawMessage `json:"params,omitempty"`
+	Artifact       *Artifact       `json:"artifact,omitempty"`
+	Trace          *TraceEdge      `json:"trace,omitempty"`
+}
+
+func cloneRawJSONObject(raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		return nil, fmt.Errorf("expected JSON object, got %q", trimmed[:min(len(trimmed), 24)])
+	}
+	cp := make(json.RawMessage, len(trimmed))
+	copy(cp, trimmed)
+	return cp, nil
+}
+
+// UnmarshalJSON decodes a CTDPayload while preserving the raw JSON slices for metrics and params
+// so downstream storage sinks can avoid redundant re-marshaling.
+func (c *CTDPayload) UnmarshalJSON(data []byte) error {
+	var w wireCTDPayload
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	rawMetrics, err := cloneRawJSONObject(w.Metrics)
+	if err != nil {
+		return fmt.Errorf("decode metrics: %w", err)
+	}
+	rawParams, err := cloneRawJSONObject(w.Params)
+	if err != nil {
+		return fmt.Errorf("decode params: %w", err)
+	}
+
+	var metrics map[string]any
+	if len(rawMetrics) > 0 {
+		if err := json.Unmarshal(rawMetrics, &metrics); err != nil {
+			return fmt.Errorf("decode metrics map: %w", err)
+		}
+	}
+	var params map[string]string
+	if len(rawParams) > 0 {
+		if err := json.Unmarshal(rawParams, &params); err != nil {
+			return fmt.Errorf("decode params map: %w", err)
+		}
+	}
+
+	*c = CTDPayload{
+		EventID:        w.EventID,
+		NodeID:         w.NodeID,
+		Pillar:         w.Pillar,
+		Component:      w.Component,
+		Status:         w.Status,
+		EventTimestamp: w.EventTimestamp,
+		Metrics:        metrics,
+		Params:         params,
+		Artifact:       w.Artifact,
+		Trace:          w.Trace,
+		rawMetrics:     rawMetrics,
+		rawParams:      rawParams,
+	}
+	return nil
+}
+
+// DecodeWireCTDPayload parses only the top-level CTD envelope fields (plus optional Artifact/Trace)
+// and retains raw metrics/params JSON slices without allocating Go maps on the high-throughput ingest path.
+func DecodeWireCTDPayload(data []byte) (*CTDPayload, error) {
+	var w wireCTDPayload
+	if err := json.Unmarshal(data, &w); err != nil {
+		return nil, err
+	}
+	rawMetrics, err := cloneRawJSONObject(w.Metrics)
+	if err != nil {
+		return nil, fmt.Errorf("decode metrics: %w", err)
+	}
+	rawParams, err := cloneRawJSONObject(w.Params)
+	if err != nil {
+		return nil, fmt.Errorf("decode params: %w", err)
+	}
+	return &CTDPayload{
+		EventID:        w.EventID,
+		NodeID:         w.NodeID,
+		Pillar:         w.Pillar,
+		Component:      w.Component,
+		Status:         w.Status,
+		EventTimestamp: w.EventTimestamp,
+		Artifact:       w.Artifact,
+		Trace:          w.Trace,
+		rawMetrics:     rawMetrics,
+		rawParams:      rawParams,
+	}, nil
+}
+
+// RawMetrics returns the preserved wire JSON bytes for metrics when available and unmutated.
+func (c *CTDPayload) RawMetrics() []byte {
+	if c == nil || len(c.rawMetrics) == 0 {
+		return nil
+	}
+	return c.rawMetrics
+}
+
+// RawParams returns the preserved wire JSON bytes for params when available and unmutated.
+func (c *CTDPayload) RawParams() []byte {
+	if c == nil || len(c.rawParams) == 0 {
+		return nil
+	}
+	return c.rawParams
 }
 
 // NewCTDPayload initializes a standard Observer/Runner payload.
@@ -202,6 +358,7 @@ func (c *CTDPayload) AddMetric(key string, val any) *CTDPayload {
 		c.Metrics = make(map[string]any)
 	}
 	c.Metrics[key] = val
+	c.rawMetrics = nil
 	return c
 }
 
@@ -210,6 +367,7 @@ func (c *CTDPayload) AddParam(key, val string) *CTDPayload {
 		c.Params = make(map[string]string)
 	}
 	c.Params[key] = val
+	c.rawParams = nil
 	return c
 }
 

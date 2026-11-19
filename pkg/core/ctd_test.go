@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -99,5 +100,57 @@ func TestNormalizeTagsAndRunnerRequestValidate(t *testing.T) {
 	emptySel.Selectors = RunnerSelector{}
 	if err := emptySel.Validate(); err == nil {
 		t.Fatal("expected empty RunnerSelector to fail validation")
+	}
+
+	for _, bad := range []string{"", "bad/slash", "bad+plus", "bad#hash", "has space", "null\x00byte", "ctrl\nchar", strings.Repeat("a", 129)} {
+		if err := ValidateTopicToken(bad); err == nil {
+			t.Fatalf("expected ValidateTopicToken(%q) to fail", bad)
+		}
+	}
+	for _, good := range []string{"rv64-compute-01", "runner:SyntheticComputeRnr", "host_os.01", "10.0.10.1"} {
+		if err := ValidateTopicToken(good); err != nil {
+			t.Fatalf("expected ValidateTopicToken(%q) to succeed, got %v", good, err)
+		}
+	}
+
+	badRunner := req
+	badRunner.Runner = "bad/runner"
+	if err := badRunner.Validate(); err == nil {
+		t.Fatal("expected RunnerRequestCTD with slash in runner to fail")
+	}
+	badNode := req
+	badNode.Selectors = RunnerSelector{Nodes: []string{"node+#"}}
+	if err := badNode.Validate(); err == nil {
+		t.Fatal("expected RunnerRequestCTD with wildcard in node selector to fail")
+	}
+	badReqBy := req
+	badReqBy.RequestedBy = "bad operator"
+	if err := badReqBy.Validate(); err == nil {
+		t.Fatal("expected RunnerRequestCTD with space in requested_by to fail")
+	}
+}
+
+func TestDecodeWireCTDPayloadPreservesRawJSON(t *testing.T) {
+	wire := []byte(`{"node_id":"rv64-compute-01","pillar":"observer","component":"host-os","status":"active","metrics":{"load_1m":1.25,"temp":42},"params":{"arch":"riscv64"}}`)
+	ev, err := DecodeWireCTDPayload(wire)
+	if err != nil {
+		t.Fatalf("DecodeWireCTDPayload failed: %v", err)
+	}
+	if ev.NodeID != "rv64-compute-01" || ev.Pillar != PillarObserver || ev.Component != "host-os" {
+		t.Fatalf("unexpected decoded envelope: %+v", ev)
+	}
+	if ev.Metrics != nil || ev.Params != nil {
+		t.Fatal("expected DecodeWireCTDPayload to skip map allocation on fast path")
+	}
+	if string(ev.RawMetrics()) != `{"load_1m":1.25,"temp":42}` {
+		t.Fatalf("unexpected RawMetrics: %s", string(ev.RawMetrics()))
+	}
+	if string(ev.RawParams()) != `{"arch":"riscv64"}` {
+		t.Fatalf("unexpected RawParams: %s", string(ev.RawParams()))
+	}
+	// Mutating metrics invalidates raw cache
+	ev.AddMetric("extra", 1)
+	if ev.RawMetrics() != nil {
+		t.Fatal("expected AddMetric to invalidate cached RawMetrics")
 	}
 }

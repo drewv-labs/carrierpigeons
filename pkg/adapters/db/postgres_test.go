@@ -1,7 +1,11 @@
 package db
 
 import (
+	"errors"
+	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestValidateViewIdentifier(t *testing.T) {
@@ -45,6 +49,9 @@ func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
 		"SELECT 'drop table telemetric_ledger; update ctd_nodes' AS literal_note FROM ctd_nodes",
 		"SELECT $$delete from telemetric_ledger$$ AS dollar_literal /* nested /* drop */ comment */ FROM ctd_nodes",
 		"SELECT node_id -- trailing comment with delete keyword\nFROM ctd_nodes",
+		"SELECT E'escaped\\'quote; drop table x' AS esc_lit FROM ctd_nodes",
+		"SELECT U&'d\\0061t\\+000061' AS u_lit, U&\"col\\0020name\" FROM ctd_nodes",
+		"SELECT true, 'not an E string\\' FROM ctd_nodes",
 	}
 	for _, q := range validQueries {
 		if _, err := ValidateSelectOnlySQL(q); err != nil {
@@ -59,14 +66,72 @@ func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
 		"WITH evil AS (DELETE FROM telemetric_ledger RETURNING *) SELECT * FROM evil",
 		"UPDATE ctd_nodes SET status = 'OFFLINE'",
 		"SELECT * INTO sneaky_copy FROM ctd_nodes",
+		"SELECT * FROM ctd_nodes FOR UPDATE",
+		"SELECT * FROM ctd_nodes FOR NO KEY UPDATE",
+		"SELECT * FROM ctd_nodes FOR SHARE",
+		"SELECT * FROM ctd_nodes FOR KEY SHARE",
+		"SELECT pg_advisory_lock(1)",
+		"SELECT pg_advisory_lock_shared(1)",
+		"SELECT pg_try_advisory_lock(1)",
 		"SELECT pg_sleep(30)",
 		"SELECT lo_import('/etc/passwd')",
+		"SELECT lo_export(1, '/tmp/x')",
+		"SELECT dblink('dbname=x', 'SELECT 1')",
+		"SELECT dblink_exec('dbname=x', 'DELETE FROM ctd_nodes')",
 		"SELECT pg_read_file('/etc/hostname')",
+		"SELECT pg_read_binary_file('/etc/hostname')",
+		"SELECT pg_ls_dir('.')",
+		"SELECT true'\\'; DROP TABLE ctd_nodes; --'",
 	}
 	for _, q := range blockedQueries {
 		if _, err := ValidateSelectOnlySQL(q); err == nil {
 			t.Fatalf("expected mutating or dangerous query %q to be rejected", q)
 		}
+	}
+}
+
+func TestValidateSchemaIdentifierAndProvisionRolePasswordsAndBisectGuard(t *testing.T) {
+	if err := ValidateSchemaIdentifier("pigeonmath"); err != nil {
+		t.Fatalf("expected pigeonmath valid, got %v", err)
+	}
+	if err := ValidateSchemaIdentifier(strings.Repeat("a", 64)); err == nil {
+		t.Fatal("expected 64-char schema identifier to fail PostgreSQL NAMEDATALEN check")
+	}
+	if err := ValidateSchemaIdentifier("bad; DROP SCHEMA public"); err == nil {
+		t.Fatal("expected SQL injection schema identifier to fail")
+	}
+
+	// ProvisionRoles allows defaults on loopback, rejects empty/default on remote hosts.
+	if _, _, err := validateProvisionRolePasswords("127.0.0.1", "", ""); err != nil {
+		t.Fatalf("expected loopback defaults to be allowed, got %v", err)
+	}
+	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "", "strong_ro_pw"); err == nil {
+		t.Fatal("expected empty ingest password on remote host to fail")
+	}
+	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "ctd_ingest_password", "strong_ro_pw"); err == nil {
+		t.Fatal("expected default ingest password on remote host to fail")
+	}
+	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "strong_ing_pw", "pigeoncare_readonly"); err == nil {
+		t.Fatal("expected default readonly password on remote host to fail")
+	}
+	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "strong_ing_pw", "strong_ro_pw"); err != nil {
+		t.Fatalf("expected rotated passwords on remote host to succeed, got %v", err)
+	}
+
+	// Bisect guard: only SQLSTATE 22xxx / 23xxx are bisectable.
+	if !isBisectablePGError(&pgconn.PgError{Code: "22P02"}) {
+		t.Fatal("expected SQLSTATE 22P02 to be bisectable")
+	}
+	if !isBisectablePGError(&pgconn.PgError{Code: "23505"}) {
+		t.Fatal("expected SQLSTATE 23505 to be bisectable")
+	}
+	for _, code := range []string{"08006", "57014", "40001", "40P01"} {
+		if isBisectablePGError(&pgconn.PgError{Code: code}) {
+			t.Fatalf("expected SQLSTATE %s NOT to be bisectable", code)
+		}
+	}
+	if isBisectablePGError(errors.New("connection reset by peer")) {
+		t.Fatal("expected generic network error NOT to be bisectable")
 	}
 }
 

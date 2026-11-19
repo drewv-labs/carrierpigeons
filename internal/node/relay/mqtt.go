@@ -23,6 +23,7 @@ type Options struct {
 	NodeID         string
 	ClientPrefix   string
 	TopicPrefix    string
+	Brand          brand.Spec
 	SpoolCapacity  int
 	BootTags       []string
 	Username       string
@@ -38,6 +39,7 @@ type MQTTClient struct {
 	client       mqtt.Client
 	nodeID       string
 	topicPrefix  string
+	brand        brand.Spec
 	bootTags     []string
 	meta         map[string]string
 	runnerPolicy runner.ExecutionPolicy
@@ -75,15 +77,21 @@ func NewMQTTClientWithPrefix(brokerURL, nodeID, topicPrefix string) *MQTTClient 
 
 // NewMQTTClientWithOptions initializes the broker connection with configurable spool sizing, TLS, and NodeHello tags.
 func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
+	bSpec := cfg.Brand
+	if bSpec == (brand.Spec{}) {
+		bSpec = brand.Active()
+	}
+	bSpec = bSpec.MergeWithDefaults()
+
 	if strings.TrimSpace(cfg.BrokerURL) == "" {
 		cfg.BrokerURL = "tcp://127.0.0.1:1883"
 	}
 	if strings.TrimSpace(cfg.TopicPrefix) == "" {
-		cfg.TopicPrefix = brand.Active().CTDPrefix()
+		cfg.TopicPrefix = bSpec.CTDPrefix()
 	}
 	clientPrefix := strings.TrimSpace(cfg.ClientPrefix)
 	if clientPrefix == "" {
-		clientPrefix = strings.ToLower(brand.Active().EdgeName)
+		clientPrefix = strings.ToLower(bSpec.EdgeName)
 	}
 	if cfg.SpoolCapacity <= 0 {
 		cfg.SpoolCapacity = DefaultSpoolCapacity
@@ -92,6 +100,7 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 	c := &MQTTClient{
 		nodeID:       cfg.NodeID,
 		topicPrefix:  cfg.TopicPrefix,
+		brand:        bSpec,
 		bootTags:     core.NormalizeTags(cfg.BootTags),
 		meta:         cfg.Meta,
 		runnerPolicy: cfg.RunnerPolicy,
@@ -101,8 +110,8 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 		flushDone:    make(chan struct{}),
 	}
 
-	registryTopic := core.RegistryTopic(cfg.NodeID)
-	helloTopic := core.HelloTopic(cfg.NodeID)
+	registryTopic := bSpec.RegistryTopic(cfg.NodeID)
+	helloTopic := bSpec.HelloTopic(cfg.NodeID)
 
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(cfg.BrokerURL)
@@ -227,13 +236,19 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		})
 	}
 
+	requeuePending := func() {
+		items := make([]*core.CTDPayload, 0, len(pending))
+		for _, item := range pending {
+			items = append(items, item.payload)
+		}
+		c.spool.PrependBatch(items)
+	}
+
 	for len(pending) > 0 {
 		select {
 		case <-c.stopCh:
-			// Re-enqueue undelivered items for best-effort final drain in Disconnect().
-			for _, item := range pending {
-				c.spool.Push(item.payload)
-			}
+			// Prepend undelivered items in FIFO order for best-effort final drain in Disconnect().
+			requeuePending()
 			return
 		default:
 		}
@@ -241,9 +256,7 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		if !c.client.IsConnected() {
 			select {
 			case <-c.stopCh:
-				for _, item := range pending {
-					c.spool.Push(item.payload)
-				}
+				requeuePending()
 				return
 			case <-time.After(1 * time.Second):
 				continue
@@ -272,9 +285,7 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 
 		select {
 		case <-c.stopCh:
-			for _, item := range pending {
-				c.spool.Push(item.payload)
-			}
+			requeuePending()
 			return
 		case <-time.After(1 * time.Second):
 		}
@@ -323,7 +334,7 @@ func (c *MQTTClient) Disconnect() {
 		if c.client != nil {
 			c.drainRemainingBeforeClose(2 * time.Second)
 			if c.client.IsConnected() {
-				tok := c.client.Publish(core.RegistryTopic(c.nodeID), 1, true, []byte("OFFLINE"))
+				tok := c.client.Publish(c.brand.RegistryTopic(c.nodeID), 1, true, []byte("OFFLINE"))
 				tok.WaitTimeout(500 * time.Millisecond)
 			}
 			c.client.Disconnect(250)

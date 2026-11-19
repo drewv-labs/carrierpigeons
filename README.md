@@ -52,7 +52,7 @@ Transitioning beyond passive logging, CarrierPigeons pairs continuous hardware o
 </div>
 
 🚀 **Pigeoneer (`cmd/pigeoneer` / `pkg/edge`) — Configurable Edge Observer + Runner Daemon**
-* **Self-Aware Hardware Detection:** Auto-detects RISC-V/ARM/x86 host sensors, CPU cooler RPM/PWM (`/sys/class/hwmon` & `cooling_device*`), OpenWrt `ubus`, macOS SMC/ANE, Nvidia/AMD/Intel GPUs, and Hailo/Coral NPUs.
+* **Self-Aware Hardware Detection:** Auto-detects RISC-V/ARM/x86 host sensors, CPU cooler RPM/PWM (`/sys/class/hwmon` & `cooling_device*`), OpenWrt zero-fork `/proc` & `/sys`, macOS SMC/ANE, Nvidia/AMD/Intel GPUs, and Hailo/Coral NPUs.
 * **Variable Ring-Buffer Spool:** Configurable `spool_capacity` circular ring buffer evicts oldest frames in `O(1)` when `PigeonCoop` is unreachable without blocking observers or leaking heap memory.
 * **Node Tagging:** Publishes hardware architecture and boot tags (`riscv64`, `compute-bench`, `npu-node`, etc.) on connect, merged with operator-assigned tags on the hub.
 
@@ -111,7 +111,7 @@ Because `pigeoneer` links only the Go standard library, `BurntSushi/toml`, and `
 | Target Profile | Estimated CPU | Observer Mechanism |
 | :--- | :--- | :--- |
 | **Headless Linux / RISC-V SBCs** | **`< 0.05% – 0.15%` (1 hart)** | Zero subprocess forks; reads `/proc/loadavg`, `/proc/meminfo`, `/proc/net/dev`, `/sys/class/thermal`, `/sys/class/hwmon` (CPU cooler RPM & PWM), and Coral `/sys/class/apex` directly in-process. |
-| **OpenWrt Routers** | **`~0.1% – 0.3%` (1 core)** | Two lightweight native C `ubus call` invocations per 5s window (`< 2 MiB` transient child RSS) plus in-process sysfs thermal/fan reads. |
+| **OpenWrt Routers** | **`< 0.05% – 0.15%` (1 core)** | Zero subprocess forks; reads `/proc/uptime`, `/proc/loadavg`, `/proc/meminfo`, `/proc/net/dev` (including `br-lan` bridges), and `/sys` thermal/fan sensors directly in-process. |
 | **Discrete GPU / Hailo NPU Nodes** | **`~0.5% – 2.5%` (1 core)** | Driven by vendor CLI subprocess startup (`nvidia-smi`, `rocm-smi`, `hailortcli`); Intel GPUs use a single persistent `intel_gpu_top` JSON stream (`~0.1% – 0.3%`). |
 | **Active `SyntheticComputeRnr` / `benchmark`** | **`100% × NumCPU()`** | On-demand synthetic stress workload (`sha256` burn) with near-zero heap allocation; completely idle unless explicitly dispatched. |
 

@@ -23,16 +23,21 @@ import (
 // SECURITY INVARIANT: Store is typed as `db.AgentSafeDB`, guaranteeing strictly Read-Only access
 // to the public CTD Ledger for Zed, Google Antigravity, Claude Code/Desktop, and custom harnesses.
 type Options struct {
-	Store     db.AgentSafeDB
-	Brand     brand.Spec
-	Optimizer llm.BaseLLM
-	Version   string
+	Store           db.AgentSafeDB
+	Brand           brand.Spec
+	Optimizer       llm.BaseLLM
+	Version         string
+	AllowWriteViews bool
 }
+
+// ServerOptions is an alias for Options for callers referencing the explicit server options type name.
+type ServerOptions = Options
 
 // HTTPOptions configures Bearer authentication and DNS-rebinding guards for Streamable HTTP mode.
 type HTTPOptions struct {
 	AuthToken                       string
 	AllowUnauthenticatedNonLoopback bool
+	EnforceLoopbackHost             bool
 }
 
 // New constructs a configured `*server.MCPServer` ready for `ServeStdio` or `ServeHTTPWithOptions`.
@@ -42,7 +47,7 @@ func New(opts Options) *server.MCPServer {
 	if version == "" {
 		version = "0.2.0"
 	}
-	mathEngine := pigeonmath.NewEngine(opts.Store)
+	mathEngine := pigeonmath.NewEngineWithSchema(opts.Store, bSpec.MathSchema)
 
 	s := server.NewMCPServer(
 		bSpec.MCPName+" ("+bSpec.ProductName+" CTD Telemetry)",
@@ -56,7 +61,7 @@ func New(opts Options) *server.MCPServer {
 		mcp.WithDescription("List all registered mesh nodes with hardware architecture, tags, liveness, and latest metrics."),
 	)
 	s.AddTool(clusterTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		summaries, err := opts.Store.GetClusterStatus(ctx, 90*time.Second)
+		summaries, err := opts.Store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Database error: %v", err)), nil
 		}
@@ -101,10 +106,10 @@ func New(opts Options) *server.MCPServer {
 
 	// 3. check_offline_nodes
 	offlineTool := mcp.NewTool("check_offline_nodes",
-		mcp.WithDescription("Identify any nodes that stopped reporting in the last 60 seconds or entered an unhealthy state."),
+		mcp.WithDescription("Identify any nodes that stopped reporting within the cluster health window or entered an unhealthy state."),
 	)
 	s.AddTool(offlineTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		summaries, err := opts.Store.GetClusterStatus(ctx, 60*time.Second)
+		summaries, err := opts.Store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Database error: %v", err)), nil
 		}
@@ -186,28 +191,30 @@ func New(opts Options) *server.MCPServer {
 		return mcp.NewToolResultText(string(out)), nil
 	})
 
-	// 8. create_pigeonmath_view
-	createViewTool := mcp.NewTool("create_pigeonmath_view",
-		mcp.WithDescription("Cache raw SQL intent, validate read-only safety, and materialize an analytical view inside pigeonmath.pmv_<name>."),
-		mcp.WithString("view_name", mcp.Required(), mcp.Description("Analytical view slug (e.g., cooling_headroom)")),
-		mcp.WithString("sql", mcp.Required(), mcp.Description("Single read-only SELECT query")),
-	)
-	s.AddTool(createViewTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		viewName, err := req.RequireString("view_name")
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Invalid view_name: %v", err)), nil
-		}
-		rawSQL, err := req.RequireString("sql")
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Invalid sql: %v", err)), nil
-		}
-		rec, err := mathEngine.SubmitAndCertifyPMV(ctx, strings.ToLower(bSpec.MCPName), viewName, rawSQL, opts.Optimizer)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("PMV certification failed: %v", err)), nil
-		}
-		out, _ := json.MarshalIndent(rec, "", "  ")
-		return mcp.NewToolResultText(string(out)), nil
-	})
+	// 8. create_pigeonmath_view (opt-in only via AllowWriteViews)
+	if opts.AllowWriteViews {
+		createViewTool := mcp.NewTool("create_pigeonmath_view",
+			mcp.WithDescription(fmt.Sprintf("Cache raw SQL intent, validate read-only safety, and materialize an analytical view inside %s.pmv_<name>.", bSpec.MathSchema)),
+			mcp.WithString("view_name", mcp.Required(), mcp.Description("Analytical view slug (e.g., cooling_headroom)")),
+			mcp.WithString("sql", mcp.Required(), mcp.Description("Single read-only SELECT query")),
+		)
+		s.AddTool(createViewTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			viewName, err := req.RequireString("view_name")
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Invalid view_name: %v", err)), nil
+			}
+			rawSQL, err := req.RequireString("sql")
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Invalid sql: %v", err)), nil
+			}
+			rec, err := mathEngine.SubmitAndCertifyPMV(ctx, strings.ToLower(bSpec.MCPName), viewName, rawSQL, opts.Optimizer)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("PMV certification failed: %v", err)), nil
+			}
+			out, _ := json.MarshalIndent(rec, "", "  ")
+			return mcp.NewToolResultText(string(out)), nil
+		})
+	}
 
 	return s
 }
@@ -223,12 +230,26 @@ func isLoopbackOrigin(origin string) bool {
 	return config.IsLoopbackListen(u.Host)
 }
 
-// NewHTTPHandler wraps an MCPServer in a Streamable HTTP handler with Bearer token auth and DNS-rebinding guards.
+const maxMCPRequestBodyBytes = 1 << 20 // 1 MiB request body ceiling
+
+// NewHTTPHandler wraps an MCPServer in a Streamable HTTP handler with Bearer token auth,
+// loopback DNS-rebinding guards, and a 1 MiB request body limit.
 func NewHTTPHandler(s *server.MCPServer, opts HTTPOptions) http.Handler {
 	inner := server.NewStreamableHTTPServer(s)
 	expectedToken := strings.TrimSpace(opts.AuthToken)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if opts.EnforceLoopbackHost {
+			if !config.IsLoopbackListen(r.Host) {
+				http.Error(w, "Forbidden: non-loopback Host header rejected on loopback listener", http.StatusForbidden)
+				return
+			}
+			if !isLoopbackOrigin(r.Header.Get("Origin")) {
+				http.Error(w, "Forbidden: cross-origin request rejected", http.StatusForbidden)
+				return
+			}
+		}
+
 		if expectedToken != "" {
 			authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
 			const prefix = "Bearer "
@@ -243,7 +264,7 @@ func NewHTTPHandler(s *server.MCPServer, opts HTTPOptions) http.Handler {
 				http.Error(w, "Unauthorized: invalid Bearer token", http.StatusUnauthorized)
 				return
 			}
-		} else {
+		} else if !opts.EnforceLoopbackHost {
 			// Loopback-only mode without token: enforce Host and Origin checks to defeat browser DNS-rebinding/CSRF.
 			if !config.IsLoopbackListen(r.Host) {
 				http.Error(w, "Forbidden: non-loopback Host header rejected without auth token", http.StatusForbidden)
@@ -253,6 +274,10 @@ func NewHTTPHandler(s *server.MCPServer, opts HTTPOptions) http.Handler {
 				http.Error(w, "Forbidden: cross-origin request rejected", http.StatusForbidden)
 				return
 			}
+		}
+
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxMCPRequestBodyBytes)
 		}
 		inner.ServeHTTP(w, r)
 	})
@@ -270,17 +295,45 @@ func ServeHTTP(s *server.MCPServer, listenAddr string) error {
 
 // ServeHTTPWithOptions runs the MCP server over Streamable HTTP with Bearer authentication and timeouts.
 func ServeHTTPWithOptions(s *server.MCPServer, listenAddr string, opts HTTPOptions) error {
+	return ServeHTTPContext(context.Background(), s, listenAddr, opts)
+}
+
+// ServeHTTPContext runs the MCP server over Streamable HTTP and shuts down cleanly when ctx is cancelled.
+func ServeHTTPContext(ctx context.Context, s *server.MCPServer, listenAddr string, opts HTTPOptions) error {
 	listenAddr = strings.TrimSpace(listenAddr)
-	if !config.IsLoopbackListen(listenAddr) && strings.TrimSpace(opts.AuthToken) == "" && !opts.AllowUnauthenticatedNonLoopback {
+	isLoopback := config.IsLoopbackListen(listenAddr)
+	if !isLoopback && strings.TrimSpace(opts.AuthToken) == "" && !opts.AllowUnauthenticatedNonLoopback {
 		return fmt.Errorf(
 			"refusing unauthenticated MCP HTTP listener on non-loopback %q: configure --auth-token / PIGEONS_MCP_AUTH_TOKEN or bind 127.0.0.1",
 			listenAddr,
 		)
 	}
+	if isLoopback {
+		opts.EnforceLoopbackHost = true
+	}
 	httpSrv := &http.Server{
 		Addr:              listenAddr,
 		Handler:           NewHTTPHandler(s, opts),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
-	return httpSrv.ListenAndServe()
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+		return <-errCh
+	}
 }

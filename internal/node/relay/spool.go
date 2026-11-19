@@ -59,6 +59,50 @@ func (r *RingSpool) Push(p *core.CTDPayload) bool {
 	return evicted
 }
 
+// PrependBatch re-inserts undelivered items at the head of the ring buffer in their original FIFO order
+// without evicting newer elements already buffered in the spool. If capacity is insufficient, only the
+// oldest items from `items` are dropped and counted toward Dropped().
+func (r *RingSpool) PrependBatch(items []*core.CTDPayload) {
+	if len(items) == 0 {
+		return
+	}
+	nonNil := make([]*core.CTDPayload, 0, len(items))
+	for _, p := range items {
+		if p != nil {
+			nonNil = append(nonNil, p)
+		}
+	}
+	if len(nonNil) == 0 {
+		return
+	}
+
+	r.mu.Lock()
+	capLen := len(r.buf)
+	available := capLen - r.count
+	if available <= 0 {
+		r.dropped += uint64(len(nonNil))
+		r.mu.Unlock()
+		return
+	}
+	startIdx := 0
+	if len(nonNil) > available {
+		excess := len(nonNil) - available
+		r.dropped += uint64(excess)
+		startIdx = excess
+	}
+	for i := len(nonNil) - 1; i >= startIdx; i-- {
+		r.head = (r.head - 1 + capLen) % capLen
+		r.buf[r.head] = nonNil[i]
+		r.count++
+	}
+	r.mu.Unlock()
+
+	select {
+	case r.notify <- struct{}{}:
+	default:
+	}
+}
+
 // PopBlocking blocks until at least one event is available or stopCh is closed.
 func (r *RingSpool) PopBlocking(stopCh <-chan struct{}) (*core.CTDPayload, bool) {
 	batch, ok := r.PopBatchBlocking(1, stopCh)

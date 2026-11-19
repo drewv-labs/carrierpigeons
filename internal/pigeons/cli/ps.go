@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -31,7 +32,7 @@ var psCmd = &cobra.Command{
 		}
 		defer store.Close()
 
-		summaries, err := store.GetClusterStatus(ctx, 3*time.Minute)
+		summaries, err := store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
 			return err
 		}
@@ -52,7 +53,7 @@ var psCmd = &cobra.Command{
 			detail := "clean"
 
 			timeSince := time.Since(n.LastSeen)
-			if timeSince > 3*time.Minute {
+			if timeSince > config.DefaultHealthyWindow {
 				state = "offline"
 				detail = fmt.Sprintf("unreachable (%.0fm ago)", timeSince.Minutes())
 				needsSupport = true

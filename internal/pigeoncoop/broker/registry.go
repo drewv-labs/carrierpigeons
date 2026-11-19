@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
@@ -18,14 +17,34 @@ var ntfyHTTPClient = &http.Client{
 	Timeout: 5 * time.Second,
 }
 
-// processHelloUpdate ingests NodeHello hardware capabilities & boot tags on `<root>/registry/+/hello`.
+func (s *Subscriber) parseRegistryNodeID(topic, suffix string) (string, bool) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 4 || parts[0] != s.topicRoot || parts[1] != "registry" || parts[3] != suffix {
+		return "", false
+	}
+	nodeID := parts[2]
+	if err := core.ValidateTopicToken(nodeID); err != nil {
+		log.Printf("[Registry] Invalid node_id in topic %q: %v", topic, err)
+		return "", false
+	}
+	return nodeID, true
+}
+
+// processHelloUpdate ingests NodeHello hardware capabilities & boot tags on `<root>/registry/<node_id>/hello`.
 func (s *Subscriber) processHelloUpdate(topic string, payload []byte) {
+	topicNodeID, ok := s.parseRegistryNodeID(topic, "hello")
+	if !ok {
+		log.Printf("[Registry] Malformed NodeHello topic %q dropped", topic)
+		return
+	}
+
 	var hello core.NodeHello
 	if err := json.Unmarshal(payload, &hello); err != nil {
 		log.Printf("[Registry] Malformed NodeHello on %s: %v", topic, err)
 		return
 	}
-	if strings.TrimSpace(hello.NodeID) == "" {
+	if hello.NodeID != topicNodeID {
+		log.Printf("[Registry] Mismatched NodeHello node_id %q on topic %q dropped", hello.NodeID, topic)
 		return
 	}
 
@@ -45,13 +64,8 @@ func (s *Subscriber) processHelloUpdate(topic string, payload []byte) {
 // and triggers bounded Ntfy alerts strictly on genuine state transitions.
 func (s *Subscriber) processRegistryUpdate(topic string, payload []byte) {
 	// Topic structure: <root>/registry/<node_id>/status
-	parts := strings.Split(topic, "/")
-	if len(parts) < 3 {
-		return
-	}
-
-	nodeID := strings.TrimSpace(parts[len(parts)-2])
-	if nodeID == "" {
+	nodeID, ok := s.parseRegistryNodeID(topic, "status")
+	if !ok {
 		return
 	}
 	status := strings.TrimSpace(string(payload))
@@ -117,7 +131,7 @@ func (s *Subscriber) sendNtfyAlert(nodeID, status string) {
 		log.Printf("[Ntfy] Invalid request URL %q: %v", url, err)
 		return
 	}
-	req.Header.Set("Title", brand.Active().ProductName+" Hardware Alert")
+	req.Header.Set("Title", s.brand.ProductName+" Hardware Alert")
 
 	if status == "OFFLINE" {
 		req.Header.Set("Tags", "warning,skull")

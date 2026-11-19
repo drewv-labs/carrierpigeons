@@ -4,14 +4,9 @@ import (
 	"context"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
-	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 )
 
 type hostOSObserver struct{}
-
-func init() {
-	observer.Register(&hostOSObserver{})
-}
 
 func (h *hostOSObserver) Name() string {
 	return "host-os"

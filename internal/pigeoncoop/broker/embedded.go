@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"bytes"
+	"crypto/subtle"
 	"crypto/tls"
 	"fmt"
 	"log/slog"
@@ -10,21 +12,117 @@ import (
 	"sync"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	mochi "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
+	"github.com/mochi-mqtt/server/v2/packets"
 )
 
 // EmbeddedOptions configures PigeonCoop's built-in pure-Go MQTT v3.1.1/v5.0 broker.
 type EmbeddedOptions struct {
-	ListenAddr   string
-	Username     string
-	Password     string
-	EdgeUsername string
-	EdgePassword string
-	TLSCertFile  string
-	TLSKeyFile   string
-	TopicRoot    string
+	ListenAddr       string
+	Username         string
+	Password         string
+	EdgeUsername     string
+	EdgePassword     string
+	EdgeClientPrefix string
+	TLSCertFile      string
+	TLSKeyFile       string
+	TopicRoot        string
+}
+
+type perNodeAuthHook struct {
+	mochi.HookBase
+	adminUser  string
+	adminPass  string
+	edgeUser   string
+	edgePass   string
+	edgePrefix string
+	topicRoot  string
+}
+
+func (h *perNodeAuthHook) ID() string {
+	return "per-node-acl"
+}
+
+func (h *perNodeAuthHook) Provides(b byte) bool {
+	return bytes.Contains([]byte{mochi.OnConnectAuthenticate, mochi.OnACLCheck}, []byte{b})
+}
+
+func constantTimeEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func extractEdgeNodeID(clientID, edgePrefix string) string {
+	id := strings.TrimSpace(clientID)
+	if edgePrefix != "" && strings.HasPrefix(id, edgePrefix) {
+		trimmed := strings.TrimPrefix(id, edgePrefix)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return id
+}
+
+func (h *perNodeAuthHook) OnConnectAuthenticate(cl *mochi.Client, pk packets.Packet) bool {
+	user := string(pk.Connect.Username)
+	pass := string(pk.Connect.Password)
+
+	if h.adminUser != "" && constantTimeEqual(user, h.adminUser) && constantTimeEqual(pass, h.adminPass) {
+		return true
+	}
+	if h.edgeUser != "" && constantTimeEqual(user, h.edgeUser) && constantTimeEqual(pass, h.edgePass) {
+		nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
+		if err := core.ValidateTopicToken(nodeID); err != nil {
+			return false
+		}
+		if pk.Connect.WillFlag && !h.allowEdgeWrite(nodeID, pk.Connect.WillTopic) {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (h *perNodeAuthHook) allowEdgeWrite(nodeID, topic string) bool {
+	if strings.ContainsAny(topic, "+#") {
+		return false
+	}
+	if topic == h.topicRoot+"/registry/"+nodeID+"/status" || topic == h.topicRoot+"/registry/"+nodeID+"/hello" {
+		return true
+	}
+	parts := strings.Split(topic, "/")
+	if len(parts) == 5 && parts[0] == h.topicRoot && parts[1] == "ctd" && parts[3] == nodeID {
+		return core.ValidateTopicToken(parts[2]) == nil && core.ValidateTopicToken(parts[4]) == nil
+	}
+	return false
+}
+
+func (h *perNodeAuthHook) OnACLCheck(cl *mochi.Client, topic string, write bool) bool {
+	if cl == nil {
+		return false
+	}
+	if cl.Net.Inline {
+		return true
+	}
+
+	user := string(cl.Properties.Username)
+	if h.adminUser != "" && constantTimeEqual(user, h.adminUser) {
+		return topic == h.topicRoot || strings.HasPrefix(topic, h.topicRoot+"/") || topic == "#"
+	}
+	if h.edgeUser != "" && constantTimeEqual(user, h.edgeUser) {
+		nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
+		if err := core.ValidateTopicToken(nodeID); err != nil {
+			return false
+		}
+		if !write {
+			// Strict per-node ReadOnly: disallow control/+ or sibling node control topics.
+			return topic == h.topicRoot+"/control/"+nodeID
+		}
+		return h.allowEdgeWrite(nodeID, topic)
+	}
+	return false
 }
 
 // EmbeddedBroker hosts an in-process pure-Go MQTT server (`CGO_ENABLED=0`).
@@ -94,47 +192,24 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 		}
 	}
 
+	edgePrefix := strings.TrimSpace(opts.EdgeClientPrefix)
+	if edgePrefix == "" {
+		edgePrefix = strings.ToLower(brand.Active().EdgeName)
+	}
+	if edgePrefix != "" && !strings.HasSuffix(edgePrefix, "-") {
+		edgePrefix += "-"
+	}
+
 	if adminUser != "" || edgeUser != "" {
-		var authRules auth.AuthRules
-		var aclRules auth.ACLRules
-
-		if adminUser != "" {
-			authRules = append(authRules, auth.AuthRule{
-				Username: auth.RString(adminUser),
-				Password: auth.RString(opts.Password),
-				Allow:    true,
-			})
-			aclRules = append(aclRules, auth.ACLRule{
-				Username: auth.RString(adminUser),
-			})
+		hook := &perNodeAuthHook{
+			adminUser:  adminUser,
+			adminPass:  opts.Password,
+			edgeUser:   edgeUser,
+			edgePass:   opts.EdgePassword,
+			edgePrefix: edgePrefix,
+			topicRoot:  topicRoot,
 		}
-
-		if edgeUser != "" && edgeUser != adminUser {
-			authRules = append(authRules, auth.AuthRule{
-				Username: auth.RString(edgeUser),
-				Password: auth.RString(opts.EdgePassword),
-				Allow:    true,
-			})
-			// Least-privilege edge node ACL: may publish telemetry + presence/hello and subscribe to control/<node>,
-			// but cannot publish RunnerRequestCTD or dispatch control envelopes to sibling nodes.
-			aclRules = append(aclRules, auth.ACLRule{
-				Username: auth.RString(edgeUser),
-				Filters: auth.Filters{
-					auth.RString(topicRoot + "/ctd/#"):      auth.WriteOnly,
-					auth.RString(topicRoot + "/registry/#"): auth.WriteOnly,
-					auth.RString(topicRoot + "/control/+"):  auth.ReadOnly,
-					"#":                                     auth.Deny,
-				},
-			})
-		}
-
-		authRules = append(authRules, auth.AuthRule{Allow: false})
-		err = srv.AddHook(new(auth.Hook), &auth.Options{
-			Ledger: &auth.Ledger{
-				Auth: authRules,
-				ACL:  aclRules,
-			},
-		})
+		err = srv.AddHook(hook, nil)
 	} else {
 		err = srv.AddHook(new(auth.AllowHook), nil)
 	}

@@ -9,6 +9,7 @@ NODE_TAGS="${PIGEONEER_TAGS:-}"
 MQTT_USER="${PIGEONEER_MQTT_USERNAME:-}"
 MQTT_PASS="${PIGEONEER_MQTT_PASSWORD:-}"
 SKIP_CHECKSUM="${PIGEONEER_SKIP_CHECKSUM:-false}"
+ENABLE_GPU_GROUPS="${PIGEONEER_ENABLE_GPU_GROUPS:-false}"
 
 if [[ ! "${NODE_ID}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     echo "Invalid NODE_ID '${NODE_ID}': must match ^[a-zA-Z0-9._-]+$" >&2
@@ -34,7 +35,7 @@ curl -fsSL -o "${TMP_DIR}/${BIN_NAME}" "${BASE_URL}/${BIN_NAME}"
 if [[ "${SKIP_CHECKSUM}" != "true" ]]; then
     echo "[*] Verifying SHA-256 release checksum..."
     curl -fsSL -o "${TMP_DIR}/checksums.txt" "${BASE_URL}/checksums.txt"
-    (cd "${TMP_DIR}" && grep -E "  ${BIN_NAME}\$" checksums.txt | sha256sum -c -)
+    (cd "${TMP_DIR}" && awk -v bin="${BIN_NAME}" '$2 == bin || $2 == "*"bin { found=1; print } END { if (!found) exit 1 }' checksums.txt | sha256sum -c -)
 fi
 
 # Atomic install avoids ETXTBSY when upgrading a live running daemon
@@ -74,19 +75,39 @@ EOF
     chmod 0640 /etc/pigeons/pigeoneer.toml
 fi
 
-# Write environment overrides with restricted 0640 permissions
+# Pre-create environment file with 0640 permissions before writing secrets to eliminate any world-readable window.
+# Format values as systemd EnvironmentFile= double-quoted strings (escaping only backslashes and double quotes).
+systemd_env_quote() {
+    local val="$1"
+    val="${val//\\/\\\\}"
+    val="${val//\"/\\\"}"
+    printf '"%s"' "${val}"
+}
+
+install -m 0640 -o root -g pigeoneer /dev/null /etc/pigeons/pigeoneer.env
 {
-    printf 'PIGEONEER_NODE_ID=%q\n' "${NODE_ID}"
-    printf 'PIGEONEER_BROKER_URL=%q\n' "${BROKER_URL}"
-    printf 'PIGEONEER_TAGS=%q\n' "${NODE_TAGS:-${GO_ARCH}}"
-    printf 'PIGEONEER_MQTT_USERNAME=%q\n' "${MQTT_USER}"
-    printf 'PIGEONEER_MQTT_PASSWORD=%q\n' "${MQTT_PASS}"
+    printf 'PIGEONEER_NODE_ID=%s\n' "$(systemd_env_quote "${NODE_ID}")"
+    printf 'PIGEONEER_BROKER_URL=%s\n' "$(systemd_env_quote "${BROKER_URL}")"
+    printf 'PIGEONEER_TAGS=%s\n' "$(systemd_env_quote "${NODE_TAGS:-${GO_ARCH}}")"
+    printf 'PIGEONEER_MQTT_USERNAME=%s\n' "$(systemd_env_quote "${MQTT_USER}")"
+    printf 'PIGEONEER_MQTT_PASSWORD=%s\n' "$(systemd_env_quote "${MQTT_PASS}")"
 } > /etc/pigeons/pigeoneer.env
-chown root:pigeoneer /etc/pigeons/pigeoneer.env
-chmod 0640 /etc/pigeons/pigeoneer.env
+
+SUPP_GROUPS_DIRECTIVE="# SupplementaryGroups=video render  # Set PIGEONEER_ENABLE_GPU_GROUPS=true if DRM/sysfs GPU/NPU access is restricted"
+if [[ "${ENABLE_GPU_GROUPS}" == "true" ]]; then
+    SUPP_GROUPS_LIST=()
+    for grp in video render; do
+        if getent group "${grp}" >/dev/null 2>&1; then
+            SUPP_GROUPS_LIST+=("${grp}")
+        fi
+    done
+    if [[ "${#SUPP_GROUPS_LIST[@]}" -gt 0 ]]; then
+        SUPP_GROUPS_DIRECTIVE="SupplementaryGroups=${SUPP_GROUPS_LIST[*]}"
+    fi
+fi
 
 echo "[*] Configuring hardened systemd service..."
-cat <<'EOF' > /etc/systemd/system/pigeoneer.service
+cat <<EOF > /etc/systemd/system/pigeoneer.service
 [Unit]
 Description=CarrierPigeons Edge Observer & Runner Daemon
 After=network-online.target
@@ -96,6 +117,7 @@ Wants=network-online.target
 Type=simple
 User=pigeoneer
 Group=pigeoneer
+${SUPP_GROUPS_DIRECTIVE}
 EnvironmentFile=/etc/pigeons/pigeoneer.env
 ExecStart=/usr/local/bin/pigeoneer --config /etc/pigeons/pigeoneer.toml
 Restart=always

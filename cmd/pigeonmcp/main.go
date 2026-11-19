@@ -4,7 +4,10 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
@@ -15,10 +18,11 @@ import (
 
 func main() {
 	var (
-		cfgPath   = flag.String("config", "", "Optional path to pigeons.toml")
-		httpAddr  = flag.String("http", "", "Serve Streamable HTTP on host:port instead of stdio (e.g. 127.0.0.1:8089)")
-		authToken = flag.String("auth-token", "", "Bearer token for --http Streamable HTTP mode (required on non-loopback)")
-		dbURL     = flag.String("db-url", "", "Override Read-Only PostgreSQL DSN")
+		cfgPath         = flag.String("config", "", "Optional path to pigeons.toml")
+		httpAddr        = flag.String("http", "", "Serve Streamable HTTP on host:port instead of stdio (e.g. 127.0.0.1:8089)")
+		authToken       = flag.String("auth-token", "", "Bearer token for --http Streamable HTTP mode (required on non-loopback)")
+		dbURL           = flag.String("db-url", "", "Override Read-Only PostgreSQL DSN")
+		allowWriteViews = flag.Bool("allow-write-views", false, "Register create_pigeonmath_view tool (disabled by default)")
 	)
 	flag.Parse()
 
@@ -41,10 +45,13 @@ func main() {
 		token = wsCfg.MCPAuthToken
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	store, err := db.NewReadOnlyAgentStore(ctx, dsn, strings.ToLower(wsCfg.Brand.MCPName), db.ReadOnlyOptions{
 		AllowSuperuser: wsCfg.AllowSuperuserReadOnly,
 		MaxRows:        100,
+		MathSchema:     wsCfg.Brand.MathSchema,
 	})
 	if err != nil {
 		log.Fatalf("%s failed connecting to read-only ledger: %v", wsCfg.Brand.MCPName, err)
@@ -59,14 +66,15 @@ func main() {
 	})
 
 	srv := mcpserver.New(mcpserver.Options{
-		Store:     store,
-		Brand:     wsCfg.Brand,
-		Optimizer: optLLM,
+		Store:           store,
+		Brand:           wsCfg.Brand,
+		Optimizer:       optLLM,
+		AllowWriteViews: *allowWriteViews,
 	})
 
 	if strings.TrimSpace(*httpAddr) != "" {
 		log.Printf("Starting %s Streamable HTTP server on %s...", wsCfg.Brand.MCPName, *httpAddr)
-		if err := mcpserver.ServeHTTPWithOptions(srv, *httpAddr, mcpserver.HTTPOptions{
+		if err := mcpserver.ServeHTTPContext(ctx, srv, *httpAddr, mcpserver.HTTPOptions{
 			AuthToken: token,
 		}); err != nil {
 			log.Fatalf("%s HTTP server error: %v", wsCfg.Brand.MCPName, err)

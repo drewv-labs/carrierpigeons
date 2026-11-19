@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -27,7 +28,7 @@ var listCmd = &cobra.Command{
 		}
 		defer store.Close()
 
-		summaries, err := store.GetClusterStatus(ctx, 5*time.Minute)
+		summaries, err := store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
 			return err
 		}
@@ -44,7 +45,7 @@ var listCmd = &cobra.Command{
 			}
 			status := "active"
 			if !n.IsHealthy {
-				if time.Since(n.LastSeen) > 5*time.Minute {
+				if time.Since(n.LastSeen) > config.DefaultHealthyWindow {
 					status = "offline"
 				} else {
 					status = n.Status

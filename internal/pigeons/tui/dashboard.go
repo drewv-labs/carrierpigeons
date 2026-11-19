@@ -120,7 +120,7 @@ type DashboardModel struct {
 	chatHistory     []llm.Message
 	uiHistory       []string
 	userInput       string
-	currentResponse string
+	currentResponse *strings.Builder
 	streamCancel    context.CancelFunc
 	waiting         bool
 	pendingApproval *ApprovalPromptMsg
@@ -155,7 +155,7 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 	if opts.Care != nil {
 		mathEng = opts.Care.MathEngine()
 	} else if opts.Store != nil {
-		mathEng = pigeonmath.NewEngine(opts.Store)
+		mathEng = pigeonmath.NewEngineWithSchema(opts.Store, bSpec.MathSchema)
 	}
 
 	agentGreeting := fmt.Sprintf("%s: Connected to %s read-only CTD Ledger. Ask about thermals, runners, or %s views.",
@@ -258,7 +258,7 @@ func (m DashboardModel) fetchOverviewCmd() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
 
-		nodes, err := store.GetClusterStatus(ctx, 90*time.Second)
+		nodes, err := store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
 			return overviewDataMsg{err: err}
 		}
@@ -403,12 +403,15 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
+		m.currentResponse = nil
 		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render(m.brand.AgentName + " Error: " + msg.err.Error())
 		return m, nil
 
 	case streamTokenMsg:
-		m.currentResponse += msg.token
-		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render(m.brand.AgentName + ": " + m.currentResponse)
+		if m.currentResponse == nil {
+			m.currentResponse = &strings.Builder{}
+		}
+		m.currentResponse.WriteString(msg.token)
 		return m, waitForToken(msg.ch)
 
 	case streamDoneMsg:
@@ -417,7 +420,13 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
-		m.chatHistory = append(m.chatHistory, llm.Message{Role: "assistant", Content: m.currentResponse})
+		reply := ""
+		if m.currentResponse != nil {
+			reply = m.currentResponse.String()
+			m.currentResponse = nil
+		}
+		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render(m.brand.AgentName + ": " + reply)
+		m.chatHistory = append(m.chatHistory, llm.Message{Role: "assistant", Content: reply})
 		return m, tea.Batch(m.fetchOverviewCmd(), m.fetchMathCmd())
 
 	case tea.KeyMsg:
@@ -551,7 +560,7 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.uiHistory = append(m.uiHistory, userStyle.Render("Operator: "+userText))
 		m.uiHistory = append(m.uiHistory, agentStyle.Render(m.brand.AgentName+": "))
 		m.userInput = ""
-		m.currentResponse = ""
+		m.currentResponse = &strings.Builder{}
 		m.waiting = true
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -785,12 +794,35 @@ func (m DashboardModel) renderPigeonMath(box lipgloss.Style, accent, secondary l
 	return box.Render(nBuf.String()) + "\n" + box.Render(cBuf.String()) + "\n" + box.Render(vBuf.String())
 }
 
+func tailViewportLines(entries []string, maxLines int) []string {
+	if maxLines <= 0 {
+		maxLines = 18
+	}
+	var all []string
+	for _, entry := range entries {
+		all = append(all, strings.Split(entry, "\n")...)
+	}
+	if len(all) <= maxLines {
+		return all
+	}
+	return all[len(all)-maxLines:]
+}
+
 func (m DashboardModel) renderPigeonCare(box lipgloss.Style, accent lipgloss.Color) string {
 	var sb strings.Builder
 
-	// Show last ~12 chat entries so viewport never overflows terminal height
+	// Compute viewport line budget from terminal height so long streaming responses remain bounded.
+	maxLines := max(12, m.height-11)
 	start := max(0, len(m.uiHistory)-12)
-	for _, line := range m.uiHistory[start:] {
+	entries := make([]string, 0, len(m.uiHistory)-start)
+	for i := start; i < len(m.uiHistory); i++ {
+		if m.waiting && i == len(m.uiHistory)-1 && m.currentResponse != nil {
+			entries = append(entries, agentStyle.Render(m.brand.AgentName+": "+m.currentResponse.String()))
+		} else {
+			entries = append(entries, m.uiHistory[i])
+		}
+	}
+	for _, line := range tailViewportLines(entries, maxLines) {
 		sb.WriteString(line + "\n")
 	}
 

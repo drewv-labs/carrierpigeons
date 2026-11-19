@@ -8,6 +8,7 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
-func observeNetPlatform(_ context.Context, _ core.TelemetryPublisher, _ string) {
-	// Unsupported OS network observer stub.
+func observeNetPlatform(ctx context.Context, _ core.TelemetryPublisher, _ string) {
+	// Unsupported OS network observer stub; block cleanly until context cancellation.
+	<-ctx.Done()
 }

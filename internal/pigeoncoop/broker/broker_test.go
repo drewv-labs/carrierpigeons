@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/ingest"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	mochi "github.com/mochi-mqtt/server/v2"
 )
 
 type memoryLedger struct {
@@ -289,5 +291,99 @@ func TestEmbeddedBrokerAuthAndEdgeTopicACLs(t *testing.T) {
 	}
 	if len(ledger.events) == 0 {
 		t.Fatal("expected edge_node telemetry event to be ingested")
+	}
+}
+
+func TestPerNodeACLHookAndTopicSpoofingGuards(t *testing.T) {
+	hook := &perNodeAuthHook{
+		adminUser:  "coop_admin",
+		adminPass:  "admin_pw",
+		edgeUser:   "edge_node",
+		edgePass:   "edge_pw",
+		edgePrefix: "pigeoneer-",
+		topicRoot:  "pigeons",
+	}
+
+	edgeClient := &mochi.Client{
+		ID: "pigeoneer-rv64-edge-01",
+		Properties: mochi.ClientProperties{
+			Username: []byte("edge_node"),
+		},
+	}
+
+	// Own topics allowed
+	if !hook.OnACLCheck(edgeClient, "pigeons/control/rv64-edge-01", false) {
+		t.Fatal("expected edge node to subscribe to its own control topic")
+	}
+	if !hook.OnACLCheck(edgeClient, "pigeons/ctd/observer/rv64-edge-01/host-os", true) {
+		t.Fatal("expected edge node to publish to its own CTD telemetry topic")
+	}
+	if !hook.OnACLCheck(edgeClient, "pigeons/registry/rv64-edge-01/status", true) {
+		t.Fatal("expected edge node to publish to its own registry status topic")
+	}
+
+	// Wildcard and cross-node topics strictly denied
+	if hook.OnACLCheck(edgeClient, "pigeons/control/+", false) {
+		t.Fatal("expected edge node subscription to control/+ to be denied")
+	}
+	if hook.OnACLCheck(edgeClient, "pigeons/control/rv64-edge-02", false) {
+		t.Fatal("expected edge node subscription to sibling control topic to be denied")
+	}
+	if hook.OnACLCheck(edgeClient, "pigeons/ctd/observer/rv64-edge-02/host-os", true) {
+		t.Fatal("expected edge node publish to sibling telemetry topic to be denied")
+	}
+	if hook.OnACLCheck(edgeClient, "pigeons/registry/rv64-edge-02/status", true) {
+		t.Fatal("expected edge node publish to sibling registry topic to be denied")
+	}
+	if hook.OnACLCheck(edgeClient, "pigeons/requests/runner", true) {
+		t.Fatal("expected edge node publish to runner requests topic to be denied")
+	}
+
+	// Admin client retains full access across <topicRoot>/#
+	adminClient := &mochi.Client{
+		ID: "pigeoncoop-ingestor",
+		Properties: mochi.ClientProperties{
+			Username: []byte("coop_admin"),
+		},
+	}
+	if !hook.OnACLCheck(adminClient, "pigeons/ctd/#", false) || !hook.OnACLCheck(adminClient, "pigeons/control/rv64-edge-02", true) {
+		t.Fatal("expected admin client to retain full pub/sub across topicRoot")
+	}
+
+	// Subscriber topic spoofing & malformed registry topic guards (pure in-memory, no sockets required).
+	ledger := newMemoryLedger()
+	sub := &Subscriber{
+		ledger:    ledger,
+		batcher:   ingest.NewBatcher(ledger, ingest.Options{QueueSize: 16, BatchSize: 1, FlushInterval: 10 * time.Millisecond}),
+		brand:     brand.Default(),
+		topicRoot: "pigeons",
+	}
+	defer sub.batcher.Close()
+
+	// Spoofed node_id must be rejected
+	spoofedNode, _ := json.Marshal(core.NewCTDPayload("victim-node", "host-os", "active"))
+	sub.processTelemetry("pigeons/ctd/observer/attacker-node/host-os", spoofedNode)
+
+	// Spoofed pillar must be rejected
+	spoofedPillar, _ := json.Marshal(core.NewCTDPayload("edge-01", "host-os", "active").WithPillar(core.PillarRunner))
+	sub.processTelemetry("pigeons/ctd/observer/edge-01/host-os", spoofedPillar)
+
+	// Valid matching event must be ingested
+	validEv, _ := json.Marshal(core.NewCTDPayload("edge-01", "host-os", "active"))
+	sub.processTelemetry("pigeons/ctd/observer/edge-01/host-os", validEv)
+
+	// Malformed registry topics must not panic and must be ignored
+	sub.processRegistryUpdate("bad", []byte("ONLINE"))
+	sub.processRegistryUpdate("pigeons/registry/bad+node/status", []byte("ONLINE"))
+	sub.processRegistryUpdate("pigeons/registry/edge-01/status", []byte("ONLINE"))
+
+	sub.batcher.Close()
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if len(ledger.events) != 1 || ledger.events[0].NodeID != "edge-01" {
+		t.Fatalf("expected exactly 1 valid non-spoofed event for edge-01, got %+v", ledger.events)
+	}
+	if ledger.statusByID["edge-01"] != "ONLINE" || len(ledger.statusByID) != 1 {
+		t.Fatalf("unexpected registry statuses: %+v", ledger.statusByID)
 	}
 }

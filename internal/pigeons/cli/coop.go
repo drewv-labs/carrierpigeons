@@ -7,6 +7,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/spf13/cobra"
 )
 
@@ -46,6 +47,12 @@ var coopStatusCmd = &cobra.Command{
 
 		fmt.Printf("[CTD Ledger]   ONLINE\n")
 
+		mathSchema := wsCfg.Brand.MathSchema
+		if err := db.ValidateSchemaIdentifier(mathSchema); err != nil {
+			fmt.Fprintf(os.Stderr, "Fatal: Invalid math_schema configuration: %v\n", err)
+			os.Exit(1)
+		}
+
 		counts, err := store.QueryMaps(ctx, fmt.Sprintf(`
 			SELECT
 				GREATEST(
@@ -56,7 +63,7 @@ var coopStatusCmd = &cobra.Command{
 				(SELECT COUNT(*) FROM ctd_artifacts) AS artifacts,
 				(SELECT COUNT(*) FROM (SELECT 1 FROM ctd_traces LIMIT 100000) _bounded_traces) AS traces,
 				(SELECT COUNT(*) FROM %s.pmv_catalog WHERE status = 'certified') AS certified_pmvs
-		`, wsCfg.Brand.MathSchema))
+		`, mathSchema))
 		if err == nil && len(counts) > 0 {
 			c := counts[0]
 			fmt.Printf("  Nodes: %v | Events: %v | Artifacts: %v | Traces: %v | Certified PMVs: %v\n",

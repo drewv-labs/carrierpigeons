@@ -127,14 +127,19 @@ var (
 	activeSpec = Default()
 )
 
-// Active returns the currently active global BrandSpec.
+// Active returns the currently active process-wide BrandSpec.
+//
+// Deprecated: Prefer passing an instance-scoped brand.Spec into coop.New, edge.New,
+// controlplane, and mcpserver.New for multi-tenant isolation.
 func Active() Spec {
 	activeMu.RLock()
 	defer activeMu.RUnlock()
 	return activeSpec
 }
 
-// SetActive updates the global BrandSpec for whitelabeled binaries.
+// SetActive updates the process-wide BrandSpec for standalone CLI binaries.
+//
+// Deprecated: Avoid mutating global brand state in library paths; inject brand.Spec per instance instead.
 func SetActive(spec Spec) {
 	activeMu.Lock()
 	defer activeMu.Unlock()

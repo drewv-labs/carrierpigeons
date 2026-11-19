@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
@@ -58,6 +59,7 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 type adaptersObserver struct{}
 
 func init() {
+	observer.Register(&hostOSObserver{})
 	observer.Register(&adaptersObserver{})
 }
 
@@ -69,11 +71,23 @@ func (a *adaptersObserver) Observe(ctx context.Context, nodeID string, pub core.
 	ObserveAdapters(ctx, pub, nodeID)
 }
 
-// ObserveAdapters initializes all peripheral hardware observer loops bound to ctx.
+// ObserveAdapters runs all peripheral hardware observer loops bound to ctx and blocks until ctx is done.
 func ObserveAdapters(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	go observeGPU(ctx, pub, nodeID)
-	go observeNPU(ctx, pub, nodeID)
-	go observeNet(ctx, pub, nodeID)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		observeGPU(ctx, pub, nodeID)
+	}()
+	go func() {
+		defer wg.Done()
+		observeNPU(ctx, pub, nodeID)
+	}()
+	go func() {
+		defer wg.Done()
+		observeNet(ctx, pub, nodeID)
+	}()
+	wg.Wait()
 }
 
 // StartConfigured launches enabled built-in hardware observers alongside any custom SDK observers in the default registry.
