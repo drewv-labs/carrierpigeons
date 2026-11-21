@@ -5,7 +5,6 @@ import (
 	"log"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -19,7 +18,7 @@ func observeGPUNvidiaWithBin(ctx context.Context, pub core.TelemetryPublisher, n
 		nvidiaBin = "nvidia-smi"
 	}
 
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		out, err := runCommand(
 			ctx,
 			defaultCmdTimeout,
@@ -72,19 +71,5 @@ func observeGPUNvidiaWithBin(ctx context.Context, pub core.TelemetryPublisher, n
 				log.Printf("[Nvidia GPU Observer] Publish failed for %s: %v", componentID, err)
 			}
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

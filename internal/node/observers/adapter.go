@@ -38,6 +38,40 @@ func pollInterval(ctx context.Context) time.Duration {
 	return defaultPollInterval
 }
 
+// runPeriodicObserver executes emit on the configured poll cadence while parking cleanly across PauseController windows
+// without executing syscalls/subprocesses while paused or double-emitting buffered ticks upon resumption.
+func runPeriodicObserver(ctx context.Context, emitOnBoot bool, emit func()) {
+	interval := pollInterval(ctx)
+	if emitOnBoot {
+		if !observer.WaitIfPaused(ctx) {
+			return
+		}
+		emit()
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if observer.IsPaused(ctx) {
+				if !observer.WaitIfPaused(ctx) {
+					return
+				}
+				ticker.Reset(interval)
+				select {
+				case <-ticker.C:
+				default:
+				}
+			}
+			emit()
+		}
+	}
+}
+
 type limitedWriter struct {
 	buf bytes.Buffer
 	max int
@@ -110,6 +144,13 @@ func StartConfiguredWithRegistry(
 	interval time.Duration,
 	reg *observer.Registry,
 ) []string {
+	pc := observer.PauseControllerFromContext(ctx)
+	if pc == nil {
+		pc = observer.NewPauseController()
+		ctx = observer.WithPauseController(ctx, pc)
+	}
+	pub = observer.NewGatedPublisher(pub, pc)
+
 	obsCtx := WithPollInterval(ctx, interval)
 	var active []string
 

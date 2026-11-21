@@ -69,6 +69,10 @@ func (r *Registry) Names() []string {
 
 // StartAll launches every registered Observer in r concurrently under ctx.
 func (r *Registry) StartAll(ctx context.Context, nodeID string, pub core.TelemetryPublisher) {
+	if pc := PauseControllerFromContext(ctx); pc != nil && pub != nil {
+		pub = NewGatedPublisher(pub, pc)
+	}
+
 	r.mu.RLock()
 	list := make([]Observer, 0, len(r.items))
 	for _, o := range r.items {

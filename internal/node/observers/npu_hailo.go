@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -42,7 +41,7 @@ func observeNPUHailo(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 		ticks         int
 	)
 
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		if (ticks == 0 || ticks%60 == 0) && hasHailoDeviceNode() {
 			if scanned := scanHailoDevices(ctx); len(scanned) > 0 {
 				cachedDevices = scanned
@@ -82,21 +81,7 @@ func observeNPUHailo(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 				log.Printf("[Hailo NPU Observer] Publish failed for %s: %v", componentID, err)
 			}
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }
 
 func scanHailoDevices(ctx context.Context) []string {

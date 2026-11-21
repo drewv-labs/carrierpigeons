@@ -11,6 +11,7 @@ import (
 
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -19,19 +20,20 @@ const maxPipelinedPublishes = 64
 
 // Options configures a node's MQTT relay, ring-buffer spool, LWT presence, TLS, and NodeHello metadata.
 type Options struct {
-	BrokerURL      string
-	NodeID         string
-	ClientPrefix   string
-	TopicPrefix    string
-	Brand          brand.Spec
-	SpoolCapacity  int
-	BootTags       []string
-	Username       string
-	Password       string
-	TLSConfig      *tls.Config
-	Meta           map[string]string
-	RunnerPolicy   runner.ExecutionPolicy
-	RunnerRegistry *runner.Registry
+	BrokerURL       string
+	NodeID          string
+	ClientPrefix    string
+	TopicPrefix     string
+	Brand           brand.Spec
+	SpoolCapacity   int
+	BootTags        []string
+	Username        string
+	Password        string
+	TLSConfig       *tls.Config
+	Meta            map[string]string
+	RunnerPolicy    runner.ExecutionPolicy
+	RunnerRegistry  *runner.Registry
+	PauseController *observer.PauseController
 }
 
 // MQTTClient manages the MQTT connection, LWT presence, NodeHello boot announcement, and variable ring spool.
@@ -44,6 +46,7 @@ type MQTTClient struct {
 	meta         map[string]string
 	runnerPolicy runner.ExecutionPolicy
 	runnerReg    *runner.Registry
+	pauseCtrl    *observer.PauseController
 	spool        *RingSpool
 	stopCh       chan struct{}
 	flushDone    chan struct{}
@@ -96,6 +99,10 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 	if cfg.SpoolCapacity <= 0 {
 		cfg.SpoolCapacity = DefaultSpoolCapacity
 	}
+	pauseCtrl := cfg.PauseController
+	if pauseCtrl == nil {
+		pauseCtrl = observer.NewPauseController()
+	}
 
 	c := &MQTTClient{
 		nodeID:       cfg.NodeID,
@@ -105,6 +112,7 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 		meta:         cfg.Meta,
 		runnerPolicy: cfg.RunnerPolicy,
 		runnerReg:    cfg.RunnerRegistry,
+		pauseCtrl:    pauseCtrl,
 		spool:        NewRingSpool(cfg.SpoolCapacity),
 		stopCh:       make(chan struct{}),
 		flushDone:    make(chan struct{}),

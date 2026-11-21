@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -29,7 +28,7 @@ func observeNPUPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID
 }
 
 func observeNPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		out, err := sampleDarwinPowermetrics(ctx)
 		if err != nil {
 			return
@@ -43,19 +42,5 @@ func observeNPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 				}
 			}
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

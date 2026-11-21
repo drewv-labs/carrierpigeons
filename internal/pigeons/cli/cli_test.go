@@ -37,3 +37,22 @@ func TestBuildRunnerRequestChainedNodesAndBraceTags(t *testing.T) {
 		t.Fatal("expected missing selectors to return validation error")
 	}
 }
+
+func TestBuildRunnerRequestPauseRnrDefaultsSecsZero(t *testing.T) {
+	req, err := buildRunnerRequest("PauseRnr", "operator", true, nil, nil, nil, 0)
+	if err != nil {
+		t.Fatalf("buildRunnerRequest(PauseRnr) failed: %v", err)
+	}
+	dur, exists := req.Params["duration_sec"]
+	if !exists || dur != 0 {
+		t.Fatalf("expected PauseRnr default duration_sec=0, got params=%+v", req.Params)
+	}
+
+	abortReq, err := buildAbortRunnerRequest("PauseRnr", "operator", true, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildAbortRunnerRequest(--all) failed: %v", err)
+	}
+	if abortReq.Action != "abort" || !abortReq.Selectors.All {
+		t.Fatalf("unexpected abort request: %+v", abortReq)
+	}
+}

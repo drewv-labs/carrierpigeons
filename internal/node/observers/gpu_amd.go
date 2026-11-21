@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -54,7 +53,7 @@ func readSysfsFloat(path string) (float64, bool) {
 // observeGPUAMDSysfs reads AMD Radeon / Instinct telemetry directly from Linux `/sys/class/drm/card*/device`
 // without spawning Python `rocm-smi` processes.
 func observeGPUAMDSysfs(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		for _, cardPath := range discoverSysfsAMDCards("/sys") {
 			cardName := filepath.Base(cardPath)
 			devDir := filepath.Join(cardPath, "device")
@@ -102,25 +101,11 @@ func observeGPUAMDSysfs(ctx context.Context, pub core.TelemetryPublisher, nodeID
 				}
 			}
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }
 
 func observeGPUAMD(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		out, err := runCommand(ctx, defaultCmdTimeout, "rocm-smi", "--showtemp", "--showuse", "--showfan", "--showmeminfo", "vram", "--json")
 		if err != nil {
 			log.Printf("[AMD GPU Observer] Sensor timeout: %v", err)
@@ -166,19 +151,5 @@ func observeGPUAMD(ctx context.Context, pub core.TelemetryPublisher, nodeID stri
 				log.Printf("[AMD GPU Observer] Publish failed for %s: %v", cardName, err)
 			}
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

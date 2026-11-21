@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
@@ -138,10 +139,90 @@ func TestBenchmarkRunnerRespectsMaxTimeoutSec(t *testing.T) {
 	})
 	start := time.Now()
 	_ = b.Run(polCtx, "edge-01", map[string]any{
-		"duration_secs": 30,
-		"threads":       1,
+		"duration_sec": 30,
+		"threads":      1,
 	}, pub)
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("expected MaxTimeoutSec=1 to clamp duration_secs=30, took %s", elapsed)
+		t.Fatalf("expected MaxTimeoutSec=1 to clamp duration_sec=30, took %s", elapsed)
+	}
+}
+
+func TestPauseRunnerIndefiniteDefaultAndTimedResume(t *testing.T) {
+	if _, ok := runner.Get("PauseRnr"); !ok {
+		t.Fatal("expected PauseRnr alias to be registered")
+	}
+	if runner.CanonicalKey("PauseRnr") != "pause" {
+		t.Fatalf("CanonicalKey(PauseRnr) = %q, want %q", runner.CanonicalKey("PauseRnr"), "pause")
+	}
+
+	pc := observer.NewPauseController()
+	basePub := &memPublisher{}
+	obsPub := observer.NewGatedPublisher(basePub, pc)
+
+	// 1. Indefinite default (--secs=0 / omitted) pauses observers until aborted.
+	runCtx, abortPause := context.WithCancel(observer.WithPauseController(context.Background(), pc))
+	doneCh := make(chan error, 1)
+	p := &PauseRunner{}
+
+	go func() {
+		doneCh <- p.Run(runCtx, "edge-01", map[string]any{
+			"request_id": "req-pause-01",
+			"invoked_as": "PauseRnr",
+		}, obsPub)
+	}()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !pc.IsPaused() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !pc.IsPaused() {
+		t.Fatal("expected PauseRnr to pause PauseController")
+	}
+
+	// Attempt to emit an observer event while paused -> must be suppressed!
+	_ = obsPub.Publish(core.NewCTDPayload("edge-01", "host-os", "active"))
+
+	abortPause()
+	if err := <-doneCh; err != nil {
+		t.Fatalf("PauseRunner indefinite abort returned unexpected error: %v", err)
+	}
+	if pc.IsPaused() {
+		t.Fatal("expected PauseController to unpause after PauseRnr abort")
+	}
+
+	// Emit observer event after unpause -> must succeed!
+	_ = obsPub.Publish(core.NewCTDPayload("edge-01", "host-os", "active"))
+
+	basePub.mu.Lock()
+	if len(basePub.events) != 3 {
+		t.Fatalf("expected [runner-start, runner-aborted, post-resume host-os] (3 events), got %d", len(basePub.events))
+	}
+	if basePub.events[0].Component != "runner:PauseRnr" || basePub.events[0].Status != "runner-start" || basePub.events[0].Metrics["mode"] != "indefinite" {
+		t.Fatalf("unexpected start bookend: %+v", basePub.events[0])
+	}
+	if basePub.events[1].Status != "runner-aborted" {
+		t.Fatalf("expected runner-aborted on canceled indefinite pause, got %q", basePub.events[1].Status)
+	}
+	if basePub.events[2].Component != "host-os" {
+		t.Fatalf("expected post-resume host-os event, got %q", basePub.events[2].Component)
+	}
+	basePub.mu.Unlock()
+
+	// 2. Timed pause (--secs=1) ignores MaxTimeoutSec=0/small policies and closes with runner-end.
+	timedPub := &memPublisher{}
+	timedCtx := observer.WithPauseController(context.Background(), pc)
+	if err := p.Run(timedCtx, "edge-01", map[string]any{
+		"duration_sec": 1,
+		"invoked_as":   "PauseRnr",
+	}, timedPub); err != nil {
+		t.Fatalf("timed PauseRnr failed: %v", err)
+	}
+	if pc.IsPaused() {
+		t.Fatal("expected timed PauseRnr to unpause upon completion")
+	}
+	timedPub.mu.Lock()
+	defer timedPub.mu.Unlock()
+	if len(timedPub.events) != 2 || timedPub.events[1].Status != "runner-end" || timedPub.events[0].Metrics["mode"] != "timed" {
+		t.Fatalf("unexpected timed PauseRnr bookends: %+v", timedPub.events)
 	}
 }

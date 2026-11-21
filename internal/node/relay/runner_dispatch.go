@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -104,6 +105,9 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		}
 
 		baseCtx := runner.WithExecutionPolicy(parentCtx, c.runnerPolicy)
+		if observer.PauseControllerFromContext(baseCtx) == nil && c.pauseCtrl != nil {
+			baseCtx = observer.WithPauseController(baseCtx, c.pauseCtrl)
+		}
 		runCtx, cancel := context.WithCancel(baseCtx)
 		runID := seq.Add(1)
 		activeRunners[runnerKey] = &activeRun{id: runID, cancel: cancel}

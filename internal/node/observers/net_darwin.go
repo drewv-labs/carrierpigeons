@@ -10,7 +10,6 @@ import (
 	"net"
 	"strings"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
@@ -105,17 +104,7 @@ func emitDarwinNetSamples(pub core.TelemetryPublisher, nodeID string) {
 }
 
 func observeNetDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emitDarwinNetSamples(pub, nodeID)
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emitDarwinNetSamples(pub, nodeID)
-		}
-	}
+	runPeriodicObserver(ctx, true, func() {
+		emitDarwinNetSamples(pub, nodeID)
+	})
 }

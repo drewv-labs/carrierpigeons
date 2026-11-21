@@ -31,6 +31,7 @@ type Options struct {
 	ExtraRunners     []runner.Runner
 	ObserverRegistry *observer.Registry
 	RunnerRegistry   *runner.Registry
+	PauseController  *observer.PauseController
 }
 
 // Agent encapsulates the MQTT-driven Observer + Runner runtime with variable-size ring spooling.
@@ -40,6 +41,7 @@ type Agent struct {
 	opts      Options
 	obsReg    *observer.Registry
 	runnerReg *runner.Registry
+	pauseCtrl *observer.PauseController
 	relay     *relay.MQTTClient
 
 	stopOnce sync.Once
@@ -77,12 +79,23 @@ func New(cfg config.EdgeConfig, opts ...Options) *Agent {
 		runnerReg.Register(r)
 	}
 
+	pauseCtrl := opt.PauseController
+	if pauseCtrl == nil {
+		pauseCtrl = observer.NewPauseController()
+	}
+
 	return &Agent{
 		cfg:       cfg,
 		opts:      opt,
 		obsReg:    obsReg,
 		runnerReg: runnerReg,
+		pauseCtrl: pauseCtrl,
 	}
+}
+
+// PauseController returns the node's isolated observer PauseController for SDK callers.
+func (a *Agent) PauseController() *observer.PauseController {
+	return a.pauseCtrl
 }
 
 // Start connects (or spools offline) to the MQTT broker, binds Runner control topics, and launches Observers.
@@ -109,6 +122,7 @@ func (a *Agent) Start(parentCtx context.Context) error {
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	a.cancel = cancel
+	ctx = observer.WithPauseController(ctx, a.pauseCtrl)
 
 	execPolicy := runner.ExecutionPolicy{
 		AllowEphemeral:      a.cfg.Runners.AllowEphemeral,
@@ -118,19 +132,20 @@ func (a *Agent) Start(parentCtx context.Context) error {
 	}
 
 	a.relay = relay.NewMQTTClientWithOptions(relay.Options{
-		BrokerURL:      a.cfg.BrokerURL,
-		NodeID:         a.cfg.NodeID,
-		ClientPrefix:   a.opts.ClientPrefix,
-		TopicPrefix:    a.cfg.TopicPrefix,
-		Brand:          a.cfg.Brand,
-		SpoolCapacity:  a.cfg.SpoolCapacity,
-		BootTags:       a.cfg.Tags,
-		Username:       username,
-		Password:       password,
-		TLSConfig:      tlsCfg,
-		Meta:           a.opts.Meta,
-		RunnerPolicy:   execPolicy,
-		RunnerRegistry: a.runnerReg,
+		BrokerURL:       a.cfg.BrokerURL,
+		NodeID:          a.cfg.NodeID,
+		ClientPrefix:    a.opts.ClientPrefix,
+		TopicPrefix:     a.cfg.TopicPrefix,
+		Brand:           a.cfg.Brand,
+		SpoolCapacity:   a.cfg.SpoolCapacity,
+		BootTags:        a.cfg.Tags,
+		Username:        username,
+		Password:        password,
+		TLSConfig:       tlsCfg,
+		Meta:            a.opts.Meta,
+		RunnerPolicy:    execPolicy,
+		RunnerRegistry:  a.runnerReg,
+		PauseController: a.pauseCtrl,
 	})
 
 	if a.cfg.Runners.Enabled {

@@ -7,7 +7,6 @@ import (
 	"log"
 	"math"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
@@ -35,7 +34,7 @@ type memoryStatusEx struct {
 func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	log.Println("[OS Observer] Windows host detected (zero-fork Win32 GlobalMemoryStatusEx observer).")
 
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		var mem memoryStatusEx
 		mem.Length = uint32(unsafe.Sizeof(mem))
 		r1, _, _ := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&mem)))
@@ -61,19 +60,5 @@ func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 		if err := pub.Publish(event); err != nil {
 			log.Printf("[Windows OS Observer] Publish failed: %v", err)
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

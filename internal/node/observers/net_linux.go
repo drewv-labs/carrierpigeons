@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -88,17 +87,7 @@ func emitProcNetDevSamples(pub core.TelemetryPublisher, nodeID string, allowBrid
 }
 
 func observeNetLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emitProcNetDevSamples(pub, nodeID, false)
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emitProcNetDevSamples(pub, nodeID, false)
-		}
-	}
+	runPeriodicObserver(ctx, true, func() {
+		emitProcNetDevSamples(pub, nodeID, false)
+	})
 }

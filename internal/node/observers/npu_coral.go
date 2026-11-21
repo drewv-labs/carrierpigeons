@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -15,7 +14,7 @@ import (
 func observeNPUCoral(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	basePath := "/sys/class/apex"
 
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		devices, err := filepath.Glob(filepath.Join(basePath, "apex_*"))
 		if err != nil || len(devices) == 0 {
 			return
@@ -42,19 +41,5 @@ func observeNPUCoral(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 				log.Printf("[Coral NPU Observer] Publish failed for %s: %v", devName, err)
 			}
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

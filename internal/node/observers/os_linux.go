@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -109,24 +108,9 @@ func collectLinuxHostSample(nodeID string) *core.CTDPayload {
 }
 
 func observeOSLinux(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		if err := pub.Publish(collectLinuxHostSample(nodeID)); err != nil {
 			log.Printf("[OS Observer] Publish failed: %v", err)
 		}
-	}
-
-	// Emit immediate initial telemetry on boot before waiting for first ticker cycle.
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

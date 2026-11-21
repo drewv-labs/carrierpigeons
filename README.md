@@ -121,46 +121,6 @@ Because `pigeoneer` links only the Go standard library, `BurntSushi/toml`, and `
 
 <div align="center">
 
-## Project Structure
-
-</div>
-
-~~~sh
-└── /
-    ├── cmd/
-    │   ├── pigeoncoop/     # Embedded MQTT broker + batched COPY ledger hub (with self-observation)
-    │   ├── pigeoneer/      # Lightweight edge observer + runner daemon
-    │   ├── pigeonmcp/      # Read-only Model Context Protocol (MCP) server (stdio & HTTP)
-    │   └── pigeons/        # Workstation CLI & 4-tab TUI control plane
-    ├── configs/            # Example TOML configs (pigeoncoop, pigeoneer, pigeons)
-    ├── deployments/
-    │   ├── compose/        # PostgreSQL 18 + Ntfy (+ optional external Mosquitto) Compose stack
-    │   └── install-pigeoneer.sh
-    ├── internal/
-    │   ├── node/           # Shared Observer, variable RingSpool relay, & Runner runtime
-    │   ├── pigeoncare/     # Read-only diagnostic agent & Default/AutoEdit/YOLO PolicyGate
-    │   ├── pigeoncoop/     # Embedded mochi-mqtt server, COPY batcher, & RunnerRequestCTD router
-    │   ├── pigeonmath/     # 1-min rollup analytics & certified pigeonmath.pmv_* view engine
-    │   └── pigeons/        # Cobra CLI commands & 4-tab Bubble Tea TUI dashboard
-    └── pkg/                # Whitelabelable public Go SDK surface
-        ├── adapters/
-        │   ├── db/         # BaseDB, ReadOnlyDB, AgentSafeDB, & PostgresStore (pgx CopyFrom)
-        │   └── llm/        # Ollama, Claude, OpenAI, vLLM, & llama.cpp inference adapters
-        ├── brand/          # Whitelabel BrandSpec identity, topics, & color palette
-        ├── config/         # Layered TOML + environment configuration loaders
-        ├── controlplane/   # Embeddable Pigeons CLI/TUI SDK entrypoint
-        ├── coop/           # Embeddable PigeonCoop hub server SDK
-        ├── core/           # Canonical CTDPayload, NodeHello, & RunnerRequestCTD contracts
-        ├── edge/           # Embeddable Pigeoneer edge agent SDK
-        ├── mcpserver/      # Embeddable PigeonMCP server SDK
-        ├── observer/       # Extensible Observer registry
-        └── runner/         # Extensible Runner registry, ExecutionPolicy, & EphemeralSpec
-~~~
-
----
-
-<div align="center">
-
 <img src=".github/images/pigeon.gif" alt="pigeon.gif" width="30"/>
 // Built by
 

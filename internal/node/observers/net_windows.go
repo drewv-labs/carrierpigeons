@@ -8,7 +8,6 @@ import (
 	"log"
 	"strconv"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
@@ -140,17 +139,7 @@ func emitWindowsNetSamples(pub core.TelemetryPublisher, nodeID string) {
 }
 
 func observeNetWindows(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emitWindowsNetSamples(pub, nodeID)
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emitWindowsNetSamples(pub, nodeID)
-		}
-	}
+	runPeriodicObserver(ctx, true, func() {
+		emitWindowsNetSamples(pub, nodeID)
+	})
 }

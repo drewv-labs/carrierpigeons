@@ -1284,6 +1284,7 @@ func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold tim
 			GREATEST(COALESCE(l.event_timestamp, TIMESTAMPTZ 'epoch'), COALESCE(n.last_seen, TIMESTAMPTZ 'epoch')) AS last_seen,
 			CASE
 				WHEN n.status = 'OFFLINE' THEN 'OFFLINE'
+				WHEN pause_rnr.status = 'runner-start' THEN 'paused'
 				ELSE COALESCE(l.status, n.status, 'unknown')
 			END AS status,
 			COALESCE(os_obs.metrics, '{}'::jsonb) || COALESCE(l.metrics, '{}'::jsonb) AS metrics
@@ -1303,6 +1304,14 @@ func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold tim
 			ORDER BY h.event_timestamp DESC
 			LIMIT 1
 		) os_obs ON true
+		LEFT JOIN LATERAL (
+			SELECT status
+			FROM telemetric_ledger p
+			WHERE p.node_id = k.node_id
+			  AND p.component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr')
+			ORDER BY p.event_timestamp DESC
+			LIMIT 1
+		) pause_rnr ON true
 		ORDER BY k.node_id ASC
 	`)
 	if err != nil {
@@ -1325,7 +1334,7 @@ func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold tim
 		if len(metricsBytes) > 0 {
 			_ = json.Unmarshal(metricsBytes, &ns.LatestMetrics)
 		}
-		ns.IsHealthy = ns.LastSeen.After(cutoff) && !isAbnormalStatus(ns.Status)
+		ns.IsHealthy = (strings.EqualFold(ns.Status, "paused") || ns.LastSeen.After(cutoff)) && !isAbnormalStatus(ns.Status)
 		summaries = append(summaries, ns)
 	}
 	return summaries, rows.Err()

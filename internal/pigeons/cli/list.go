@@ -44,7 +44,9 @@ var listCmd = &cobra.Command{
 				continue
 			}
 			status := "active"
-			if !n.IsHealthy {
+			if strings.EqualFold(n.Status, "paused") {
+				status = "paused"
+			} else if !n.IsHealthy {
 				if time.Since(n.LastSeen) > config.DefaultHealthyWindow {
 					status = "offline"
 				} else {

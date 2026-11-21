@@ -8,7 +8,6 @@ import (
 	"os"
 	"regexp"
 	"strconv"
-	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -29,7 +28,7 @@ func observeGPUPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID
 }
 
 func observeGPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		output, err := sampleDarwinPowermetrics(ctx)
 		if err != nil {
 			log.Printf("[Darwin GPU Observer] Failed to read powermetrics: %v", err)
@@ -58,19 +57,5 @@ func observeGPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID s
 				log.Printf("[Darwin GPU Observer] Publish failed: %v", err)
 			}
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

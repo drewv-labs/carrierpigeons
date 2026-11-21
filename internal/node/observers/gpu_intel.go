@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 )
 
 func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
@@ -16,13 +17,17 @@ func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 	const maxBackoff = 30 * time.Second
 
 	for {
-		if ctx.Err() != nil {
+		if !observer.WaitIfPaused(ctx) {
 			return
 		}
 		startedAt := time.Now()
 		runIntelGPUTopOnce(ctx, pub, nodeID)
 		if ctx.Err() != nil {
 			return
+		}
+		if observer.IsPaused(ctx) {
+			backoff = time.Second
+			continue
 		}
 		if time.Since(startedAt) >= 30*time.Second {
 			backoff = time.Second
@@ -40,8 +45,11 @@ func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID st
 }
 
 func runIntelGPUTopOnce(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	streamCtx, cancelStream := observer.ContextUntilPaused(ctx)
+	defer cancelStream()
+
 	intervalMs := max(pollInterval(ctx).Milliseconds(), int64(250))
-	cmd := exec.CommandContext(ctx, "intel_gpu_top", "-J", "-s", strconv.FormatInt(intervalMs, 10))
+	cmd := exec.CommandContext(streamCtx, "intel_gpu_top", "-J", "-s", strconv.FormatInt(intervalMs, 10))
 	configureProcessGroup(cmd)
 	cmd.WaitDelay = 2 * time.Second
 
@@ -62,7 +70,9 @@ func runIntelGPUTopOnce(ctx context.Context, pub core.TelemetryPublisher, nodeID
 
 	decoder := json.NewDecoder(stdout)
 	if _, err := decoder.Token(); err != nil {
-		log.Printf("[Intel GPU Observer] Failed to read opening JSON bracket: %v", err)
+		if streamCtx.Err() == nil {
+			log.Printf("[Intel GPU Observer] Failed to read opening JSON bracket: %v", err)
+		}
 		return
 	}
 
@@ -70,14 +80,16 @@ func runIntelGPUTopOnce(ctx context.Context, pub core.TelemetryPublisher, nodeID
 
 	for decoder.More() {
 		select {
-		case <-ctx.Done():
+		case <-streamCtx.Done():
 			return
 		default:
 		}
 
 		var data map[string]any
 		if err := decoder.Decode(&data); err != nil {
-			log.Printf("[Intel GPU Observer] JSON stream decode error: %v", err)
+			if streamCtx.Err() == nil {
+				log.Printf("[Intel GPU Observer] JSON stream decode error: %v", err)
+			}
 			break
 		}
 
@@ -102,7 +114,7 @@ func runIntelGPUTopOnce(ctx context.Context, pub core.TelemetryPublisher, nodeID
 		}
 	}
 
-	if ctx.Err() == nil {
+	if streamCtx.Err() == nil {
 		log.Println("[Intel GPU Observer] intel_gpu_top stream ended.")
 	}
 }

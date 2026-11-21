@@ -69,9 +69,22 @@ func parseRunnerKeyValueParams(pairs []string) map[string]any {
 	return params
 }
 
+func isPauseRunnerName(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	return strings.EqualFold(trimmed, "PauseRnr") || strings.EqualFold(trimmed, "pause")
+}
+
 func buildRunnerRequest(runnerName, operator string, all bool, nodes, tags, kvPairs []string, durationSec int) (core.RunnerRequestCTD, error) {
+	trimmedRunner := strings.TrimSpace(runnerName)
 	params := parseRunnerKeyValueParams(kvPairs)
-	if durationSec > 0 {
+	if isPauseRunnerName(trimmedRunner) {
+		if durationSec < 0 {
+			durationSec = 0
+		}
+		if _, exists := params["duration_sec"]; !exists {
+			params["duration_sec"] = durationSec
+		}
+	} else if durationSec > 0 {
 		if _, exists := params["duration_sec"]; !exists {
 			params["duration_sec"] = durationSec
 		}
@@ -80,7 +93,7 @@ func buildRunnerRequest(runnerName, operator string, all bool, nodes, tags, kvPa
 	req := core.RunnerRequestCTD{
 		RequestID: fmt.Sprintf("req-%d", time.Now().UTC().UnixNano()),
 		Action:    "start",
-		Runner:    strings.TrimSpace(runnerName),
+		Runner:    trimmedRunner,
 		Selectors: core.RunnerSelector{
 			All:   all,
 			Nodes: cleanSelectorTokens(nodes, false),
@@ -96,7 +109,9 @@ func buildRunnerRequest(runnerName, operator string, all bool, nodes, tags, kvPa
 var runCmd = &cobra.Command{
 	Use:   "run <runner_name>",
 	Short: "Send a RunnerRequestCTD to PigeonCoop (--all / --node / --tag) and launch RunnerManager TUI",
-	Example: `  pigeons run SyntheticComputeRnr --node=rv64-compute-01 --node=rv64-vision-02 --tag={compute-bench}
+	Example: `  pigeons run PauseRnr --all
+  pigeons run PauseRnr --node=rv64-compute-01 --secs=60
+  pigeons run SyntheticComputeRnr --node=rv64-compute-01 --node=rv64-vision-02 --tag={compute-bench}
   pigeons run benchmark --all --secs 30 --param target_system=true`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(_ *cobra.Command, args []string) error {
@@ -126,6 +141,6 @@ func init() {
 	runCmd.Flags().StringArrayVar(&runNodes, "node", nil, "Target node ID (repeatable, chainable with --tag)")
 	runCmd.Flags().StringArrayVar(&runTags, "tag", nil, "Target node tag (repeatable, e.g. --tag=compute-bench or --tag={gpu-worker})")
 	runCmd.Flags().StringArrayVarP(&runKV, "param", "p", nil, "Runner key=value parameter (repeatable)")
-	runCmd.Flags().IntVar(&runSecs, "secs", 0, "Optional duration_sec parameter override")
+	runCmd.Flags().IntVar(&runSecs, "secs", 0, "Optional duration_sec override (defaults to 0 = indefinite for PauseRnr)")
 	runCmd.Flags().BoolVar(&runNoTUI, "no-tui", false, "Return immediately after dispatching RunnerRequestCTD without opening TUI")
 }

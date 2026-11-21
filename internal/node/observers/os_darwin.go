@@ -101,7 +101,7 @@ func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 		memTotalMB = math.Round((float64(memBytes)/1024.0/1024.0)*10) / 10
 	}
 
-	emit := func() {
+	runPeriodicObserver(ctx, true, func() {
 		event := core.NewCTDPayload(nodeID, "host-os", "active")
 		if memTotalMB > 0 {
 			event.AddMetric("mem_total_mb", memTotalMB)
@@ -165,19 +165,5 @@ func observeOSPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID 
 		if err := pub.Publish(event); err != nil {
 			log.Printf("[OS Observer] Publish failed: %v", err)
 		}
-	}
-
-	emit()
-
-	ticker := time.NewTicker(pollInterval(ctx))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
+	})
 }

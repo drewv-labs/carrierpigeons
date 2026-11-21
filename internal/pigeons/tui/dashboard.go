@@ -690,7 +690,9 @@ func (m DashboardModel) renderOverview(box lipgloss.Style) string {
 			tempC = fmt.Sprint(v)
 		}
 		state := "ONLINE"
-		if !n.IsHealthy {
+		if strings.EqualFold(n.Status, "paused") {
+			state = "PAUSED"
+		} else if !n.IsHealthy {
 			state = strings.ToUpper(n.Status)
 		}
 		ago := time.Since(n.LastSeen).Round(time.Second)

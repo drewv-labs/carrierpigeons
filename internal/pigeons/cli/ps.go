@@ -53,7 +53,10 @@ var psCmd = &cobra.Command{
 			detail := "clean"
 
 			timeSince := time.Since(n.LastSeen)
-			if timeSince > config.DefaultHealthyWindow {
+			if strings.EqualFold(n.Status, "paused") {
+				state = "paused"
+				detail = "observers paused (PauseRnr)"
+			} else if timeSince > config.DefaultHealthyWindow {
 				state = "offline"
 				detail = fmt.Sprintf("unreachable (%.0fm ago)", timeSince.Minutes())
 				needsSupport = true
