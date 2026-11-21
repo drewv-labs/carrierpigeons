@@ -127,7 +127,7 @@ Because `pigeoneer` links only the Go standard library, `BurntSushi/toml`, and `
 </div>
 
 ```go
-package drewvlabs // Drew Vandagriff — Dallas, TX
+package drewvlabs // Indie Data Systems R&D
 
 var Ethos = [5]string{
 	"Simplicity in Architecture",
