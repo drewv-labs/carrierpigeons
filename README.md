@@ -7,7 +7,7 @@
 
 # CarrierPigeons
 
-**Continuous Telemetric Documentation Mesh,<br>
+**Continuous Telemetric Documentation Mesh<br>
 & Distributed Execution Harness**<br>
 *Release the Pigeons!*  
 
