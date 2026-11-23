@@ -18,8 +18,7 @@ type ReadOnlyOptions struct {
 	MathSchema     string
 }
 
-// ReadOnlyAgentStore wraps a PostgresStore behind the narrow AgentSafeDB capability boundary,
-// physically withholding all write/mutation methods against the public CTD Ledger.
+// ReadOnlyAgentStore wraps a PostgresStore behind the narrow AgentSafeDB capability boundary,\n// physically withholding all write/mutation methods against the public CTD Ledger.
 type ReadOnlyAgentStore struct {
 	inner     *PostgresStore
 	ownsInner bool
@@ -72,6 +71,10 @@ func (r *ReadOnlyAgentStore) Close() {
 	if r.ownsInner && r.inner != nil {
 		r.inner.Close()
 	}
+}
+
+func (r *ReadOnlyAgentStore) GetMeshIdentity(ctx context.Context) (*core.MeshIdentity, error) {
+	return r.inner.GetMeshIdentity(ctx)
 }
 
 func (r *ReadOnlyAgentStore) GetClusterStatus(ctx context.Context, staleThreshold time.Duration) ([]NodeSummary, error) {

@@ -63,6 +63,9 @@ func TestCTDPayloadArtifactAndTrace(t *testing.T) {
 	if p.Trace == nil || p.Trace.Verb != "transformed_into" || p.Trace.NodeID != "rv64-compute-01" {
 		t.Fatalf("unexpected TraceEdge: %+v", p.Trace)
 	}
+	if got := MeshTopic(); got != "pigeons/registry/mesh" {
+		t.Fatalf("unexpected MeshTopic: %q", got)
+	}
 	if got := RegistryTopic("node-a"); got != "pigeons/registry/node-a/status" {
 		t.Fatalf("unexpected RegistryTopic: %q", got)
 	}
@@ -74,6 +77,44 @@ func TestCTDPayloadArtifactAndTrace(t *testing.T) {
 	}
 	if got := RunnerRequestTopic(); got != "pigeons/requests/runner" {
 		t.Fatalf("unexpected RunnerRequestTopic: %q", got)
+	}
+}
+
+func TestValidateMeshNameRFC1123KebabCase(t *testing.T) {
+	valid := []string{
+		"a",
+		"0",
+		"default",
+		"rv64-lab",
+		"compute-mesh-01",
+		"sensor-fabric-west",
+		strings.Repeat("a", 63),
+	}
+	for _, name := range valid {
+		if err := ValidateMeshName(name); err != nil {
+			t.Fatalf("expected ValidateMeshName(%q) to succeed, got %v", name, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"-leading",
+		"trailing-",
+		"-",
+		"UpperCase",
+		"Mixed-Case",
+		"under_score",
+		"dot.domain",
+		"slash/path",
+		"space name",
+		"wild+card",
+		"wild#card",
+		strings.Repeat("a", 64),
+	}
+	for _, name := range invalid {
+		if err := ValidateMeshName(name); err == nil {
+			t.Fatalf("expected ValidateMeshName(%q) to fail", name)
+		}
 	}
 }
 
@@ -107,7 +148,7 @@ func TestNormalizeTagsAndRunnerRequestValidate(t *testing.T) {
 			t.Fatalf("expected ValidateTopicToken(%q) to fail", bad)
 		}
 	}
-	for _, good := range []string{"rv64-compute-01", "runner:SyntheticComputeRnr", "host_os.01", "10.0.10.1"} {
+	for _, good := range []string{"rv64-compute-01", "runner:SyntheticComputeRnr", "host_os.01", "192.0.2.1"} {
 		if err := ValidateTopicToken(good); err != nil {
 			t.Fatalf("expected ValidateTopicToken(%q) to succeed, got %v", good, err)
 		}

@@ -98,6 +98,10 @@ func (s Spec) TelemetryWildcard() string {
 	return s.CTDPrefix() + "/#"
 }
 
+func (s Spec) MeshTopic() string {
+	return fmt.Sprintf("%s/registry/mesh", s.MergeWithDefaults().TopicRoot)
+}
+
 func (s Spec) RegistryTopic(nodeID string) string {
 	return fmt.Sprintf("%s/registry/%s/status", s.MergeWithDefaults().TopicRoot, nodeID)
 }

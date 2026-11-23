@@ -14,6 +14,9 @@ import (
 
 type stubSafeDB struct{}
 
+func (s *stubSafeDB) GetMeshIdentity(context.Context) (*core.MeshIdentity, error) {
+	return &core.MeshIdentity{MeshName: core.DefaultMeshName, CoopNodeID: "rv64-coop-01"}, nil
+}
 func (s *stubSafeDB) GetClusterStatus(context.Context, time.Duration) ([]db.NodeSummary, error) {
 	return []db.NodeSummary{{NodeID: "rv64-compute-01", Arch: "riscv64", Status: "active", IsHealthy: true}}, nil
 }

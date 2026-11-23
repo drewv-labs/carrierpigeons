@@ -12,7 +12,37 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 )
 
-var validTopicTokenRe = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,128}$`)
+var (
+	validTopicTokenRe = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,128}$`)
+	validMeshNameRe   = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+)
+
+// DefaultMeshName is the default Mesh Name System (MNS) identifier when mesh_name is omitted.
+const DefaultMeshName = "default"
+
+// ValidateMeshName enforces RFC 1123 lowercase kebab-case DNS hostname label rules (1..63 bytes,
+// strictly [a-z0-9-], starting and ending with an alphanumeric character).
+func ValidateMeshName(name string) error {
+	if name == "" {
+		return fmt.Errorf("mesh name cannot be empty")
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("mesh name %q exceeds 63-byte RFC 1123 hostname label limit (%d bytes)", name, len(name))
+	}
+	if !validMeshNameRe.MatchString(name) {
+		return fmt.Errorf("mesh name %q must be lowercase kebab-case RFC 1123 hostname label (^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$)", name)
+	}
+	return nil
+}
+
+// MeshIdentity represents the registered Mesh Name System (MNS) record advertised by PigeonCoop
+// in the PostgreSQL CTD Ledger and on the retained MQTT mesh registry topic.
+type MeshIdentity struct {
+	MeshName   string    `json:"mesh_name"`
+	CoopNodeID string    `json:"coop_node_id"`
+	TopicRoot  string    `json:"topic_root,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
 
 // ValidateTopicToken enforces safe MQTT topic-segment identifiers (node IDs, pillars, components, tags, runner names).
 // Explicitly rejects wildcards (+, #), path separators (/), NUL bytes, whitespace, and control characters.
@@ -37,6 +67,8 @@ const (
 	DefaultTopicPrefix = "pigeons/ctd"
 	// DefaultTelemetryWildcard subscribes to all pillars, nodes, and components.
 	DefaultTelemetryWildcard = "pigeons/ctd/#"
+	// DefaultMeshTopic is the retained MQTT topic advertising PigeonCoop's MNS identity.
+	DefaultMeshTopic = "pigeons/registry/mesh"
 	// RegistryWildcard subscribes to LWT / presence state changes across all nodes.
 	RegistryWildcard = "pigeons/registry/+/status"
 	// HelloWildcard subscribes to boot metadata & tag announcements across all nodes.
@@ -44,6 +76,11 @@ const (
 	// DefaultRunnerRequestTopic is the Coop control-plane ingress topic for RunnerRequestCTD.
 	DefaultRunnerRequestTopic = "pigeons/requests/runner"
 )
+
+// MeshTopic returns the retained MQTT topic advertising PigeonCoop's MNS identity.
+func MeshTopic() string {
+	return brand.Active().MeshTopic()
+}
 
 // RegistryTopic returns the MQTT presence/LWT topic for a given edge node.
 func RegistryTopic(nodeID string) string {

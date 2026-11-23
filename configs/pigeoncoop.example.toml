@@ -2,6 +2,9 @@
 # PigeonCoop natively observes its own hardware and executes Runners alongside
 # operating the MQTT broker, batched PostgreSQL COPY ingestor, and Ntfy alerting.
 
+# Registered Mesh Name System (MNS) identifier (RFC 1123 lowercase kebab-case).
+# Persisted in `ctd_mesh` and announced on `<topic_root>/registry/mesh` for `pigeons connect <mesh>`.
+mesh_name      = "rv64-lab"
 node_id        = "rv64-coop-01"
 tags           = ["coop", "databroker", "riscv64"]
 self_observe   = true

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/spf13/cobra"
 )
 
@@ -24,10 +25,18 @@ var coopCmd = &cobra.Command{
 
 var coopStatusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "View live MQTT broker, CTD Ledger, and PigeonMath status",
+	Short: "View live MNS identity, MQTT broker, CTD Ledger, and PigeonMath status",
 	Run: func(_ *cobra.Command, _ []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
+		activeMesh := wsCfg.ActiveMesh
+		activeSource := wsCfg.ActiveMeshSource
+		if activeMesh == "" {
+			activeMesh = core.DefaultMeshName
+			activeSource = "default"
+		}
+		fmt.Printf("[Workstation]  mesh=%s (source=%s)\n", activeMesh, activeSource)
 
 		brokerURL := resolveBrokerURL()
 		clientID := fmt.Sprintf("%s-coop-probe-%d", wsCfg.Brand.CLIName, os.Getpid())
@@ -46,6 +55,15 @@ var coopStatusCmd = &cobra.Command{
 		defer store.Close()
 
 		fmt.Printf("[CTD Ledger]   ONLINE\n")
+
+		if meshID, mErr := store.GetMeshIdentity(ctx); mErr == nil && meshID != nil {
+			fmt.Printf("[Mesh (MNS)]   %s (coop=%s, topic_root=%s)\n",
+				meshID.MeshName, meshID.CoopNodeID, meshID.TopicRoot)
+			if wsCfg.ActiveMesh != "" && meshID.MeshName != "" && meshID.MeshName != wsCfg.ActiveMesh {
+				fmt.Printf("[Mesh Warning] MISMATCH: workstation working mesh is %q, but Coop ledger reports %q!\n",
+					wsCfg.ActiveMesh, meshID.MeshName)
+			}
+		}
 
 		mathSchema := wsCfg.Brand.MathSchema
 		if err := db.ValidateSchemaIdentifier(mathSchema); err != nil {
@@ -74,7 +92,7 @@ var coopStatusCmd = &cobra.Command{
 
 var coopMigrateCmd = &cobra.Command{
 	Use:   "migrate",
-	Short: "Idempotently apply the CTD Ledger, Node/Tag Registry, and PigeonMath PostgreSQL schema",
+	Short: "Idempotently apply the CTD Ledger, MNS Registry, Node/Tag Registry, and PigeonMath PostgreSQL schema",
 	Run: func(_ *cobra.Command, _ []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -90,7 +108,7 @@ var coopMigrateCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "Fatal: Schema migration failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("[+] Verified PostgreSQL schema (telemetric_ledger, ctd_nodes, ctd_artifacts, ctd_traces, %s.pmv_catalog).\n",
+		fmt.Printf("[+] Verified PostgreSQL schema (telemetric_ledger, ctd_mesh, ctd_nodes, ctd_artifacts, ctd_traces, %s.pmv_catalog).\n",
 			wsCfg.Brand.MathSchema)
 	},
 }

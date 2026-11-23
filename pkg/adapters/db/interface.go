@@ -65,6 +65,7 @@ type PMVRecord struct {
 // ReadOnlyDB is the strictly read-only CTD Ledger contract exposed to PigeonCare and PigeonMCP.
 // Implementations MUST enforce PostgreSQL READ ONLY transaction semantics against public tables.
 type ReadOnlyDB interface {
+	GetMeshIdentity(ctx context.Context) (*core.MeshIdentity, error)
 	GetClusterStatus(ctx context.Context, staleThreshold time.Duration) ([]NodeSummary, error)
 	ResolveNodes(ctx context.Context, sel core.RunnerSelector) ([]string, error)
 	GetLineageDAG(ctx context.Context, artifactID string, maxDepth int) (*DAG, error)
@@ -99,6 +100,7 @@ type BaseDB interface {
 
 	EnsureSchema(ctx context.Context) error
 	ProvisionRoles(ctx context.Context, ingestPassword, readOnlyPassword string) error
+	UpsertMeshIdentity(ctx context.Context, identity core.MeshIdentity) error
 
 	// High-throughput & single-event CTD ingestion
 	InsertEvent(ctx context.Context, payload *core.CTDPayload) error

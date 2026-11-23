@@ -25,6 +25,7 @@ import (
 type Options struct {
 	Store           db.AgentSafeDB
 	Brand           brand.Spec
+	ActiveMesh      string
 	Optimizer       llm.BaseLLM
 	Version         string
 	AllowWriteViews bool
@@ -55,6 +56,23 @@ func New(opts Options) *server.MCPServer {
 		server.WithToolCapabilities(false),
 		server.WithRecovery(),
 	)
+
+	// 0. get_mesh_identity
+	meshTool := mcp.NewTool("get_mesh_identity",
+		mcp.WithDescription("Return the registered Mesh Name System (MNS) identity of the connected PigeonCoop ledger and workstation active mesh."),
+	)
+	s.AddTool(meshTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		identity, err := opts.Store.GetMeshIdentity(ctx)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Database error: %v", err)), nil
+		}
+		resp := map[string]any{
+			"workstation_active_mesh": opts.ActiveMesh,
+			"coop_mesh_identity":      identity,
+		}
+		raw, _ := json.MarshalIndent(resp, "", "  ")
+		return mcp.NewToolResultText(string(raw)), nil
+	})
 
 	// 1. get_cluster_status
 	clusterTool := mcp.NewTool("get_cluster_status",

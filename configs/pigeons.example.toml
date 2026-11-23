@@ -26,3 +26,17 @@ allowed_script_hashes = []
 
 [math]
 refresh_interval = "60s"
+
+# Optional multi-mesh profiles for `pigeons connect <mesh-name>` ("cwd"-style working mesh switcher).
+# Unset fields inherit top-level `[llm]`, `[permissions]`, `[math]`, and `operator` defaults.
+# Active working mesh is persisted in `~/.config/pigeons/current_mesh` (or overridden via `--mesh` / `PIGEONS_MESH`).
+#
+# [meshes.compute-mesh]
+# broker_url            = "tcp://192.0.2.10:1883"
+# database_url          = "postgres://pigeoncoop_admin:change_me@192.0.2.10:5432/edge_ledger"
+# readonly_database_url = "postgres://pigeoncare_ro:change_me_ro@192.0.2.10:5432/edge_ledger"
+#
+# [meshes.sensor-mesh]
+# broker_url            = "tcp://192.0.2.20:1883"
+# database_url          = "postgres://pigeoncoop_admin:change_me@192.0.2.20:5432/edge_ledger"
+# readonly_database_url = "postgres://pigeoncare_ro:change_me_ro@192.0.2.20:5432/edge_ledger"

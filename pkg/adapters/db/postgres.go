@@ -414,8 +414,29 @@ func (s *PostgresStore) Close() {
 	}
 }
 
-// EnsureSchema migrates the core CTD Ledger tables, Node/Tag Registry, attribution columns, and PigeonMath schema.
+// EnsureSchema migrates the core CTD Ledger tables, Node/Tag Registry, MNS singleton, attribution columns, and PigeonMath schema.
 func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
+	var ready bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+			(
+				SELECT COUNT(*) = 5
+				FROM information_schema.tables
+				WHERE table_schema = 'public'
+				  AND table_name IN ('telemetric_ledger', 'ctd_nodes', 'ctd_artifacts', 'ctd_traces', 'ctd_mesh')
+			)
+			AND
+			(
+				SELECT COUNT(*) = 3
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = 'telemetric_ledger'
+				  AND column_name IN ('ingested_at', 'db_actor', 'app_actor')
+			)
+	`).Scan(&ready); err == nil && ready {
+		return s.EnsureMathSchema(ctx)
+	}
+
 	ddl := `
 	CREATE TABLE IF NOT EXISTS telemetric_ledger (
 		id BIGSERIAL PRIMARY KEY,
@@ -488,11 +509,74 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	ALTER TABLE ctd_traces ADD COLUMN IF NOT EXISTS db_actor TEXT NOT NULL DEFAULT SESSION_USER;
 	CREATE INDEX IF NOT EXISTS idx_traces_source ON ctd_traces (source_id);
 	CREATE INDEX IF NOT EXISTS idx_traces_target ON ctd_traces (target_id);
+
+	CREATE TABLE IF NOT EXISTS ctd_mesh (
+		singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+		mesh_name TEXT NOT NULL CHECK (mesh_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+		coop_node_id TEXT NOT NULL DEFAULT '',
+		topic_root TEXT NOT NULL DEFAULT 'pigeons',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_by TEXT NOT NULL DEFAULT SESSION_USER
+	);
 	`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return err
 	}
 	return s.EnsureMathSchema(ctx)
+}
+
+// UpsertMeshIdentity persists PigeonCoop's registered Mesh Name System (MNS) singleton record in `ctd_mesh`.
+func (s *PostgresStore) UpsertMeshIdentity(ctx context.Context, identity core.MeshIdentity) error {
+	if err := core.ValidateMeshName(identity.MeshName); err != nil {
+		return fmt.Errorf("invalid mesh_name: %w", err)
+	}
+	topicRoot := strings.Trim(strings.TrimSpace(identity.TopicRoot), "/")
+	if topicRoot == "" {
+		topicRoot = "pigeons"
+	}
+	ts := identity.UpdatedAt
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO ctd_mesh (singleton, mesh_name, coop_node_id, topic_root, updated_at, updated_by)
+		VALUES (TRUE, $1, $2, $3, $4, SESSION_USER)
+		ON CONFLICT (singleton) DO UPDATE SET
+			mesh_name    = EXCLUDED.mesh_name,
+			coop_node_id = EXCLUDED.coop_node_id,
+			topic_root   = EXCLUDED.topic_root,
+			updated_at   = EXCLUDED.updated_at,
+			updated_by   = SESSION_USER
+	`, identity.MeshName, strings.TrimSpace(identity.CoopNodeID), topicRoot, ts)
+	return err
+}
+
+// GetMeshIdentity queries the registered MNS singleton record inside a PostgreSQL READ ONLY transaction.
+func (s *PostgresStore) GetMeshIdentity(ctx context.Context) (*core.MeshIdentity, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var out core.MeshIdentity
+	err = tx.QueryRow(ctx, `
+		SELECT mesh_name, coop_node_id, topic_root, updated_at
+		FROM ctd_mesh
+		WHERE singleton = TRUE
+		LIMIT 1
+	`).Scan(&out.MeshName, &out.CoopNodeID, &out.TopicRoot, &out.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &out, nil
 }
 
 // EnsureMathSchema creates the isolated `pigeonmath` analytical schema and `pmv_catalog` intent cache.
@@ -614,7 +698,7 @@ func (s *PostgresStore) ProvisionRoles(ctx context.Context, ingestPassword, read
 
 	GRANT USAGE ON SCHEMA public TO ctd_ingestor;
 	GRANT SELECT, INSERT ON telemetric_ledger, ctd_traces TO ctd_ingestor;
-	GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts TO ctd_ingestor;
+	GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts, ctd_mesh TO ctd_ingestor;
 	GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ctd_ingestor;
 
 	REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM pigeoncare_ro;

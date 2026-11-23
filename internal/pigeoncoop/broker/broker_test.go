@@ -135,6 +135,7 @@ func TestEmbeddedBrokerAndRunnerRequestRouting(t *testing.T) {
 
 	sub, err := NewSubscriberWithOptions(SubscriberOptions{
 		BrokerURL:   emb.LocalClientURL(),
+		MeshName:    "rv64-lab",
 		CoopNodeID:  "rv64-coop-01",
 		NtfyEnabled: false,
 		Ingest: ingest.Options{
@@ -154,6 +155,28 @@ func TestEmbeddedBrokerAndRunnerRequestRouting(t *testing.T) {
 		t.Fatalf("test client connect failed: %v", tok.Error())
 	}
 	defer cli.Disconnect(100)
+
+	// Verify newly connecting workstation client receives the retained MNS identity announcement.
+	meshCh := make(chan core.MeshIdentity, 1)
+	if tok := cli.Subscribe(core.MeshTopic(), 1, func(_ mqtt.Client, m mqtt.Message) {
+		var id core.MeshIdentity
+		if err := json.Unmarshal(m.Payload(), &id); err == nil {
+			select {
+			case meshCh <- id:
+			default:
+			}
+		}
+	}); tok.Wait() && tok.Error() != nil {
+		t.Fatalf("subscribe %s failed: %v", core.MeshTopic(), tok.Error())
+	}
+	select {
+	case id := <-meshCh:
+		if id.MeshName != "rv64-lab" || id.CoopNodeID != "rv64-coop-01" || id.TopicRoot != "pigeons" {
+			t.Fatalf("unexpected retained MeshIdentity: %+v", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for retained MeshIdentity on %s", core.MeshTopic())
+	}
 
 	controlCh := make(chan runner.Envelope, 4)
 	for _, nodeID := range []string{"rv64-compute-01", "arm64-gateway-01"} {
@@ -239,6 +262,7 @@ func TestEmbeddedBrokerAuthAndEdgeTopicACLs(t *testing.T) {
 	ledger := newMemoryLedger()
 	sub, err := NewSubscriberWithOptions(SubscriberOptions{
 		BrokerURL:   emb.LocalClientURL(),
+		MeshName:    "compute-mesh",
 		CoopNodeID:  "coop-01",
 		Username:    "coop_admin",
 		Password:    "admin_secret",
@@ -322,7 +346,10 @@ func TestPerNodeACLHookAndTopicSpoofingGuards(t *testing.T) {
 		t.Fatal("expected edge node to publish to its own registry status topic")
 	}
 
-	// Wildcard and cross-node topics strictly denied
+	// Wildcard, MNS registry, and cross-node topics strictly denied
+	if hook.OnACLCheck(edgeClient, "pigeons/registry/mesh", true) {
+		t.Fatal("expected edge node publish to MNS registry/mesh topic to be denied")
+	}
 	if hook.OnACLCheck(edgeClient, "pigeons/control/+", false) {
 		t.Fatal("expected edge node subscription to control/+ to be denied")
 	}
@@ -346,7 +373,9 @@ func TestPerNodeACLHookAndTopicSpoofingGuards(t *testing.T) {
 			Username: []byte("coop_admin"),
 		},
 	}
-	if !hook.OnACLCheck(adminClient, "pigeons/ctd/#", false) || !hook.OnACLCheck(adminClient, "pigeons/control/rv64-edge-02", true) {
+	if !hook.OnACLCheck(adminClient, "pigeons/ctd/#", false) ||
+		!hook.OnACLCheck(adminClient, "pigeons/control/rv64-edge-02", true) ||
+		!hook.OnACLCheck(adminClient, "pigeons/registry/mesh", true) {
 		t.Fatal("expected admin client to retain full pub/sub across topicRoot")
 	}
 

@@ -48,9 +48,10 @@ type TransitionLedger interface {
 	UpdateNodePresenceTransition(ctx context.Context, nodeID, status string) (prevStatus string, changed bool, err error)
 }
 
-// SubscriberOptions configures Coop's MQTT ingestion, Ntfy alerting, TLS, and COPY batching parameters.
+// SubscriberOptions configures Coop's MQTT ingestion, MNS announcement, Ntfy alerting, TLS, and COPY batching parameters.
 type SubscriberOptions struct {
 	BrokerURL   string
+	MeshName    string
 	CoopNodeID  string
 	Username    string
 	Password    string
@@ -66,6 +67,7 @@ type Subscriber struct {
 	client         mqtt.Client
 	ledger         Ledger
 	batcher        *ingest.Batcher
+	meshName       string
 	coopNodeID     string
 	brand          brand.Spec
 	topicRoot      string
@@ -85,6 +87,7 @@ type Subscriber struct {
 func NewSubscriber(brokerURL string, ledger Ledger) (*Subscriber, error) {
 	return NewSubscriberWithOptions(SubscriberOptions{
 		BrokerURL:   brokerURL,
+		MeshName:    core.DefaultMeshName,
 		CoopNodeID:  "coop",
 		NtfyEnabled: true,
 		NtfyURL:     "http://127.0.0.1:2586/carrier-pigeons",
@@ -98,6 +101,13 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 	}
 	if strings.TrimSpace(cfg.CoopNodeID) == "" {
 		cfg.CoopNodeID = "coop"
+	}
+	meshName := strings.TrimSpace(cfg.MeshName)
+	if meshName == "" {
+		meshName = core.DefaultMeshName
+	}
+	if err := core.ValidateMeshName(meshName); err != nil {
+		return nil, fmt.Errorf("invalid subscriber mesh_name: %w", err)
 	}
 
 	bSpec := cfg.Brand
@@ -114,6 +124,7 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 	sub := &Subscriber{
 		ledger:         ledger,
 		batcher:        ingest.NewBatcher(ledger, cfg.Ingest),
+		meshName:       meshName,
 		coopNodeID:     cfg.CoopNodeID,
 		brand:          bSpec,
 		topicRoot:      strings.Trim(bSpec.TopicRoot, "/"),
@@ -139,6 +150,7 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 	registryTopic := bSpec.RegistryWildcard()
 	helloTopic := bSpec.HelloWildcard()
 	runnerReqTopic := bSpec.RunnerRequestTopic()
+	meshTopic := bSpec.MeshTopic()
 
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(cfg.BrokerURL)
@@ -170,8 +182,22 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 			log.Printf("[Coop Broker] Failed subscribing to %s: %v", runnerReqTopic, tok.Error())
 		}
 
-		log.Printf("[%s] Subscribed to telemetry (%s), registry (%s), & runner requests (%s)",
-			bSpec.CoopName, telemetryTopic, registryTopic, runnerReqTopic)
+		// Publish retained Mesh Name System (MNS) identity so workstation CLI/TUI handshakes
+		// can verify the remote PigeonCoop's registered mesh name before switching profiles.
+		rawIdentity, err := json.Marshal(core.MeshIdentity{
+			MeshName:   sub.meshName,
+			CoopNodeID: sub.coopNodeID,
+			TopicRoot:  sub.topicRoot,
+			UpdatedAt:  time.Now().UTC(),
+		})
+		if err == nil {
+			if tok := client.Publish(meshTopic, 1, true, rawIdentity); tok.WaitTimeout(2*time.Second) && tok.Error() != nil {
+				log.Printf("[Coop Broker] Failed publishing retained MNS identity to %s: %v", meshTopic, tok.Error())
+			}
+		}
+
+		log.Printf("[%s] Subscribed to telemetry (%s), registry (%s), & runner requests (%s) [mesh=%s]",
+			bSpec.CoopName, telemetryTopic, registryTopic, runnerReqTopic, sub.meshName)
 	}
 
 	client := mqtt.NewClient(opts)

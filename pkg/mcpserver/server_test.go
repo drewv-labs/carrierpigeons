@@ -14,6 +14,9 @@ import (
 
 type stubAgentSafeDB struct{}
 
+func (stubAgentSafeDB) GetMeshIdentity(context.Context) (*core.MeshIdentity, error) {
+	return &core.MeshIdentity{MeshName: "rv64-lab", CoopNodeID: "rv64-coop-01"}, nil
+}
 func (stubAgentSafeDB) GetClusterStatus(context.Context, time.Duration) ([]db.NodeSummary, error) {
 	return []db.NodeSummary{{NodeID: "edge-01", Status: "ONLINE"}}, nil
 }
@@ -119,7 +122,10 @@ func TestMCPHTTPAuthAndDNSRebindingProtection(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden for non-loopback Host when EnforceLoopbackHost=true, got %d", rec.Code)
 	}
 
-	// Default MCP server does NOT register create_pigeonmath_view unless AllowWriteViews is explicitly enabled.
+	// Default MCP server registers get_mesh_identity and omits create_pigeonmath_view unless AllowWriteViews is enabled.
+	if srv.GetTool("get_mesh_identity") == nil {
+		t.Fatal("expected get_mesh_identity tool to be registered")
+	}
 	if srv.GetTool("create_pigeonmath_view") != nil {
 		t.Fatal("expected create_pigeonmath_view to be omitted when AllowWriteViews is false")
 	}

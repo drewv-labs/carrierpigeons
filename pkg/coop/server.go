@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/broker"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/ingest"
@@ -58,6 +59,10 @@ func New(cfg config.CoopConfig, opts ...Options) *Server {
 		cfg.Brand = opt.Brand
 	}
 	cfg.Brand = cfg.Brand.MergeWithDefaults()
+	cfg.MeshName = strings.TrimSpace(cfg.MeshName)
+	if cfg.MeshName == "" {
+		cfg.MeshName = core.DefaultMeshName
+	}
 	cfg.Tags = core.NormalizeTags(cfg.Tags)
 	return &Server{
 		cfg:  cfg,
@@ -65,7 +70,7 @@ func New(cfg config.CoopConfig, opts ...Options) *Server {
 	}
 }
 
-// Start boots the PostgreSQL schema, MQTT broker, batched CTD ingestor, and implicit self-observation/runners.
+// Start boots the PostgreSQL schema, MNS registration, MQTT broker, batched CTD ingestor, and implicit self-observation/runners.
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.cfg.ValidateSecurity(); err != nil {
 		return err
@@ -137,6 +142,16 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("ensure CTD & %s schema: %w", s.cfg.Brand.MathName, err)
 	}
 
+	if err := s.store.UpsertMeshIdentity(ctx, core.MeshIdentity{
+		MeshName:   s.cfg.MeshName,
+		CoopNodeID: s.cfg.NodeID,
+		TopicRoot:  s.cfg.Brand.TopicRoot,
+		UpdatedAt:  time.Now().UTC(),
+	}); err != nil {
+		s.Stop()
+		return fmt.Errorf("register MNS mesh identity %q: %w", s.cfg.MeshName, err)
+	}
+
 	if s.opts.ProvisionRoles {
 		if err := s.store.ProvisionRoles(ctx, s.opts.IngestPassword, s.opts.ReadOnlyPassword); err != nil {
 			log.Printf("[%s] Warning: ProvisionRoles skipped/failed (insufficient superuser privileges?): %v",
@@ -174,6 +189,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// 3. Start high-throughput COPY Ingestion Subscriber & RunnerRequestCTD Router
 	sub, err := broker.NewSubscriberWithOptions(broker.SubscriberOptions{
 		BrokerURL:  s.brokerURL,
+		MeshName:   s.cfg.MeshName,
 		CoopNodeID: s.cfg.NodeID,
 		Username:   s.cfg.MQTT.Username,
 		Password:   s.cfg.MQTT.Password,
@@ -218,9 +234,12 @@ func (s *Server) Start(ctx context.Context) error {
 			Username:         s.cfg.MQTT.Username,
 			Password:         s.cfg.MQTT.Password,
 			DisableObservers: !s.cfg.SelfObserve,
-			Meta:             map[string]string{"role": "coop"},
-			ExtraObservers:   s.opts.ExtraObservers,
-			ExtraRunners:     s.opts.ExtraRunners,
+			Meta: map[string]string{
+				"role":      "coop",
+				"mesh_name": s.cfg.MeshName,
+			},
+			ExtraObservers: s.opts.ExtraObservers,
+			ExtraRunners:   s.opts.ExtraRunners,
 		})
 		if err := s.selfNode.Start(ctx); err != nil {
 			log.Printf("[%s] Warning: self-observation startup degraded: %v", s.cfg.Brand.CoopName, err)
@@ -238,6 +257,11 @@ func (s *Server) Store() db.BaseDB {
 // BrokerURL returns the active dialable MQTT URL for local clients.
 func (s *Server) BrokerURL() string {
 	return s.brokerURL
+}
+
+// MeshName returns the registered MNS identifier for this PigeonCoop instance.
+func (s *Server) MeshName() string {
+	return s.cfg.MeshName
 }
 
 // Stop gracefully shuts down self-observers, flushes pending COPY batches, stops the embedded broker, and closes DB pools.

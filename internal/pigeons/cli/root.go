@@ -21,19 +21,50 @@ import (
 
 var (
 	cfgFilePath string
+	meshFlag    string
 	wsCfg       = config.DefaultWorkstationConfig()
 )
+
+func isMeshManagementCommand(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	switch cmd.Name() {
+	case "connect", "disconnect", "mesh":
+		return true
+	}
+	if p := cmd.Parent(); p != nil && p.Name() == "mesh" {
+		return true
+	}
+	return false
+}
 
 var rootCmd = &cobra.Command{
 	Use:   "pigeons",
 	Short: "CarrierPigeons Control Plane CLI & TUI",
 	Long:  "Manage heterogeneous telemetry meshes (RISC-V, ARM64, x86), node tags, remote Runners, PigeonMath views, and PigeonCare diagnostics.",
-	PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
-		loaded, err := config.LoadWorkstationConfig(cfgFilePath)
+	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		loaded, err := config.LoadWorkstationConfigForMesh(cfgFilePath, meshFlag)
 		if err != nil {
+			// Allow mesh recovery/switching commands (`connect`, `disconnect`, `mesh`) to run even if
+			// `~/.config/pigeons/current_mesh` points to a removed profile.
+			if isMeshManagementCommand(cmd) && strings.TrimSpace(meshFlag) == "" {
+				base, baseErr := config.LoadBaseWorkstationConfig(cfgFilePath)
+				if baseErr != nil {
+					return baseErr
+				}
+				fin, finErr := config.FinalizeWorkstationConfig(base)
+				if finErr != nil {
+					return finErr
+				}
+				wsCfg = fin
+				brand.SetActive(wsCfg.Brand)
+				return nil
+			}
 			return err
 		}
 		wsCfg = loaded
+		brand.SetActive(wsCfg.Brand)
 		return nil
 	},
 	Run: func(cmd *cobra.Command, _ []string) {
@@ -51,6 +82,7 @@ var tuiCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFilePath, "config", "", "Path to pigeons.toml")
+	rootCmd.PersistentFlags().StringVar(&meshFlag, "mesh", "", "Override current working mesh for this command")
 	rootCmd.AddCommand(tuiCmd)
 }
 
@@ -66,8 +98,8 @@ func resolveBrokerURL() string {
 	return "tcp://127.0.0.1:1883"
 }
 
-func dialMQTTClient(brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
-	mqttAuth := wsCfg.EffectiveMQTTAuth()
+func dialMQTTClientWithConfig(cfg config.WorkstationConfig, brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
+	mqttAuth := cfg.EffectiveMQTTAuth()
 	tlsCfg, err := config.BuildMQTTTLSConfig(
 		mqttAuth.TLSCAFile,
 		mqttAuth.TLSCertFile,
@@ -97,6 +129,10 @@ func dialMQTTClient(brokerURL, clientID string, timeout time.Duration) (mqtt.Cli
 		return nil, fmt.Errorf("connect MQTT broker %s: %w", brokerURL, tok.Error())
 	}
 	return client, nil
+}
+
+func dialMQTTClient(brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
+	return dialMQTTClientWithConfig(wsCfg, brokerURL, clientID, timeout)
 }
 
 func openOperatorStore(ctx context.Context) (*db.PostgresStore, error) {

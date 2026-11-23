@@ -1,4 +1,4 @@
--- CarrierPigeons CTD Ledger, Node Tag Registry, RBAC, & PigeonMath Schema
+-- CarrierPigeons CTD Ledger, Node Tag Registry, MNS, RBAC, & PigeonMath Schema
 -- Compatible with PostgreSQL 16+ / 18+ across RISC-V, ARM64, and x86_64
 
 CREATE TABLE IF NOT EXISTS telemetric_ledger (
@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS ctd_traces (
 CREATE INDEX IF NOT EXISTS idx_traces_source ON ctd_traces (source_id);
 CREATE INDEX IF NOT EXISTS idx_traces_target ON ctd_traces (target_id);
 
+CREATE TABLE IF NOT EXISTS ctd_mesh (
+	singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+	mesh_name TEXT NOT NULL CHECK (mesh_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+	coop_node_id TEXT NOT NULL DEFAULT '',
+	topic_root TEXT NOT NULL DEFAULT 'pigeons',
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_by TEXT NOT NULL DEFAULT SESSION_USER
+);
+
 -- Isolated PigeonMath Analytical Schema & PMV Intent Cache
 CREATE SCHEMA IF NOT EXISTS pigeonmath;
 
@@ -97,7 +106,7 @@ $$;
 
 GRANT USAGE ON SCHEMA public TO ctd_ingestor;
 GRANT SELECT, INSERT ON telemetric_ledger, ctd_traces TO ctd_ingestor;
-GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts TO ctd_ingestor;
+GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts, ctd_mesh TO ctd_ingestor;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ctd_ingestor;
 
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM pigeoncare_ro;

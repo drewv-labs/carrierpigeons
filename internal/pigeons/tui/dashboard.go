@@ -77,6 +77,7 @@ type overviewTickMsg time.Time
 type mathTickMsg time.Time
 
 type overviewDataMsg struct {
+	mesh    *core.MeshIdentity
 	nodes   []db.NodeSummary
 	runners []RunnerRecord
 	err     error
@@ -106,6 +107,7 @@ type DashboardModel struct {
 	height       int
 	focusRequest string
 	statusBanner string
+	meshIdentity *core.MeshIdentity
 
 	// Tab 1 & 2 state
 	nodes        []db.NodeSummary
@@ -158,8 +160,12 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 		mathEng = pigeonmath.NewEngineWithSchema(opts.Store, bSpec.MathSchema)
 	}
 
-	agentGreeting := fmt.Sprintf("%s: Connected to %s read-only CTD Ledger. Ask about thermals, runners, or %s views.",
-		bSpec.AgentName, bSpec.ProductName, bSpec.MathName)
+	meshLabel := opts.Config.ActiveMesh
+	if meshLabel == "" {
+		meshLabel = core.DefaultMeshName
+	}
+	agentGreeting := fmt.Sprintf("%s: Connected to %s read-only CTD Ledger [mesh=%s]. Ask about thermals, runners, or %s views.",
+		bSpec.AgentName, bSpec.ProductName, meshLabel, bSpec.MathName)
 	uiHist := []string{agentStyle.Render(agentGreeting)}
 	var chatHist []llm.Message
 	if fault := strings.TrimSpace(opts.FaultContext); fault != "" {
@@ -258,9 +264,11 @@ func (m DashboardModel) fetchOverviewCmd() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
 
+		meshID, _ := store.GetMeshIdentity(ctx)
+
 		nodes, err := store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
-			return overviewDataMsg{err: err}
+			return overviewDataMsg{mesh: meshID, err: err}
 		}
 
 		rows, rErr := store.QueryReadOnlyMaps(ctx, `
@@ -306,7 +314,7 @@ func (m DashboardModel) fetchOverviewCmd() tea.Cmd {
 				})
 			}
 		}
-		return overviewDataMsg{nodes: nodes, runners: recs}
+		return overviewDataMsg{mesh: meshID, nodes: nodes, runners: recs}
 	}
 }
 
@@ -370,6 +378,9 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchMathCmd(), m.scheduleMathTick())
 
 	case overviewDataMsg:
+		if msg.mesh != nil {
+			m.meshIdentity = msg.mesh
+		}
 		if msg.err != nil {
 			m.statusBanner = "Ledger warning: " + msg.err.Error()
 		} else {
@@ -377,6 +388,9 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.runners = msg.runners
 			if m.runnerCursor >= len(m.runners) {
 				m.runnerCursor = max(0, len(m.runners)-1)
+			}
+			if m.cfg.ActiveMesh != "" && m.meshIdentity != nil && m.meshIdentity.MeshName != "" && m.meshIdentity.MeshName != m.cfg.ActiveMesh {
+				m.statusBanner = fmt.Sprintf("MNS warning: workstation mesh=%q != ledger mesh=%q", m.cfg.ActiveMesh, m.meshIdentity.MeshName)
 			}
 		}
 		return m, nil
@@ -589,6 +603,23 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m DashboardModel) renderMeshBadge(accent lipgloss.Color) string {
+	meshLabel := m.cfg.ActiveMesh
+	if meshLabel == "" && m.meshIdentity != nil && m.meshIdentity.MeshName != "" {
+		meshLabel = m.meshIdentity.MeshName
+	}
+	if meshLabel == "" {
+		meshLabel = core.DefaultMeshName
+	}
+
+	if m.cfg.ActiveMesh != "" && m.meshIdentity != nil && m.meshIdentity.MeshName != "" && m.meshIdentity.MeshName != m.cfg.ActiveMesh {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).
+			Render(fmt.Sprintf(" [mesh: %s != %s]", m.cfg.ActiveMesh, m.meshIdentity.MeshName))
+	}
+	return lipgloss.NewStyle().Bold(true).Foreground(accent).
+		Render(fmt.Sprintf(" [mesh: %s]", meshLabel))
+}
+
 func (m DashboardModel) View() string {
 	if m.quitting {
 		return fmt.Sprintf("%s control plane closed.\n", m.brand.ProductName)
@@ -622,6 +653,7 @@ func (m DashboardModel) View() string {
 		}
 	}
 
+	meshBadge := m.renderMeshBadge(accent)
 	modeBadge := ""
 	if m.care != nil {
 		mode := m.care.PolicyGate().Mode()
@@ -636,7 +668,7 @@ func (m DashboardModel) View() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(headerStyle.Render(m.brand.ProductName+" Control Plane") + modeBadge + "\n")
+	sb.WriteString(headerStyle.Render(m.brand.ProductName+" Control Plane") + meshBadge + modeBadge + "\n")
 	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...) + "\n\n")
 
 	switch m.activeTab {

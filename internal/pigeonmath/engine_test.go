@@ -25,6 +25,9 @@ func newFakeAgentSafeStore() *fakeAgentSafeStore {
 	}
 }
 
+func (f *fakeAgentSafeStore) GetMeshIdentity(context.Context) (*core.MeshIdentity, error) {
+	return &core.MeshIdentity{MeshName: core.DefaultMeshName, CoopNodeID: "rv64-coop-01"}, nil
+}
 func (f *fakeAgentSafeStore) GetClusterStatus(context.Context, time.Duration) ([]db.NodeSummary, error) {
 	return []db.NodeSummary{{NodeID: "rv64-coop-01", Status: "active", IsHealthy: true}}, nil
 }
