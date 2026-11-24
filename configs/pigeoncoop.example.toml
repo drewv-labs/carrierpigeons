@@ -19,6 +19,14 @@ listen        = "127.0.0.1:1883"
 url           = "tcp://127.0.0.1:1883"
 username      = ""
 password      = ""
+# Shared edge credential: isolates edge nodes from admin/control-plane topics
+# (`requests/runner`, `registry/mesh`, wildcards, and other nodes' `control/<id>`),
+# and restricts writes to the MQTT client_id's own `ctd/.../<node_id>/...` and
+# `registry/<node_id>/{status,hello}` topics.
+# Trust boundary: any host holding this shared credential can choose its MQTT
+# client_id and impersonate another edge node's `node_id`; use TLS + client
+# certificates or an external broker with per-node credentials when edge nodes
+# are mutually untrusted.
 edge_username = ""
 edge_password = ""
 

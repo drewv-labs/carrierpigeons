@@ -226,6 +226,24 @@ func (c CoopConfig) ValidateSecurity() error {
 			)
 		}
 	}
+	if !isExternal && strings.TrimSpace(c.MQTT.Username) != "" && c.MQTT.Password == "" {
+		return fmt.Errorf(
+			"refusing insecure startup: mqtt.username %q configured without mqtt.password",
+			strings.TrimSpace(c.MQTT.Username),
+		)
+	}
+	if !isExternal && c.MQTT.Password != "" && strings.TrimSpace(c.MQTT.Username) == "" {
+		return fmt.Errorf("refusing insecure startup: mqtt.password configured without mqtt.username")
+	}
+	if strings.TrimSpace(c.MQTT.EdgeUsername) != "" && c.MQTT.EdgePassword == "" {
+		return fmt.Errorf(
+			"refusing insecure startup: mqtt.edge_username %q configured without mqtt.edge_password",
+			strings.TrimSpace(c.MQTT.EdgeUsername),
+		)
+	}
+	if c.MQTT.EdgePassword != "" && strings.TrimSpace(c.MQTT.EdgeUsername) == "" {
+		return fmt.Errorf("refusing insecure startup: mqtt.edge_password configured without mqtt.edge_username")
+	}
 
 	if dbURL := strings.TrimSpace(c.Database.URL); dbURL != "" && !c.Database.AllowInsecureDefaults {
 		if u, err := url.Parse(dbURL); err == nil {
@@ -627,7 +645,7 @@ func ApplyMeshProfile(base WorkstationConfig, meshName string, p MeshProfileConf
 	if v := strings.TrimSpace(p.ReadOnlyDatabaseURL); v != "" {
 		out.ReadOnlyDatabaseURL = v
 	} else if dbChanged {
-		out.ReadOnlyDatabaseURL = db.DeriveReadOnlyURLFromAdmin(out.DatabaseURL, "")
+		out.ReadOnlyDatabaseURL = deriveReadOnlyURL(out.DatabaseURL)
 	}
 
 	if p.AllowSuperuserReadOnly != nil {
@@ -1161,13 +1179,158 @@ func firstEnv(keys ...string) string {
 	return ""
 }
 
-func prefixedEnv(brandPrefix, suffix string, fallbacks ...string) string {
+// PrefixedEnv returns the first non-empty trimmed environment variable from
+// `<BRAND_ENV_PREFIX>_<suffix>` followed by the fallback keys in order.
+func PrefixedEnv(brandPrefix, suffix string, fallbacks ...string) string {
 	var keys []string
 	if p := strings.TrimSuffix(strings.ToUpper(strings.TrimSpace(brandPrefix)), "_"); p != "" {
 		keys = append(keys, p+"_"+suffix)
 	}
 	keys = append(keys, fallbacks...)
 	return firstEnv(keys...)
+}
+
+// ResolveWorkstationDBURLEnv returns the first non-empty database URL environment override
+// for brandPrefix (`<BRAND>_DB_URL`, `PIGEONS_DB_URL`, `PIGEONCOOP_DB_URL`, `DATABASE_URL`).
+func ResolveWorkstationDBURLEnv(brandPrefix string) string {
+	return PrefixedEnv(brandPrefix, "DB_URL", "PIGEONS_DB_URL", "PIGEONCOOP_DB_URL", "DATABASE_URL")
+}
+
+// ResolveWorkstationRODBURLEnv returns the first non-empty read-only database URL environment override
+// for brandPrefix (`<BRAND>_RO_DB_URL`, `PIGEONS_RO_DB_URL`, `PIGEONCARE_DB_URL`, `PIGEONMCP_DB_URL`).
+func ResolveWorkstationRODBURLEnv(brandPrefix string) string {
+	return PrefixedEnv(brandPrefix, "RO_DB_URL", "PIGEONS_RO_DB_URL", "PIGEONCARE_DB_URL", "PIGEONMCP_DB_URL")
+}
+
+func isSensitiveQueryKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	switch k {
+	case "pass", "pwd", "auth", "apikey":
+		return true
+	}
+	return strings.Contains(k, "password") ||
+		strings.Contains(k, "passwd") ||
+		strings.Contains(k, "secret") ||
+		strings.Contains(k, "token") ||
+		strings.Contains(k, "api_key")
+}
+
+func redactURLQuery(u *url.URL) {
+	if u.RawQuery == "" {
+		return
+	}
+	q := u.Query()
+	changed := false
+	for k := range q {
+		if isSensitiveQueryKey(k) {
+			q.Set(k, "xxxxx")
+			changed = true
+		}
+	}
+	if changed {
+		u.RawQuery = q.Encode()
+	}
+}
+
+// RedactURL masks any userinfo password and sensitive query parameters in raw before CLI or log printing.
+// Non-URL / schemeless inputs are masked or redacted fail-closed so credentials are never echoed verbatim.
+func RedactURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, "://") {
+		u, err := url.Parse(trimmed)
+		if err == nil && u.Scheme != "" && u.Opaque == "" {
+			redactURLQuery(u)
+			return u.Redacted()
+		}
+		// Fallback for malformed hierarchical URLs (e.g. unescaped '%' in password) without leaking query secrets.
+		if schemeIdx := strings.Index(trimmed, "://"); schemeIdx >= 0 {
+			rest := trimmed[schemeIdx+3:]
+			pathIdx := strings.IndexAny(rest, "/?#")
+			authority := rest
+			pathOnly := ""
+			if pathIdx >= 0 {
+				authority = rest[:pathIdx]
+				if rest[pathIdx] == '/' {
+					endPath := strings.IndexAny(rest[pathIdx:], "?#")
+					if endPath >= 0 {
+						pathOnly = rest[pathIdx : pathIdx+endPath]
+					} else {
+						pathOnly = rest[pathIdx:]
+					}
+				}
+			}
+			if atIdx := strings.LastIndexByte(authority, '@'); atIdx >= 0 {
+				userInfo := authority[:atIdx]
+				host := authority[atIdx+1:]
+				if colonIdx := strings.IndexByte(userInfo, ':'); colonIdx >= 0 {
+					userInfo = userInfo[:colonIdx] + ":xxxxx"
+				}
+				return trimmed[:schemeIdx+3] + userInfo + "@" + host + pathOnly
+			}
+		}
+		return "[redacted-invalid-url]"
+	}
+	// Schemeless user:pass@host[:port] without whitespace or key=value pairs.
+	if !strings.ContainsAny(trimmed, " \t\r\n=?#") {
+		if atIdx := strings.LastIndexByte(trimmed, '@'); atIdx > 0 {
+			userInfo := trimmed[:atIdx]
+			hostPart := trimmed[atIdx+1:]
+			if colonIdx := strings.IndexByte(userInfo, ':'); colonIdx >= 0 {
+				return userInfo[:colonIdx] + ":xxxxx@" + hostPart
+			}
+		}
+	}
+	return "[redacted-invalid-url]"
+}
+
+func prefixedEnv(brandPrefix, suffix string, fallbacks ...string) string {
+	return PrefixedEnv(brandPrefix, suffix, fallbacks...)
+}
+
+func effectivePostgresPort(u *url.URL) string {
+	if p := strings.TrimSpace(u.Port()); p != "" {
+		return p
+	}
+	if strings.EqualFold(u.Scheme, "postgres") || strings.EqualFold(u.Scheme, "postgresql") {
+		return "5432"
+	}
+	return ""
+}
+
+func urlTargetsEqual(a, b string) bool {
+	ua, errA := url.Parse(strings.TrimSpace(a))
+	ub, errB := url.Parse(strings.TrimSpace(b))
+	if errA != nil || errB != nil {
+		return false
+	}
+	ha := strings.TrimSpace(ua.Hostname())
+	hb := strings.TrimSpace(ub.Hostname())
+	if ha == "" || hb == "" || !strings.EqualFold(ha, hb) {
+		return false
+	}
+	if effectivePostgresPort(ua) != effectivePostgresPort(ub) {
+		return false
+	}
+	pa := strings.Trim(strings.TrimSpace(ua.Path), "/")
+	pb := strings.Trim(strings.TrimSpace(ub.Path), "/")
+	return pa == pb
+}
+
+// deriveReadOnlyURL derives a least-privilege `pigeoncare_ro` DSN from baseDSN.
+// For non-loopback hosts without an explicit PIGEONCARE_RO_PASSWORD, it returns ""
+// rather than silently injecting the default development password.
+func deriveReadOnlyURL(baseDSN string) string {
+	trimmed := strings.TrimSpace(baseDSN)
+	if trimmed == "" {
+		return ""
+	}
+	if !isURLHostLoopback(trimmed) && strings.TrimSpace(os.Getenv("PIGEONCARE_RO_PASSWORD")) == "" {
+		return ""
+	}
+	return db.DeriveReadOnlyURLFromAdmin(trimmed, "")
 }
 
 func splitCSVTags(raw string) []string {
@@ -1354,10 +1517,19 @@ func LoadEdgeConfig(explicitPath string) (EdgeConfig, error) {
 	if err := core.ValidateTopicToken(cfg.NodeID); err != nil {
 		return cfg, fmt.Errorf("invalid edge node_id: %w", err)
 	}
+	if err := core.ValidateTopicToken(cfg.Brand.TopicRoot); err != nil {
+		return cfg, fmt.Errorf("invalid brand topic_root: %w", err)
+	}
 
 	cfg.Tags = core.NormalizeTags(cfg.Tags)
-	if strings.TrimSpace(cfg.TopicPrefix) == "" {
+	cfg.TopicPrefix = strings.TrimSpace(cfg.TopicPrefix)
+	if cfg.TopicPrefix == "" {
 		cfg.TopicPrefix = cfg.Brand.CTDPrefix()
+	}
+	for _, seg := range strings.Split(cfg.TopicPrefix, "/") {
+		if err := core.ValidateTopicToken(seg); err != nil {
+			return cfg, fmt.Errorf("invalid edge topic_prefix %q: %w", cfg.TopicPrefix, err)
+		}
 	}
 	return cfg, nil
 }
@@ -1395,18 +1567,20 @@ func applyWorkstationEnvAndReadOnlyDerivation(cfg WorkstationConfig) (Workstatio
 			cfg.MQTT.TLSInsecureSkipVerify = b
 		}
 	}
-	if v := prefixedEnv(bp, "DB_URL", "PIGEONS_DB_URL", "PIGEONCOOP_DB_URL", "DATABASE_URL"); v != "" {
+	dbFromEnv := false
+	if v := ResolveWorkstationDBURLEnv(bp); v != "" {
 		cfg.DatabaseURL = v
+		dbFromEnv = true
 	}
 	roFromEnv := false
-	if v := prefixedEnv(bp, "RO_DB_URL", "PIGEONS_RO_DB_URL", "PIGEONCARE_DB_URL", "PIGEONMCP_DB_URL"); v != "" {
+	if v := ResolveWorkstationRODBURLEnv(bp); v != "" {
 		cfg.ReadOnlyDatabaseURL = v
 		roFromEnv = true
 	}
 	if !roFromEnv && strings.TrimSpace(cfg.DatabaseURL) != "" {
 		ro := strings.TrimSpace(cfg.ReadOnlyDatabaseURL)
-		if ro == "" || (isURLHostLoopback(ro) && !isURLHostLoopback(cfg.DatabaseURL)) {
-			cfg.ReadOnlyDatabaseURL = db.DeriveReadOnlyURLFromAdmin(cfg.DatabaseURL, "")
+		if ro == "" || (isURLHostLoopback(ro) && !isURLHostLoopback(cfg.DatabaseURL)) || (dbFromEnv && !urlTargetsEqual(ro, cfg.DatabaseURL)) {
+			cfg.ReadOnlyDatabaseURL = deriveReadOnlyURL(cfg.DatabaseURL)
 		}
 	}
 	if v := prefixedEnv(bp, "ALLOW_SUPERUSER_RO", "PIGEONS_ALLOW_SUPERUSER_RO"); v != "" {
