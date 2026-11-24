@@ -99,9 +99,15 @@ func (s *Subscriber) processRegistryUpdate(topic string, payload []byte) {
 	if changed && s.ntfyEnabled && s.ntfyURL != "" {
 		select {
 		case s.ntfySem <- struct{}{}:
+			if s.ntfyCtx != nil && s.ntfyCtx.Err() != nil {
+				<-s.ntfySem
+				return
+			}
+			s.ntfyWG.Add(1)
 			go func() {
+				defer s.ntfyWG.Done()
 				defer func() { <-s.ntfySem }()
-				s.sendNtfyAlert(nodeID, status)
+				s.sendNtfyAlert(s.ntfyCtx, nodeID, status)
 			}()
 		default:
 			log.Printf("[Ntfy] Alert concurrency limit reached; skipping duplicate notification for %s (%s)", nodeID, status)
@@ -110,10 +116,13 @@ func (s *Subscriber) processRegistryUpdate(topic string, payload []byte) {
 }
 
 // sendNtfyAlert pushes a notification to the configured Ntfy instance and drains the HTTP body for keep-alive reuse.
-func (s *Subscriber) sendNtfyAlert(nodeID, status string) {
+func (s *Subscriber) sendNtfyAlert(parentCtx context.Context, nodeID, status string) {
 	url := strings.TrimSpace(s.ntfyURL)
 	if url == "" || url == "off" || url == "disabled" || url == "none" {
 		return
+	}
+	if parentCtx == nil {
+		parentCtx = context.Background()
 	}
 
 	var message string
@@ -123,7 +132,7 @@ func (s *Subscriber) sendNtfyAlert(nodeID, status string) {
 		message = "RECOVERY: " + nodeID + " is back online."
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(message))
