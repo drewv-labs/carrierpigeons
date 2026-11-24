@@ -72,6 +72,76 @@ func TestBenchmarkRunnerStartAndAbortBookends(t *testing.T) {
 	}
 }
 
+func TestBenchmarkRunnerFailsFastOnUnsupportedAccelerators(t *testing.T) {
+	r := &BenchmarkRunner{}
+	cases := []struct {
+		name   string
+		params map[string]any
+		want   string
+	}{
+		{
+			name: "target_gpu",
+			params: map[string]any{
+				"request_id":   "req-gpu-01",
+				"duration_sec": 30,
+				"target_gpu":   true,
+			},
+			want: "target_gpu",
+		},
+		{
+			name: "target_npu",
+			params: map[string]any{
+				"request_id":   "req-npu-01",
+				"duration_sec": 30,
+				"target_npu":   true,
+			},
+			want: "target_npu",
+		},
+		{
+			name: "target_system_and_gpu",
+			params: map[string]any{
+				"request_id":    "req-mix-01",
+				"duration_sec":  30,
+				"target_system": true,
+				"target_gpu":    true,
+			},
+			want: "target_gpu",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pub := &capturePublisher{}
+			started := time.Now()
+			err := r.Run(context.Background(), "rv64-compute-01", tc.params, pub)
+			if err == nil {
+				t.Fatal("expected unsupported accelerator target to fail fast")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected error mentioning %q, got %v", tc.want, err)
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("expected fail-fast return, took %s", elapsed)
+			}
+
+			events := pub.snapshot()
+			if len(events) != 1 {
+				t.Fatalf("expected single runner-error event, got %d", len(events))
+			}
+			ev := events[0]
+			if ev.Pillar != core.PillarRunner || ev.Component != "runner:benchmark" || ev.Status != "runner-error" {
+				t.Fatalf("unexpected CTD event: %+v", ev)
+			}
+			if !strings.Contains(ev.Params["error"], tc.want) {
+				t.Fatalf("expected error param mentioning %q, got %+v", tc.want, ev.Params)
+			}
+			if ev.Params["request_id"] != tc.params["request_id"] {
+				t.Fatalf("expected request_id=%v, got %q", tc.params["request_id"], ev.Params["request_id"])
+			}
+		})
+	}
+}
+
 func TestEphemeralRunnerExecutesAndEnforcesPolicy(t *testing.T) {
 	pub := &capturePublisher{}
 	er := &EphemeralRunner{}

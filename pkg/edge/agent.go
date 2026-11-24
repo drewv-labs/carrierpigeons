@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/internal/node/observers"
 	"github.com/drewv-labs/carrierpigeons/internal/node/relay"
@@ -171,13 +172,16 @@ func (a *Agent) Publish(p *core.CTDPayload) error {
 	return a.relay.Publish(p)
 }
 
-// Stop cancels observers/runners and gracefully disconnects the MQTT relay with OFFLINE status.
+// Stop cancels observers/runners, waits briefly for runner bookends, and gracefully disconnects the MQTT relay.
 func (a *Agent) Stop() {
 	a.stopOnce.Do(func() {
 		if a.cancel != nil {
 			a.cancel()
 		}
 		if a.relay != nil {
+			if !a.relay.WaitRunners(2 * time.Second) {
+				log.Printf("[%s] Timed out waiting for active runners to flush bookends before disconnect", a.cfg.Brand.EdgeName)
+			}
 			a.relay.Disconnect()
 		}
 	})

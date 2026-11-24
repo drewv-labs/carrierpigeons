@@ -27,8 +27,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed loading configuration: %v", err)
 	}
-	if strings.TrimSpace(*nodeID) != "" {
-		cfg.NodeID = strings.TrimSpace(*nodeID)
+	if trimmed := strings.TrimSpace(*nodeID); trimmed != "" {
+		if err := core.ValidateTopicToken(trimmed); err != nil {
+			log.Fatalf("Invalid --node-id override: %v", err)
+		}
+		cfg.NodeID = trimmed
 	}
 	if strings.TrimSpace(*brokerURL) != "" {
 		cfg.BrokerURL = strings.TrimSpace(*brokerURL)
