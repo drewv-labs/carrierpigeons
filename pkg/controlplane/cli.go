@@ -21,16 +21,14 @@ func (c *ControlPlane) Brand() brand.Spec {
 	return c.brand
 }
 
-// RootCommand returns the Pigeons CLI/TUI command tree customized with this ControlPlane's BrandSpec.
+// RootCommand returns an isolated Pigeons CLI/TUI command tree customized with this ControlPlane's BrandSpec.
 func (c *ControlPlane) RootCommand() *cobra.Command {
-	cli.ApplyBrand(c.brand)
-	return cli.RootCommand()
+	return cli.NewRootCommand(c.brand)
 }
 
 // Execute runs the Pigeons CLI/TUI workstation control plane with this ControlPlane's BrandSpec.
 func (c *ControlPlane) Execute() {
-	cli.ApplyBrand(c.brand)
-	cli.Execute()
+	cli.ExecuteWithBrand(c.brand)
 }
 
 // RootCommand returns the Pigeons CLI/TUI command tree customized with a whitelabel BrandSpec.
