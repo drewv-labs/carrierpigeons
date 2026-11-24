@@ -66,13 +66,16 @@ func extractEdgeNodeID(clientID, edgePrefix string) string {
 }
 
 func (h *perNodeAuthHook) OnConnectAuthenticate(cl *mochi.Client, pk packets.Packet) bool {
+	if cl == nil {
+		return false
+	}
 	user := string(pk.Connect.Username)
 	pass := string(pk.Connect.Password)
 
-	if h.adminUser != "" && constantTimeEqual(user, h.adminUser) && constantTimeEqual(pass, h.adminPass) {
+	if h.adminUser != "" && h.adminPass != "" && constantTimeEqual(user, h.adminUser) && constantTimeEqual(pass, h.adminPass) {
 		return true
 	}
-	if h.edgeUser != "" && constantTimeEqual(user, h.edgeUser) && constantTimeEqual(pass, h.edgePass) {
+	if h.edgeUser != "" && h.edgePass != "" && constantTimeEqual(user, h.edgeUser) && constantTimeEqual(pass, h.edgePass) {
 		nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
 		if err := core.ValidateTopicToken(nodeID); err != nil {
 			return false
@@ -108,10 +111,10 @@ func (h *perNodeAuthHook) OnACLCheck(cl *mochi.Client, topic string, write bool)
 	}
 
 	user := string(cl.Properties.Username)
-	if h.adminUser != "" && constantTimeEqual(user, h.adminUser) {
+	if h.adminUser != "" && h.adminPass != "" && constantTimeEqual(user, h.adminUser) {
 		return topic == h.topicRoot || strings.HasPrefix(topic, h.topicRoot+"/") || topic == "#"
 	}
-	if h.edgeUser != "" && constantTimeEqual(user, h.edgeUser) {
+	if h.edgeUser != "" && h.edgePass != "" && constantTimeEqual(user, h.edgeUser) {
 		nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
 		if err := core.ValidateTopicToken(nodeID); err != nil {
 			return false
@@ -225,7 +228,9 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 	}
 
 	go func() {
-		_ = srv.Serve()
+		if serveErr := srv.Serve(); serveErr != nil {
+			warnLogger.Error("embedded MQTT server exited with error", "err", serveErr)
+		}
 	}()
 
 	return &EmbeddedBroker{
