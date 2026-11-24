@@ -1,0 +1,69 @@
+name: Carrier Pigeons CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  test:
+    name: Vet & Race Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run Go Vet
+        run: go vet ./...
+
+      - name: Run Race Tests
+        run: go test -race -count=1 ./...
+
+  cross-compile:
+    name: Cross-Compile (CGO_ENABLED=0)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [riscv64, arm64, amd64]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Cross-Compile Linux Binaries
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build ./...
+          TMP_DIST="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIST"' EXIT
+          go build -trimpath -o "${TMP_DIST}/" ./cmd/...
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run ShellCheck on Edge Installer
+        run: shellcheck deployments/install-pigeoneer.sh

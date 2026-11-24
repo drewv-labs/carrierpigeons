@@ -10,6 +10,7 @@ MQTT_USER="${PIGEONEER_MQTT_USERNAME:-}"
 MQTT_PASS="${PIGEONEER_MQTT_PASSWORD:-}"
 SKIP_CHECKSUM="${PIGEONEER_SKIP_CHECKSUM:-false}"
 ENABLE_GPU_GROUPS="${PIGEONEER_ENABLE_GPU_GROUPS:-false}"
+OVERWRITE_ENV="${PIGEONEER_OVERWRITE_ENV:-false}"
 
 if [[ ! "${NODE_ID}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     echo "Invalid NODE_ID '${NODE_ID}': must match ^[a-zA-Z0-9._-]+$" >&2
@@ -46,11 +47,6 @@ if ! id -u pigeoneer >/dev/null 2>&1; then
     echo "[*] Provisioning dedicated unprivileged 'pigeoneer' system account..."
     useradd --system --no-create-home --shell /usr/sbin/nologin pigeoneer
 fi
-for grp in video render; do
-    if getent group "${grp}" >/dev/null 2>&1; then
-        usermod -aG "${grp}" pigeoneer || true
-    fi
-done
 
 install -d -m 0750 -o root -g pigeoneer /etc/pigeons
 
@@ -84,20 +80,25 @@ systemd_env_quote() {
     printf '"%s"' "${val}"
 }
 
-install -m 0640 -o root -g pigeoneer /dev/null /etc/pigeons/pigeoneer.env
-{
-    printf 'PIGEONEER_NODE_ID=%s\n' "$(systemd_env_quote "${NODE_ID}")"
-    printf 'PIGEONEER_BROKER_URL=%s\n' "$(systemd_env_quote "${BROKER_URL}")"
-    printf 'PIGEONEER_TAGS=%s\n' "$(systemd_env_quote "${NODE_TAGS:-${GO_ARCH}}")"
-    printf 'PIGEONEER_MQTT_USERNAME=%s\n' "$(systemd_env_quote "${MQTT_USER}")"
-    printf 'PIGEONEER_MQTT_PASSWORD=%s\n' "$(systemd_env_quote "${MQTT_PASS}")"
-} > /etc/pigeons/pigeoneer.env
+if [[ ! -f /etc/pigeons/pigeoneer.env || "${OVERWRITE_ENV}" == "true" ]]; then
+    install -m 0640 -o root -g pigeoneer /dev/null /etc/pigeons/pigeoneer.env
+    {
+        printf 'PIGEONEER_NODE_ID=%s\n' "$(systemd_env_quote "${NODE_ID}")"
+        printf 'PIGEONEER_BROKER_URL=%s\n' "$(systemd_env_quote "${BROKER_URL}")"
+        printf 'PIGEONEER_TAGS=%s\n' "$(systemd_env_quote "${NODE_TAGS:-${GO_ARCH}}")"
+        printf 'PIGEONEER_MQTT_USERNAME=%s\n' "$(systemd_env_quote "${MQTT_USER}")"
+        printf 'PIGEONEER_MQTT_PASSWORD=%s\n' "$(systemd_env_quote "${MQTT_PASS}")"
+    } > /etc/pigeons/pigeoneer.env
+else
+    echo "[SKIP] Preserving existing /etc/pigeons/pigeoneer.env"
+fi
 
 SUPP_GROUPS_DIRECTIVE="# SupplementaryGroups=video render  # Set PIGEONEER_ENABLE_GPU_GROUPS=true if DRM/sysfs GPU/NPU access is restricted"
 if [[ "${ENABLE_GPU_GROUPS}" == "true" ]]; then
     SUPP_GROUPS_LIST=()
     for grp in video render; do
         if getent group "${grp}" >/dev/null 2>&1; then
+            usermod -aG "${grp}" pigeoneer || true
             SUPP_GROUPS_LIST+=("${grp}")
         fi
     done
@@ -131,8 +132,8 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOF
 
-echo "[*] Enabling and starting Pigeoneer..."
+echo "[*] Enabling and restarting Pigeoneer..."
 systemctl daemon-reload
-systemctl enable --now pigeoneer
+systemctl enable pigeoneer && systemctl restart pigeoneer
 
 echo "[+] Node ${NODE_ID} (${GO_ARCH}) is online and reporting to ${BROKER_URL}."
