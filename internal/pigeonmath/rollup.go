@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
 )
 
 // BucketPoint holds 1-minute aggregated telemetry & fleet liveness counts for PigeonMath graphs.
@@ -59,7 +60,7 @@ func (e *Engine) FetchDashboardSnapshot(ctx context.Context, windowMinutes int) 
 	now := time.Now().UTC().Truncate(time.Minute)
 	start := now.Add(-time.Duration(windowMinutes-1) * time.Minute)
 
-	cluster, err := e.store.GetClusterStatus(ctx, 90*time.Second)
+	cluster, err := e.store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 	if err != nil {
 		return nil, err
 	}

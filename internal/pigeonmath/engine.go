@@ -194,6 +194,15 @@ func (e *Engine) SubmitAndCertifyPMV(
 		return draft, fmt.Errorf("sample probe failed for %s.%s: %w", e.mathSchema, normName, probeErr)
 	}
 
+	failCertification := func(note string, report map[string]any, retErr error) (*db.PMVRecord, error) {
+		draft.Status = "failed"
+		draft.OptimizedSQL = candidateSQL
+		draft.AgentNotes = strings.Join(append(notes, note), " | ")
+		draft.ValidationReport = report
+		_ = e.store.UpdatePMVState(ctx, *draft)
+		return draft, retErr
+	}
+
 	postCheckVerdict := "structural & read-only probe passed"
 	if optimizer != nil {
 		sampleJSON, _ := json.Marshal(sampleRows)
@@ -210,21 +219,40 @@ func (e *Engine) SubmitAndCertifyPMV(
 			},
 		})
 		cancel()
-		if chkErr == nil && strings.TrimSpace(chkReply) != "" {
-			trimmedVerdict := strings.TrimSpace(chkReply)
-			postCheckVerdict = trimmedVerdict
-			if strings.HasPrefix(strings.ToUpper(trimmedVerdict), "REJECTED:") {
-				draft.Status = "failed"
-				draft.OptimizedSQL = candidateSQL
-				draft.AgentNotes = strings.Join(append(notes, trimmedVerdict), " | ")
-				draft.ValidationReport = map[string]any{
+		if chkErr != nil {
+			return failCertification(
+				"certification check failed: "+chkErr.Error(),
+				map[string]any{
+					"explain_ok":        true,
+					"post_check_passed": false,
+					"error":             chkErr.Error(),
+				},
+				fmt.Errorf("certification check failed for %s: %w", normName, chkErr),
+			)
+		}
+		trimmedVerdict := strings.TrimSpace(chkReply)
+		if trimmedVerdict == "" {
+			return failCertification(
+				"certification check returned empty verdict",
+				map[string]any{
+					"explain_ok":        true,
+					"post_check_passed": false,
+					"error":             "empty certification verdict",
+				},
+				fmt.Errorf("certification check returned empty verdict for %s", normName),
+			)
+		}
+		postCheckVerdict = trimmedVerdict
+		if strings.HasPrefix(strings.ToUpper(trimmedVerdict), "REJECTED:") {
+			return failCertification(
+				trimmedVerdict,
+				map[string]any{
 					"explain_ok":        true,
 					"post_check_passed": false,
 					"verdict":           trimmedVerdict,
-				}
-				_ = e.store.UpdatePMVState(ctx, *draft)
-				return draft, fmt.Errorf("certification rejected %s: %s", normName, trimmedVerdict)
-			}
+				},
+				fmt.Errorf("certification rejected %s: %s", normName, trimmedVerdict),
+			)
 		}
 	}
 

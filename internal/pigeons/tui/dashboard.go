@@ -446,11 +446,7 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		// Global quit on Ctrl+C
 		if msg.Type == tea.KeyCtrlC {
-			if m.streamCancel != nil {
-				m.streamCancel()
-			}
-			m.quitting = true
-			return m, tea.Quit
+			return m.quit()
 		}
 
 		// Handle interactive Confirmation Modal first when pending!
@@ -501,8 +497,7 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Non-chat tabs allow quick number navigation & q/esc to quit
 		switch msg.String() {
 		case "q", "esc":
-			m.quitting = true
-			return m, tea.Quit
+			return m.quit()
 		case "1":
 			m.activeTab = TabOverview
 			return m, nil
@@ -541,6 +536,15 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m DashboardModel) quit() (tea.Model, tea.Cmd) {
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+	m.quitting = true
+	return m, tea.Quit
+}
+
 func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyEsc {
 		if m.waiting && m.streamCancel != nil {
@@ -550,8 +554,7 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statusBanner = "Cancelled active stream."
 			return m, nil
 		}
-		m.quitting = true
-		return m, tea.Quit
+		return m.quit()
 	}
 
 	if m.waiting {
