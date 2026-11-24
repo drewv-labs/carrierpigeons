@@ -1,7 +1,10 @@
 package db
 
 import (
+	"encoding/base64"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -105,16 +108,16 @@ func TestValidateSchemaIdentifierAndProvisionRolePasswordsAndBisectGuard(t *test
 	if _, _, err := validateProvisionRolePasswords("127.0.0.1", "", ""); err != nil {
 		t.Fatalf("expected loopback defaults to be allowed, got %v", err)
 	}
-	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "", "strong_ro_pw"); err == nil {
+	if _, _, err := validateProvisionRolePasswords("192.0.2.20", "", "strong_ro_pw"); err == nil {
 		t.Fatal("expected empty ingest password on remote host to fail")
 	}
-	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "ctd_ingest_password", "strong_ro_pw"); err == nil {
+	if _, _, err := validateProvisionRolePasswords("192.0.2.20", "ctd_ingest_password", "strong_ro_pw"); err == nil {
 		t.Fatal("expected default ingest password on remote host to fail")
 	}
-	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "strong_ing_pw", "pigeoncare_readonly"); err == nil {
+	if _, _, err := validateProvisionRolePasswords("192.0.2.20", "strong_ing_pw", "pigeoncare_readonly"); err == nil {
 		t.Fatal("expected default readonly password on remote host to fail")
 	}
-	if _, _, err := validateProvisionRolePasswords("10.0.10.20", "strong_ing_pw", "strong_ro_pw"); err != nil {
+	if _, _, err := validateProvisionRolePasswords("192.0.2.20", "strong_ing_pw", "strong_ro_pw"); err != nil {
 		t.Fatalf("expected rotated passwords on remote host to succeed, got %v", err)
 	}
 
@@ -182,5 +185,138 @@ func TestResolveDBURLAndAbnormalStatus(t *testing.T) {
 	}
 	if isAbnormalStatus("active") || isAbnormalStatus("runner-start") {
 		t.Fatal("expected active and runner-start statuses to be healthy")
+	}
+}
+
+func TestBuildSCRAMSHA256VerifierRFC7677TestVector(t *testing.T) {
+	// RFC 7677 Section 3 test vector: password="pencil", salt=base64("W22ZaJ0SNY7soEsUEjb6gQ=="), iterations=4096.
+	salt, err := base64.StdEncoding.DecodeString("W22ZaJ0SNY7soEsUEjb6gQ==")
+	if err != nil {
+		t.Fatalf("decode RFC 7677 salt: %v", err)
+	}
+	got, err := buildSCRAMSHA256VerifierWithSalt("pencil", salt, 4096)
+	if err != nil {
+		t.Fatalf("buildSCRAMSHA256VerifierWithSalt failed: %v", err)
+	}
+	want := "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU="
+	if got != want {
+		t.Fatalf("SCRAM-SHA-256 verifier mismatch:\n got: %s\nwant: %s", got, want)
+	}
+
+	if _, err := buildSCRAMSHA256VerifierWithSalt("", salt, 4096); err == nil {
+		t.Fatal("expected empty password to fail")
+	}
+	if _, err := buildSCRAMSHA256VerifierWithSalt("bad\x00pw", salt, 4096); err == nil {
+		t.Fatal("expected NUL byte in password to fail")
+	}
+	if _, err := buildSCRAMSHA256VerifierWithSalt("pencil", nil, 4096); err == nil {
+		t.Fatal("expected empty salt to fail")
+	}
+	if _, err := buildSCRAMSHA256VerifierWithSalt("pencil", salt, 0); err == nil {
+		t.Fatal("expected non-positive iterations to fail")
+	}
+
+	v1, err := buildSCRAMSHA256Verifier("ingest_secret_value")
+	if err != nil {
+		t.Fatalf("buildSCRAMSHA256Verifier failed: %v", err)
+	}
+	v2, err := buildSCRAMSHA256Verifier("ingest_secret_value")
+	if err != nil {
+		t.Fatalf("buildSCRAMSHA256Verifier second call failed: %v", err)
+	}
+	if v1 == v2 {
+		t.Fatal("expected unique random salt per SCRAM-SHA-256 verifier")
+	}
+	if !strings.HasPrefix(v1, "SCRAM-SHA-256$4096:") {
+		t.Fatalf("expected PostgreSQL SCRAM-SHA-256 prefix, got %q", v1)
+	}
+	roVerifier, err := buildSCRAMSHA256Verifier("readonly_secret_value")
+	if err != nil {
+		t.Fatalf("buildSCRAMSHA256Verifier readonly failed: %v", err)
+	}
+
+	ddl := buildProvisionRolesSQL("pigeonmath", v1, roVerifier)
+	if strings.Contains(ddl, "ingest_secret_value") || strings.Contains(ddl, "readonly_secret_value") {
+		t.Fatal("ProvisionRoles DDL must never contain plaintext role passwords")
+	}
+	if !strings.Contains(ddl, v1) || !strings.Contains(ddl, roVerifier) {
+		t.Fatal("ProvisionRoles DDL must embed SCRAM-SHA-256 verifiers")
+	}
+	if !strings.Contains(ddl, "DO $provision$") || !strings.Contains(ddl, "$provision$;") {
+		t.Fatal("ProvisionRoles DDL must use named dollar tag $provision$")
+	}
+	if !strings.Contains(ddl, "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM PUBLIC, pigeoncare_ro;") ||
+		!strings.Contains(ddl, "REVOKE CREATE ON SCHEMA public FROM PUBLIC, pigeoncare_ro;") {
+		t.Fatal("ProvisionRoles DDL must revoke write/CREATE privileges from both PUBLIC and pigeoncare_ro")
+	}
+}
+
+func TestEnforceNonSuperuserQueryAndEvaluation(t *testing.T) {
+	requiredFragments := []string{
+		"rolsuper",
+		"has_schema_privilege(SESSION_USER, 'public', 'CREATE')",
+		"to_regclass('public.telemetric_ledger') IS NULL",
+		"has_table_privilege(SESSION_USER, tbl, 'INSERT, UPDATE, DELETE, TRUNCATE')",
+		"'public.telemetric_ledger'",
+		"'public.ctd_nodes'",
+		"'public.ctd_artifacts'",
+		"'public.ctd_traces'",
+		"'public.ctd_mesh'",
+	}
+	for _, frag := range requiredFragments {
+		if !strings.Contains(enforceNonSuperuserQuery, frag) {
+			t.Fatalf("enforceNonSuperuserQuery missing %q", frag)
+		}
+	}
+
+	clean := roBoundaryStatus{SessionUser: "pigeoncare_ro"}
+	if err := evaluateROBoundary(clean); err != nil {
+		t.Fatalf("expected clean read-only status to pass, got %v", err)
+	}
+
+	cases := []struct {
+		name string
+		st   roBoundaryStatus
+	}{
+		{name: "missing_ledger_fails_closed", st: roBoundaryStatus{SessionUser: "pigeoncare_ro", LedgerMissing: true}},
+		{name: "superuser_rejected", st: roBoundaryStatus{SessionUser: "postgres", IsSuper: true}},
+		{name: "schema_public_create_rejected", st: roBoundaryStatus{SessionUser: "pigeoncare_ro", CanCreatePublic: true}},
+		{name: "core_table_mutation_rejected", st: roBoundaryStatus{SessionUser: "pigeoncare_ro", CanMutateCore: true}},
+	}
+	for _, tc := range cases {
+		if err := evaluateROBoundary(tc.st); err == nil {
+			t.Fatalf("%s: expected error, got nil", tc.name)
+		}
+	}
+}
+
+func TestEnsureSchemaAndCopyBatchSQLHygiene(t *testing.T) {
+	if !strings.Contains(ensureSchemaReadyQuery, "to_regclass('public.idx_ledger_metrics_path_gin') IS NULL") {
+		t.Fatal("ensureSchemaReadyQuery must check that idx_ledger_metrics_path_gin has been dropped before taking fast-path")
+	}
+	if !strings.Contains(ensureSchemaDDL, "DROP INDEX IF EXISTS idx_ledger_metrics_path_gin;") {
+		t.Fatal("ensureSchemaDDL must drop legacy idx_ledger_metrics_path_gin")
+	}
+	if strings.Contains(ensureSchemaDDL, "CREATE INDEX IF NOT EXISTS idx_ledger_metrics_path_gin") ||
+		strings.Contains(ensureSchemaDDL, "jsonb_path_ops") {
+		t.Fatal("ensureSchemaDDL must not recreate unused idx_ledger_metrics_path_gin")
+	}
+
+	initSQLPath := filepath.Join("..", "..", "..", "deployments", "compose", "init.sql")
+	initSQL, err := os.ReadFile(initSQLPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", initSQLPath, err)
+	}
+	if strings.Contains(string(initSQL), "idx_ledger_metrics_path_gin") {
+		t.Fatalf("%s must not create unused idx_ledger_metrics_path_gin", initSQLPath)
+	}
+	if !strings.Contains(string(initSQL), "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM PUBLIC, pigeoncare_ro;") ||
+		!strings.Contains(string(initSQL), "REVOKE CREATE ON SCHEMA public FROM PUBLIC, pigeoncare_ro;") {
+		t.Fatalf("%s must revoke write/CREATE privileges from both PUBLIC and pigeoncare_ro", initSQLPath)
+	}
+
+	if !strings.Contains(upsertBatchNodeLastSeenSQL, "WHERE ctd_nodes.last_seen IS NULL") ||
+		!strings.Contains(upsertBatchNodeLastSeenSQL, "ctd_nodes.last_seen < EXCLUDED.last_seen - INTERVAL '5 seconds'") {
+		t.Fatalf("upsertBatchNodeLastSeenSQL missing 5s throttle predicate: %s", upsertBatchNodeLastSeenSQL)
 	}
 }

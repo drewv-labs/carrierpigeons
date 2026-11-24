@@ -3,6 +3,11 @@ package db
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/pbkdf2"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -363,28 +368,9 @@ func NewPostgresStoreWithOptions(ctx context.Context, connStr string, opts Store
 	}
 
 	if opts.EnforceNonSuperuser {
-		var sessionUser string
-		var isSuper bool
-		var canMutateLedger bool
-		checkErr := pool.QueryRow(ctx, `
-			SELECT
-				SESSION_USER,
-				COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = SESSION_USER), false),
-				CASE
-					WHEN to_regclass('public.telemetric_ledger') IS NULL THEN false
-					ELSE has_table_privilege(SESSION_USER, 'public.telemetric_ledger', 'INSERT, UPDATE, DELETE, TRUNCATE')
-				END
-		`).Scan(&sessionUser, &isSuper, &canMutateLedger)
-		if checkErr != nil {
+		if err := verifyNonSuperuserPool(ctx, pool); err != nil {
 			pool.Close()
-			return nil, fmt.Errorf("verify read-only PostgreSQL role boundary: %w", checkErr)
-		}
-		if isSuper || canMutateLedger {
-			pool.Close()
-			return nil, fmt.Errorf(
-				"hard read-only boundary violation: connected as privileged/writable PostgreSQL role %q (provision least-privilege roles via `pigeons coop provision-roles` and connect as `pigeoncare_ro`, or set PIGEONS_ALLOW_SUPERUSER_RO=true only for isolated local testing)",
-				sessionUser,
-			)
+			return nil, err
 		}
 	}
 
@@ -414,30 +400,84 @@ func (s *PostgresStore) Close() {
 	}
 }
 
-// EnsureSchema migrates the core CTD Ledger tables, Node/Tag Registry, MNS singleton, attribution columns, and PigeonMath schema.
-func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
-	var ready bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT
-			(
-				SELECT COUNT(*) = 5
-				FROM information_schema.tables
-				WHERE table_schema = 'public'
-				  AND table_name IN ('telemetric_ledger', 'ctd_nodes', 'ctd_artifacts', 'ctd_traces', 'ctd_mesh')
-			)
-			AND
-			(
-				SELECT COUNT(*) = 3
-				FROM information_schema.columns
-				WHERE table_schema = 'public'
-				  AND table_name = 'telemetric_ledger'
-				  AND column_name IN ('ingested_at', 'db_actor', 'app_actor')
-			)
-	`).Scan(&ready); err == nil && ready {
-		return s.EnsureMathSchema(ctx)
-	}
+const enforceNonSuperuserQuery = `
+	SELECT
+		SESSION_USER,
+		COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = SESSION_USER), true) AS is_super,
+		COALESCE(has_schema_privilege(SESSION_USER, 'public', 'CREATE'), true) AS can_create_public,
+		(to_regclass('public.telemetric_ledger') IS NULL) AS ledger_missing,
+		(
+			SELECT COALESCE(bool_or(has_table_privilege(SESSION_USER, tbl, 'INSERT, UPDATE, DELETE, TRUNCATE')), false)
+			FROM unnest(ARRAY[
+				'public.telemetric_ledger',
+				'public.ctd_nodes',
+				'public.ctd_artifacts',
+				'public.ctd_traces',
+				'public.ctd_mesh'
+			]) AS tbl
+			WHERE to_regclass(tbl) IS NOT NULL
+		) AS can_mutate_core
+`
 
-	ddl := `
+type roBoundaryStatus struct {
+	SessionUser     string
+	IsSuper         bool
+	CanCreatePublic bool
+	LedgerMissing   bool
+	CanMutateCore   bool
+}
+
+func evaluateROBoundary(st roBoundaryStatus) error {
+	if st.LedgerMissing {
+		return fmt.Errorf(
+			"hard read-only boundary violation: core table public.telemetric_ledger does not exist yet (refusing fail-open read-only connection as %q)",
+			st.SessionUser,
+		)
+	}
+	if st.IsSuper || st.CanCreatePublic || st.CanMutateCore {
+		return fmt.Errorf(
+			"hard read-only boundary violation: connected as privileged/writable PostgreSQL role %q (super=%v, create_public=%v, mutate_core=%v; provision least-privilege roles via `pigeons coop provision-roles` and connect as `pigeoncare_ro`, or set PIGEONS_ALLOW_SUPERUSER_RO=true only for isolated local testing)",
+			st.SessionUser, st.IsSuper, st.CanCreatePublic, st.CanMutateCore,
+		)
+	}
+	return nil
+}
+
+func verifyNonSuperuserPool(ctx context.Context, pool *pgxpool.Pool) error {
+	var st roBoundaryStatus
+	err := pool.QueryRow(ctx, enforceNonSuperuserQuery).Scan(
+		&st.SessionUser,
+		&st.IsSuper,
+		&st.CanCreatePublic,
+		&st.LedgerMissing,
+		&st.CanMutateCore,
+	)
+	if err != nil {
+		return fmt.Errorf("verify read-only PostgreSQL role boundary: %w", err)
+	}
+	return evaluateROBoundary(st)
+}
+
+const ensureSchemaReadyQuery = `
+	SELECT
+		(
+			SELECT COUNT(*) = 5
+			FROM information_schema.tables
+			WHERE table_schema = 'public'
+			  AND table_name IN ('telemetric_ledger', 'ctd_nodes', 'ctd_artifacts', 'ctd_traces', 'ctd_mesh')
+		)
+		AND
+		(
+			SELECT COUNT(*) = 3
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'telemetric_ledger'
+			  AND column_name IN ('ingested_at', 'db_actor', 'app_actor')
+		)
+		AND to_regclass('public.idx_ledger_metrics_path_gin') IS NULL
+`
+
+const ensureSchemaDDL = `
 	CREATE TABLE IF NOT EXISTS telemetric_ledger (
 		id BIGSERIAL PRIMARY KEY,
 		node_id TEXT NOT NULL,
@@ -458,12 +498,12 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 
 	DROP INDEX IF EXISTS idx_ledger_pillar;
 	DROP INDEX IF EXISTS idx_ledger_metrics_gin;
+	DROP INDEX IF EXISTS idx_ledger_metrics_path_gin;
 	CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id, component, event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts ON telemetric_ledger (ingested_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';
-	CREATE INDEX IF NOT EXISTS idx_ledger_metrics_path_gin ON telemetric_ledger USING GIN (metrics jsonb_path_ops);
 
 	CREATE TABLE IF NOT EXISTS ctd_nodes (
 		node_id TEXT PRIMARY KEY,
@@ -518,8 +558,16 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_by TEXT NOT NULL DEFAULT SESSION_USER
 	);
-	`
-	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+`
+
+// EnsureSchema migrates the core CTD Ledger tables, Node/Tag Registry, MNS singleton, attribution columns, and PigeonMath schema.
+func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
+	var ready bool
+	if err := s.pool.QueryRow(ctx, ensureSchemaReadyQuery).Scan(&ready); err == nil && ready {
+		return s.EnsureMathSchema(ctx)
+	}
+
+	if _, err := s.pool.Exec(ctx, ensureSchemaDDL); err != nil {
 		return err
 	}
 	return s.EnsureMathSchema(ctx)
@@ -660,6 +708,96 @@ func validateProvisionRolePasswords(host, ingestPassword, readOnlyPassword strin
 	return ingestPassword, readOnlyPassword, nil
 }
 
+const (
+	scramSHA256SaltBytes  = 16
+	scramSHA256Iterations = 4096
+)
+
+func hmacSHA256(key, data []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	return mac.Sum(nil)
+}
+
+// buildSCRAMSHA256VerifierWithSalt computes a PostgreSQL-compatible SCRAM-SHA-256 verifier
+// per RFC 7677 / RFC 5802 (`SCRAM-SHA-256$<iter>:<base64(salt)>$<base64(StoredKey)>:<base64(ServerKey)>`).
+func buildSCRAMSHA256VerifierWithSalt(password string, salt []byte, iterations int) (string, error) {
+	if password == "" {
+		return "", fmt.Errorf("SCRAM-SHA-256 password cannot be empty")
+	}
+	if strings.ContainsRune(password, '\x00') {
+		return "", fmt.Errorf("SCRAM-SHA-256 password cannot contain NUL byte")
+	}
+	if len(salt) == 0 {
+		return "", fmt.Errorf("SCRAM-SHA-256 salt cannot be empty")
+	}
+	if iterations <= 0 {
+		return "", fmt.Errorf("SCRAM-SHA-256 iterations must be positive, got %d", iterations)
+	}
+
+	saltedPassword, err := pbkdf2.Key(sha256.New, password, salt, iterations, sha256.Size)
+	if err != nil {
+		return "", fmt.Errorf("derive SCRAM-SHA-256 salted password: %w", err)
+	}
+	clientKey := hmacSHA256(saltedPassword, []byte("Client Key"))
+	storedKey := sha256.Sum256(clientKey)
+	serverKey := hmacSHA256(saltedPassword, []byte("Server Key"))
+
+	return fmt.Sprintf(
+		"SCRAM-SHA-256$%d:%s$%s:%s",
+		iterations,
+		base64.StdEncoding.EncodeToString(salt),
+		base64.StdEncoding.EncodeToString(storedKey[:]),
+		base64.StdEncoding.EncodeToString(serverKey),
+	), nil
+}
+
+// buildSCRAMSHA256Verifier derives a PostgreSQL SCRAM-SHA-256 verifier using a CSPRNG 16-byte salt
+// so plaintext role passwords never leave the Go process in DDL SQL.
+func buildSCRAMSHA256Verifier(password string) (string, error) {
+	salt := make([]byte, scramSHA256SaltBytes)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("generate SCRAM-SHA-256 salt: %w", err)
+	}
+	return buildSCRAMSHA256VerifierWithSalt(password, salt, scramSHA256Iterations)
+}
+
+func buildProvisionRolesSQL(mathSchema, ingestVerifier, readOnlyVerifier string) string {
+	escapeLit := func(v string) string {
+		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	}
+	return fmt.Sprintf(`
+	DO $provision$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ctd_ingestor') THEN
+			EXECUTE 'CREATE ROLE ctd_ingestor NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD ' || quote_literal(%[1]s);
+		ELSE
+			EXECUTE 'ALTER ROLE ctd_ingestor WITH LOGIN PASSWORD ' || quote_literal(%[1]s);
+		END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pigeoncare_ro') THEN
+			EXECUTE 'CREATE ROLE pigeoncare_ro NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD ' || quote_literal(%[2]s);
+		ELSE
+			EXECUTE 'ALTER ROLE pigeoncare_ro WITH LOGIN PASSWORD ' || quote_literal(%[2]s);
+		END IF;
+	END
+	$provision$;
+
+	GRANT USAGE ON SCHEMA public TO ctd_ingestor;
+	GRANT SELECT, INSERT ON telemetric_ledger, ctd_traces TO ctd_ingestor;
+	GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts, ctd_mesh TO ctd_ingestor;
+	GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ctd_ingestor;
+
+	REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM PUBLIC, pigeoncare_ro;
+	REVOKE CREATE ON SCHEMA public FROM PUBLIC, pigeoncare_ro;
+	GRANT USAGE ON SCHEMA public TO pigeoncare_ro;
+	GRANT SELECT ON ALL TABLES IN SCHEMA public TO pigeoncare_ro;
+	ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO pigeoncare_ro;
+
+	GRANT USAGE, CREATE ON SCHEMA %[3]s TO pigeoncare_ro;
+	GRANT SELECT, INSERT, UPDATE, DELETE ON %[3]s.pmv_catalog TO pigeoncare_ro;
+	`, escapeLit(ingestVerifier), escapeLit(readOnlyVerifier), mathSchema)
+}
+
 // ProvisionRoles idempotently configures least-privilege PostgreSQL roles:
 // - `ctd_ingestor`: Write/COPY access for PigeonCoop ingestion.
 // - `pigeoncare_ro`: Strictly Read-Only on `public.*` + isolated view creation in `pigeonmath`.
@@ -676,41 +814,16 @@ func (s *PostgresStore) ProvisionRoles(ctx context.Context, ingestPassword, read
 	if err != nil {
 		return err
 	}
-	escapeLit := func(v string) string {
-		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	ingestVerifier, err := buildSCRAMSHA256Verifier(ingestPassword)
+	if err != nil {
+		return fmt.Errorf("build ctd_ingestor verifier: %w", err)
+	}
+	readOnlyVerifier, err := buildSCRAMSHA256Verifier(readOnlyPassword)
+	if err != nil {
+		return fmt.Errorf("build pigeoncare_ro verifier: %w", err)
 	}
 
-	sql := fmt.Sprintf(`
-	DO $$
-	BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ctd_ingestor') THEN
-			EXECUTE 'CREATE ROLE ctd_ingestor NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD ' || quote_literal(%[1]s);
-		ELSE
-			EXECUTE 'ALTER ROLE ctd_ingestor WITH LOGIN PASSWORD ' || quote_literal(%[1]s);
-		END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pigeoncare_ro') THEN
-			EXECUTE 'CREATE ROLE pigeoncare_ro NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD ' || quote_literal(%[2]s);
-		ELSE
-			EXECUTE 'ALTER ROLE pigeoncare_ro WITH LOGIN PASSWORD ' || quote_literal(%[2]s);
-		END IF;
-	END
-	$$;
-
-	GRANT USAGE ON SCHEMA public TO ctd_ingestor;
-	GRANT SELECT, INSERT ON telemetric_ledger, ctd_traces TO ctd_ingestor;
-	GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts, ctd_mesh TO ctd_ingestor;
-	GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ctd_ingestor;
-
-	REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM pigeoncare_ro;
-	REVOKE CREATE ON SCHEMA public FROM pigeoncare_ro;
-	GRANT USAGE ON SCHEMA public TO pigeoncare_ro;
-	GRANT SELECT ON ALL TABLES IN SCHEMA public TO pigeoncare_ro;
-	ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO pigeoncare_ro;
-
-	GRANT USAGE, CREATE ON SCHEMA %[3]s TO pigeoncare_ro;
-	GRANT SELECT, INSERT, UPDATE, DELETE ON %[3]s.pmv_catalog TO pigeoncare_ro;
-	`, escapeLit(ingestPassword), escapeLit(readOnlyPassword), s.mathSchema)
-
+	sql := buildProvisionRolesSQL(s.mathSchema, ingestVerifier, readOnlyVerifier)
 	_, err = s.pool.Exec(ctx, sql)
 	return err
 }
@@ -915,6 +1028,16 @@ func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payload
 	return leftCount + rightCount, leftErr
 }
 
+const upsertBatchNodeLastSeenSQL = `
+	INSERT INTO ctd_nodes (node_id, last_seen, updated_at)
+	SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $2::timestamptz[])
+	ON CONFLICT (node_id) DO UPDATE
+	SET last_seen = GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen),
+	    updated_at = EXCLUDED.updated_at
+	WHERE ctd_nodes.last_seen IS NULL
+	   OR ctd_nodes.last_seen < EXCLUDED.last_seen - INTERVAL '5 seconds'
+`
+
 func (s *PostgresStore) execCopyBatch(
 	ctx context.Context,
 	copyRows [][]any,
@@ -951,13 +1074,7 @@ func (s *PostgresStore) execCopyBatch(
 		for i, nodeID := range nodeIDs {
 			timestamps[i] = nodeLastSeen[nodeID]
 		}
-		batch.Queue(`
-			INSERT INTO ctd_nodes (node_id, last_seen, updated_at)
-			SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $2::timestamptz[])
-			ON CONFLICT (node_id) DO UPDATE
-			SET last_seen = GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen),
-			    updated_at = EXCLUDED.updated_at
-		`, nodeIDs, timestamps)
+		batch.Queue(upsertBatchNodeLastSeenSQL, nodeIDs, timestamps)
 		queued++
 	}
 
