@@ -272,7 +272,7 @@ func (s *Service) Execute(ctx context.Context, name string, args map[string]any)
 
 	switch name {
 	case "get_cluster_status":
-		summaries, err := s.store.GetClusterStatus(ctx, 90*time.Second)
+		summaries, err := s.store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
 			return fmt.Sprintf("Database error: %v", err)
 		}

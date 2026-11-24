@@ -179,7 +179,7 @@ func (a *ClaudeAdapter) Chat(ctx context.Context, systemPrompt string, history [
 		}
 
 		var result claudeResponse
-		err = json.NewDecoder(resp.Body).Decode(&result)
+		err = json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&result)
 		resp.Body.Close()
 		if err != nil || len(result.Content) == 0 {
 			return false, fmt.Errorf("failed to decode claude response")
@@ -249,7 +249,7 @@ func (a *ClaudeAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 			anthropicTools = convertToAnthropicTools(a.tools.Definitions())
 		}
 
-		_ = runToolLoop(defaultMaxToolTurns, "claude", func(_ int) (bool, error) {
+		if err := runToolLoop(defaultMaxToolTurns, "claude", func(_ int) (bool, error) {
 			payload := map[string]any{
 				"model":      a.model,
 				"max_tokens": 2048,
@@ -472,7 +472,9 @@ func (a *ClaudeAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				map[string]any{"role": "user", "content": toolResults},
 			)
 			return false, nil
-		})
+		}); err != nil && ctx.Err() == nil {
+			sendToken(ctx, tokenChan, fmt.Sprintf("\n[Claude tool loop error: %v]", err))
+		}
 	}()
 
 	return tokenChan, nil

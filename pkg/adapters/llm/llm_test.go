@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -222,4 +223,187 @@ func TestClaudeSSEStreamingAndToolLoop(t *testing.T) {
 	if !strings.Contains(out.String(), "Running tool: get_node_telemetry") || !strings.Contains(out.String(), "Claude SSE verified.") {
 		t.Fatalf("unexpected Claude SSE output: %q", out.String())
 	}
+}
+
+func TestStreamChatEmitsTerminalErrorOnMaxToolTurns(t *testing.T) {
+	t.Run("claude", func(t *testing.T) {
+		var turns atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			n := turns.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_%d\",\"name\":\"get_node_telemetry\"}}\n", n)
+			_, _ = fmt.Fprintln(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"node_id\":\"rv64-compute-01\"}"}}`)
+			_, _ = fmt.Fprintln(w, `data: {"type":"message_stop"}`)
+		}))
+		defer srv.Close()
+
+		adapter := NewClaudeAdapterWithEndpoint(srv.URL, "test-key", "claude-sonnet-4-5", &stubToolExecutor{})
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "loop"}})
+		if err != nil {
+			t.Fatalf("Claude StreamChat error: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		if turns.Load() != defaultMaxToolTurns {
+			t.Fatalf("expected %d turns, got %d", defaultMaxToolTurns, turns.Load())
+		}
+		if !strings.Contains(out.String(), "[Claude tool loop error:") || !strings.Contains(out.String(), "exceeded max turns") {
+			t.Fatalf("expected terminal Claude tool loop error token, got %q", out.String())
+		}
+	})
+
+	t.Run("openai", func(t *testing.T) {
+		var turns atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			n := turns.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_%d\",\"function\":{\"name\":\"get_node_telemetry\",\"arguments\":\"{\\\"node_id\\\":\\\"rv64-compute-01\\\"}\"}}]}}]}\n", n)
+			_, _ = fmt.Fprintln(w, `data: [DONE]`)
+		}))
+		defer srv.Close()
+
+		adapter := NewOpenAIAdapter(srv.URL+"/v1/chat/completions", "test-key", "gpt-4o", &stubToolExecutor{})
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "loop"}})
+		if err != nil {
+			t.Fatalf("OpenAI StreamChat error: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		if turns.Load() != defaultMaxToolTurns {
+			t.Fatalf("expected %d turns, got %d", defaultMaxToolTurns, turns.Load())
+		}
+		if !strings.Contains(out.String(), "[OpenAI tool loop error:") || !strings.Contains(out.String(), "exceeded max turns") {
+			t.Fatalf("expected terminal OpenAI tool loop error token, got %q", out.String())
+		}
+	})
+
+	t.Run("ollama", func(t *testing.T) {
+		var turns atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			turns.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": Message{
+					Role: "assistant",
+					ToolCalls: []ToolCall{
+						{Function: ToolCallFunction{
+							Name:      "get_node_telemetry",
+							Arguments: map[string]any{"node_id": "rv64-compute-01"},
+						}},
+					},
+				},
+			})
+		}))
+		defer srv.Close()
+
+		adapter := NewOllamaAdapter(srv.URL, "qwen2.5-coder", &stubToolExecutor{})
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "loop"}})
+		if err != nil {
+			t.Fatalf("Ollama StreamChat error: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		if turns.Load() != defaultOllamaMaxTurn {
+			t.Fatalf("expected %d turns, got %d", defaultOllamaMaxTurn, turns.Load())
+		}
+		if !strings.Contains(out.String(), "[Ollama tool loop error:") || !strings.Contains(out.String(), "exceeded max turns") {
+			t.Fatalf("expected terminal Ollama tool loop error token, got %q", out.String())
+		}
+	})
+}
+
+func TestChatRejectsOversizedResponseBody(t *testing.T) {
+	oversizedText := strings.Repeat("a", 4*1024*1024+1024)
+
+	t.Run("claude", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"stop_reason":"end_turn","content":[{"type":"text","text":"%s"}]}`, oversizedText)
+		}))
+		defer srv.Close()
+
+		adapter := NewClaudeAdapterWithEndpoint(srv.URL, "test-key", "claude-sonnet-4-5", nil)
+		_, err := adapter.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "hi"}})
+		if err == nil || !strings.Contains(err.Error(), "failed to decode claude response") {
+			t.Fatalf("expected decode failure on oversized Claude response, got %v", err)
+		}
+	})
+
+	t.Run("openai", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":"%s"}}]}`, oversizedText)
+		}))
+		defer srv.Close()
+
+		adapter := NewOpenAIAdapter(srv.URL+"/v1/chat/completions", "test-key", "gpt-4o", nil)
+		_, err := adapter.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "hi"}})
+		if err == nil || !strings.Contains(err.Error(), "failed to decode openai response") {
+			t.Fatalf("expected decode failure on oversized OpenAI response, got %v", err)
+		}
+	})
+}
+
+func TestOllamaChatPropagatesToolLoopAndCancelErrors(t *testing.T) {
+	t.Run("max_turns_exceeded", func(t *testing.T) {
+		var turns atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			turns.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": Message{
+					Role:    "assistant",
+					Content: "Checking telemetry...",
+					ToolCalls: []ToolCall{
+						{Function: ToolCallFunction{
+							Name:      "get_node_telemetry",
+							Arguments: map[string]any{"node_id": "rv64-compute-01"},
+						}},
+					},
+				},
+			})
+		}))
+		defer srv.Close()
+
+		adapter := NewOllamaAdapter(srv.URL, "qwen2.5-coder", &stubToolExecutor{})
+		reply, err := adapter.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "loop"}})
+		if err == nil || !strings.Contains(err.Error(), "exceeded max turns") {
+			t.Fatalf("expected max turns error from OllamaAdapter.Chat, got reply=%q err=%v", reply, err)
+		}
+		if turns.Load() != defaultOllamaMaxTurn {
+			t.Fatalf("expected %d turns, got %d", defaultOllamaMaxTurn, turns.Load())
+		}
+	})
+
+	t.Run("mid_stream_context_cancel", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		chunkSent := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = fmt.Fprintln(w, `{"message":{"role":"assistant","content":"CERTIFIED: "}}`)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			close(chunkSent)
+			<-r.Context().Done()
+		}))
+		defer srv.Close()
+
+		go func() {
+			<-chunkSent
+			cancel()
+		}()
+
+		adapter := NewOllamaAdapter(srv.URL, "qwen2.5-coder", nil)
+		reply, err := adapter.Chat(ctx, "sys", []Message{{Role: "user", Content: "verify"}})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled on mid-stream cancellation, got reply=%q err=%v", reply, err)
+		}
+	})
 }

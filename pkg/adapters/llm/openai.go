@@ -141,7 +141,7 @@ func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history [
 			} `json:"choices"`
 		}
 
-		err = json.NewDecoder(resp.Body).Decode(&result)
+		err = json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&result)
 		resp.Body.Close()
 		if err != nil || len(result.Choices) == 0 {
 			return false, fmt.Errorf("failed to decode openai response")
@@ -181,7 +181,7 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 		defer close(tokenChan)
 		messages := buildOpenAIMessages(systemPrompt, history)
 
-		_ = runToolLoop(defaultMaxToolTurns, "openai", func(_ int) (bool, error) {
+		if err := runToolLoop(defaultMaxToolTurns, "openai", func(_ int) (bool, error) {
 			payload := map[string]any{
 				"model":    a.model,
 				"messages": messages,
@@ -339,7 +339,9 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				})
 			}
 			return false, nil
-		})
+		}); err != nil && ctx.Err() == nil {
+			sendToken(ctx, tokenChan, fmt.Sprintf("\n[OpenAI tool loop error: %v]", err))
+		}
 	}()
 
 	return tokenChan, nil

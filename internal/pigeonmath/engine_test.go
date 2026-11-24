@@ -112,6 +112,7 @@ func (f *fakeAgentSafeStore) Close() {}
 type stubOptimizerLLM struct {
 	optimizeReply string
 	verifyReply   string
+	verifyErr     error
 	calls         int
 }
 
@@ -119,6 +120,9 @@ func (s *stubOptimizerLLM) Chat(_ context.Context, _ string, _ []llm.Message) (s
 	s.calls++
 	if s.calls == 1 {
 		return s.optimizeReply, nil
+	}
+	if s.verifyErr != nil {
+		return "", s.verifyErr
 	}
 	return s.verifyReply, nil
 }
@@ -204,6 +208,66 @@ func TestSubmitAndCertifyPMVDoesNotMaterializeOnRejection(t *testing.T) {
 	}
 	if _, exists := store.materialized["pmv_broken_view"]; exists {
 		t.Fatal("rejected view MUST NOT be materialized in pigeonmath schema")
+	}
+}
+
+func TestSubmitAndCertifyPMVFailsClosedOnCertificationError(t *testing.T) {
+	store := newFakeAgentSafeStore()
+	eng := NewEngine(store)
+
+	rawSQL := "SELECT node_id FROM ctd_nodes"
+	errLLM := &stubOptimizerLLM{
+		optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes\n```",
+		verifyErr:     errors.New("upstream LLM timeout"),
+	}
+
+	rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "err_view", rawSQL, errLLM)
+	if err == nil {
+		t.Fatal("expected certification error when post-check LLM fails")
+	}
+	if rec == nil || rec.Status != "failed" {
+		t.Fatalf("expected returned draft status=failed, got %+v", rec)
+	}
+	if persisted, ok := store.pmvs["pmv_err_view"]; !ok || persisted.Status != "failed" {
+		t.Fatalf("expected persisted draft status=failed, got %+v (exists=%v)", persisted, ok)
+	}
+	if _, exists := store.materialized["pmv_err_view"]; exists {
+		t.Fatal("view MUST NOT be materialized when certification check errors")
+	}
+}
+
+func TestSubmitAndCertifyPMVFailsClosedOnEmptyVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply string
+	}{
+		{name: "empty", reply: ""},
+		{name: "whitespace", reply: "   \n\t  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAgentSafeStore()
+			eng := NewEngine(store)
+
+			rawSQL := "SELECT node_id FROM ctd_nodes"
+			emptyLLM := &stubOptimizerLLM{
+				optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes\n```",
+				verifyReply:   tc.reply,
+			}
+
+			rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "empty_verdict_view", rawSQL, emptyLLM)
+			if err == nil {
+				t.Fatal("expected error when certification verdict is empty/whitespace")
+			}
+			if rec == nil || rec.Status != "failed" {
+				t.Fatalf("expected returned draft status=failed, got %+v", rec)
+			}
+			if persisted, ok := store.pmvs["pmv_empty_verdict_view"]; !ok || persisted.Status != "failed" {
+				t.Fatalf("expected persisted draft status=failed, got %+v (exists=%v)", persisted, ok)
+			}
+			if _, exists := store.materialized["pmv_empty_verdict_view"]; exists {
+				t.Fatal("view MUST NOT be materialized when certification verdict is empty")
+			}
+		})
 	}
 }
 
