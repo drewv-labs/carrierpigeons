@@ -1,35 +1,43 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
-	"os"
+	"sort"
 	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/spf13/cobra"
 )
 
+const defaultMNSRetainedMaxAge = 24 * time.Hour
+
+// mnsRetainedMaxAge bounds how old a retained MQTT MNS announcement may be before
+// `connect` rejects it as stale. Package-level var for deterministic unit testing.
+var mnsRetainedMaxAge = defaultMNSRetainedMaxAge
+
 var (
-	connectBrokerURL   string
-	connectDBURL       string
-	connectRODBURL     string
-	connectMQTTUser    string
-	connectMQTTPass    string
-	connectTLSCA       string
-	connectTLSCert     string
-	connectTLSKey      string
-	connectTLSInsecure bool
-	connectTopicRoot   string
-	connectSkipVerify  bool
+	connectBrokerURL          string
+	connectDBURL              string
+	connectRODBURL            string
+	connectMQTTUser           string
+	connectMQTTPass           string
+	connectTLSCA              string
+	connectTLSCert            string
+	connectTLSKey             string
+	connectTLSInsecure        bool
+	connectTopicRoot          string
+	connectSkipVerify         bool
+	connectAllowPartialVerify bool
 )
 
 var connectCmd = &cobra.Command{
@@ -80,7 +88,9 @@ var meshCurrentCmd = &cobra.Command{
 	Short: "Print the active working mesh name for shell prompts and scripts",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		effective, err := config.LoadWorkstationConfigForMesh(cfgFilePath, meshFlag)
+		state := cliStateFromCommand(cmd)
+		cfgPath, meshName := persistentConfigFlags(cmd)
+		effective, err := loadWorkstationConfigForBrand(cfgPath, meshName, state.brand, false)
 		if err != nil {
 			return err
 		}
@@ -112,55 +122,59 @@ func init() {
 	f.BoolVar(&connectTLSInsecure, "tls-insecure", false, "Skip TLS hostname/CA verification for lab self-signed brokers")
 	f.StringVar(&connectTopicRoot, "topic-root", "", "Register or update mesh MQTT topic root override")
 	f.BoolVar(&connectSkipVerify, "no-verify", false, "Switch working mesh offline without live MNS handshake verification")
+	f.BoolVar(&connectAllowPartialVerify, "allow-partial-verify", false, "Allow switching when at least one MNS source verifies and no source conflicts")
 }
 
 func buildConnectProfilePatch(cmd *cobra.Command) config.MeshProfilePatch {
 	var p config.MeshProfilePatch
 	f := cmd.Flags()
 	if f.Changed("broker") {
-		v := connectBrokerURL
+		v, _ := f.GetString("broker")
 		p.BrokerURL = &v
 	}
 	if f.Changed("db") {
-		v := connectDBURL
+		v, _ := f.GetString("db")
 		p.DatabaseURL = &v
 	}
 	if f.Changed("ro-db") {
-		v := connectRODBURL
+		v, _ := f.GetString("ro-db")
 		p.ReadOnlyDatabaseURL = &v
 	}
 	if f.Changed("mqtt-user") {
-		v := connectMQTTUser
+		v, _ := f.GetString("mqtt-user")
 		p.MQTTUsername = &v
 	}
 	if f.Changed("mqtt-pass") {
-		v := connectMQTTPass
+		v, _ := f.GetString("mqtt-pass")
 		p.MQTTPassword = &v
 	}
 	if f.Changed("tls-ca") {
-		v := connectTLSCA
+		v, _ := f.GetString("tls-ca")
 		p.TLSCAFile = &v
 	}
 	if f.Changed("tls-cert") {
-		v := connectTLSCert
+		v, _ := f.GetString("tls-cert")
 		p.TLSCertFile = &v
 	}
 	if f.Changed("tls-key") {
-		v := connectTLSKey
+		v, _ := f.GetString("tls-key")
 		p.TLSKeyFile = &v
 	}
 	if f.Changed("tls-insecure") {
-		v := connectTLSInsecure
+		v, _ := f.GetBool("tls-insecure")
 		p.TLSInsecureSkipVerify = &v
 	}
 	if f.Changed("topic-root") {
-		v := connectTopicRoot
+		v, _ := f.GetString("topic-root")
 		p.TopicRoot = &v
 	}
 	return p
 }
 
 func runConnectMesh(cmd *cobra.Command, args []string) error {
+	state := cliStateFromCommand(cmd)
+	cfgPath, _ := persistentConfigFlags(cmd)
+
 	rawTarget := strings.TrimSpace(args[0])
 	if rawTarget == "-" {
 		prev, err := config.ReadPreviousMesh()
@@ -168,7 +182,7 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		if prev == "" {
-			return fmt.Errorf("no previous working mesh recorded; run `%s connect <mesh-name>` first", wsCfg.Brand.CLIName)
+			return fmt.Errorf("no previous working mesh recorded; run `%s connect <mesh-name>` first", state.brand.CLIName)
 		}
 		rawTarget = prev
 	}
@@ -179,9 +193,12 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 	targetMesh := rawTarget
 	patch := buildConnectProfilePatch(cmd)
 
-	baseCfg, err := config.LoadBaseWorkstationConfig(cfgFilePath)
+	baseCfg, err := config.LoadBaseWorkstationConfig(cfgPath)
 	if err != nil {
 		return err
+	}
+	if baseCfg.Brand == brand.Default() && state.brand != brand.Default() {
+		baseCfg.Brand = state.brand
 	}
 
 	existingProfile, hasProfile := baseCfg.Meshes[targetMesh]
@@ -212,15 +229,18 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 	probeDB := strings.TrimSpace(mergedProfile.DatabaseURL) != "" ||
 		strings.TrimSpace(mergedProfile.ReadOnlyDatabaseURL) != "" ||
 		isTopLevelMesh ||
-		os.Getenv("PIGEONS_DB_URL") != "" ||
-		os.Getenv("PIGEONS_RO_DB_URL") != ""
+		config.ResolveWorkstationDBURLEnv(candidateCfg.Brand.EnvPrefix) != "" ||
+		config.ResolveWorkstationRODBURLEnv(candidateCfg.Brand.EnvPrefix) != ""
+
+	skipVerify, _ := cmd.Flags().GetBool("no-verify")
+	allowPartialVerify, _ := cmd.Flags().GetBool("allow-partial-verify")
 
 	verifySummary := "unverified (--no-verify)"
-	if !connectSkipVerify {
+	if !skipVerify {
 		ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
 		defer cancel()
 
-		verified, err := verifyRemoteMeshIdentity(ctx, candidateCfg, targetMesh, probeDB)
+		verified, err := verifyRemoteMeshIdentity(ctx, candidateCfg, targetMesh, probeDB, allowPartialVerify)
 		if err != nil {
 			return err
 		}
@@ -229,7 +249,7 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 
 	var savedConfigPath string
 	if !patch.IsEmpty() {
-		savedConfigPath, err = config.UpsertWorkstationMeshProfile(cfgFilePath, targetMesh, patch)
+		savedConfigPath, err = config.UpsertWorkstationMeshProfile(cfgPath, targetMesh, patch)
 		if err != nil {
 			return err
 		}
@@ -245,11 +265,11 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(out, "[+] Registered [meshes.%s] in %s\n", targetMesh, savedConfigPath)
 	}
 	fmt.Fprintf(out, "[+] Connected current working mesh -> %s (%s) [broker=%s, state=%s]\n",
-		targetMesh, verifySummary, candidateCfg.BrokerURL, statePath)
+		targetMesh, verifySummary, config.RedactURL(candidateCfg.BrokerURL), statePath)
 	return nil
 }
 
-func verifyRemoteMeshIdentity(ctx context.Context, cfg config.WorkstationConfig, expectedMesh string, probeDB bool) (string, error) {
+func verifyRemoteMeshIdentity(ctx context.Context, cfg config.WorkstationConfig, expectedMesh string, probeDB, allowPartial bool) (string, error) {
 	type probeResult struct {
 		source   string
 		identity *core.MeshIdentity
@@ -286,20 +306,32 @@ func verifyRemoteMeshIdentity(ctx context.Context, cfg config.WorkstationConfig,
 		verifiedSources []string
 		coopNode        string
 		probeErrors     []string
+		mismatchErr     error
 	)
 
+	var collected []probeResult
 	for r := range results {
-		if r.identity != nil && strings.TrimSpace(r.identity.MeshName) != "" {
+		collected = append(collected, r)
+	}
+	sort.Slice(collected, func(i, j int) bool {
+		return collected[i].source < collected[j].source
+	})
+
+	for _, r := range collected {
+		if r.err == nil && r.identity != nil && strings.TrimSpace(r.identity.MeshName) != "" {
 			got := strings.TrimSpace(r.identity.MeshName)
 			if got != expectedMesh {
 				nodeInfo := ""
 				if r.identity.CoopNodeID != "" {
 					nodeInfo = fmt.Sprintf(" on coop node %q", r.identity.CoopNodeID)
 				}
-				return "", fmt.Errorf(
-					"MNS verification failed via %s: remote %s%s registered mesh_name=%q, expected %q (refusing to switch working mesh)",
-					r.source, cfg.Brand.CoopName, nodeInfo, got, expectedMesh,
-				)
+				if mismatchErr == nil {
+					mismatchErr = fmt.Errorf(
+						"MNS verification failed via %s: remote %s%s registered mesh_name=%q, expected %q (refusing to switch working mesh)",
+						r.source, cfg.Brand.CoopName, nodeInfo, got, expectedMesh,
+					)
+				}
+				continue
 			}
 			verifiedSources = append(verifiedSources, r.source)
 			if coopNode == "" && r.identity.CoopNodeID != "" {
@@ -314,6 +346,10 @@ func verifyRemoteMeshIdentity(ctx context.Context, cfg config.WorkstationConfig,
 		}
 	}
 
+	if mismatchErr != nil {
+		return "", mismatchErr
+	}
+
 	if len(verifiedSources) == 0 {
 		detail := strings.Join(probeErrors, "; ")
 		if detail == "" {
@@ -322,6 +358,13 @@ func verifyRemoteMeshIdentity(ctx context.Context, cfg config.WorkstationConfig,
 		return "", fmt.Errorf(
 			"could not verify remote MNS identity for mesh %q (%s) — ensure %s is running with mesh_name=%q or pass --no-verify for offline switching",
 			expectedMesh, detail, cfg.Brand.CoopName, expectedMesh,
+		)
+	}
+
+	if !allowPartial && len(probeErrors) > 0 {
+		return "", fmt.Errorf(
+			"MNS verification incomplete for mesh %q (%s) — all probed sources must verify cleanly unless --allow-partial-verify is passed",
+			expectedMesh, strings.Join(probeErrors, "; "),
 		)
 	}
 
@@ -343,10 +386,50 @@ func verifyRemoteMeshIdentity(ctx context.Context, cfg config.WorkstationConfig,
 		ordered = append(ordered, "postgres")
 	}
 	summary := "verified via " + strings.Join(ordered, "+")
+	if len(probeErrors) > 0 {
+		summary += " (partial)"
+	}
 	if coopNode != "" {
 		summary += ", coop=" + coopNode
 	}
 	return summary, nil
+}
+
+type retainedMeshPayload struct {
+	MeshName   string    `json:"mesh_name"`
+	CoopNodeID string    `json:"coop_node_id"`
+	TopicRoot  string    `json:"topic_root,omitempty"`
+	Status     string    `json:"status"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+func validateRetainedMeshPayload(raw []byte, meshTopic, coopName string, now time.Time) (*core.MeshIdentity, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, fmt.Errorf("retained MNS announcement on %s is empty (cleared)", meshTopic)
+	}
+	var payload retainedMeshPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("decode retained MNS payload on %s: %w", meshTopic, err)
+	}
+	if strings.EqualFold(strings.TrimSpace(payload.Status), "OFFLINE") {
+		return nil, fmt.Errorf("remote %s on %s is OFFLINE (LWT)", coopName, meshTopic)
+	}
+	if strings.TrimSpace(payload.MeshName) == "" {
+		return nil, fmt.Errorf("retained MNS payload on %s has empty mesh_name", meshTopic)
+	}
+	if payload.UpdatedAt.IsZero() {
+		return nil, fmt.Errorf("retained MNS payload on %s is missing updated_at", meshTopic)
+	}
+	if mnsRetainedMaxAge > 0 && now.Sub(payload.UpdatedAt) > mnsRetainedMaxAge {
+		return nil, fmt.Errorf("retained MNS announcement on %s is stale (updated_at=%s, age>%s)",
+			meshTopic, payload.UpdatedAt.UTC().Format(time.RFC3339), mnsRetainedMaxAge)
+	}
+	return &core.MeshIdentity{
+		MeshName:   payload.MeshName,
+		CoopNodeID: payload.CoopNodeID,
+		TopicRoot:  payload.TopicRoot,
+		UpdatedAt:  payload.UpdatedAt,
+	}, nil
 }
 
 func probeMQTTMeshIdentity(ctx context.Context, cfg config.WorkstationConfig) (*core.MeshIdentity, error) {
@@ -385,11 +468,7 @@ func probeMQTTMeshIdentity(ctx context.Context, cfg config.WorkstationConfig) (*
 
 	select {
 	case raw := <-msgCh:
-		var id core.MeshIdentity
-		if err := json.Unmarshal(raw, &id); err != nil {
-			return nil, fmt.Errorf("decode retained MNS payload on %s: %w", meshTopic, err)
-		}
-		return &id, nil
+		return validateRetainedMeshPayload(raw, meshTopic, cfg.Brand.CoopName, time.Now().UTC())
 	case <-waitTimer.C:
 		return nil, fmt.Errorf("no retained MNS announcement on %s", meshTopic)
 	case <-ctx.Done():
@@ -399,17 +478,21 @@ func probeMQTTMeshIdentity(ctx context.Context, cfg config.WorkstationConfig) (*
 
 func probePostgresMeshIdentity(ctx context.Context, cfg config.WorkstationConfig) (*core.MeshIdentity, error) {
 	actor := fmt.Sprintf("%s-mns:%s", cfg.Brand.CLIName, cfg.Operator)
+	var roProbeErr error
 	if roDSN := strings.TrimSpace(cfg.ReadOnlyDatabaseURL); roDSN != "" {
 		roStore, roErr := db.NewReadOnlyAgentStore(ctx, roDSN, actor, db.ReadOnlyOptions{
 			AllowSuperuser: cfg.AllowSuperuserReadOnly,
 			MathSchema:     cfg.Brand.MathSchema,
 		})
-		if roErr == nil {
+		if roErr != nil {
+			roProbeErr = roErr
+		} else {
 			id, qErr := roStore.GetMeshIdentity(ctx)
 			roStore.Close()
 			if qErr == nil {
 				return id, nil
 			}
+			roProbeErr = qErr
 		}
 	}
 
@@ -427,6 +510,9 @@ func probePostgresMeshIdentity(ctx context.Context, cfg config.WorkstationConfig
 		return opStore.GetMeshIdentity(ctx)
 	}
 
+	if roProbeErr != nil {
+		return nil, roProbeErr
+	}
 	return nil, fmt.Errorf("no database URL configured")
 }
 
@@ -435,22 +521,24 @@ func redactDSN(raw string) string {
 	if trimmed == "" {
 		return "-"
 	}
-	u, err := url.Parse(trimmed)
-	if err != nil {
-		return trimmed
-	}
-	return u.Redacted()
+	return config.RedactURL(trimmed)
 }
 
 func runMeshList(cmd *cobra.Command, _ []string) error {
-	baseCfg, err := config.LoadBaseWorkstationConfig(cfgFilePath)
+	state := cliStateFromCommand(cmd)
+	cfgPath, meshName := persistentConfigFlags(cmd)
+
+	baseCfg, err := config.LoadBaseWorkstationConfig(cfgPath)
 	if err != nil {
 		return err
+	}
+	if baseCfg.Brand == brand.Default() && state.brand != brand.Default() {
+		baseCfg.Brand = state.brand
 	}
 
 	activeName := ""
 	activeSource := "default"
-	if eff, effErr := config.LoadWorkstationConfigForMesh(cfgFilePath, meshFlag); effErr == nil {
+	if eff, effErr := loadWorkstationConfigForBrand(cfgPath, meshName, state.brand, false); effErr == nil {
 		activeName = eff.ActiveMesh
 		if eff.ActiveMeshSource != "" {
 			activeSource = eff.ActiveMeshSource
@@ -468,7 +556,7 @@ func runMeshList(cmd *cobra.Command, _ []string) error {
 			displayActive = core.DefaultMeshName
 		}
 		fmt.Fprintf(out, "Current working mesh: %s (source: %s)\n", displayActive, activeSource)
-		fmt.Fprintf(out, "Broker: %s | Ledger: %s\n", baseCfg.BrokerURL, redactDSN(baseCfg.DatabaseURL))
+		fmt.Fprintf(out, "Broker: %s | Ledger: %s\n", config.RedactURL(baseCfg.BrokerURL), redactDSN(baseCfg.DatabaseURL))
 		fmt.Fprintf(out, "No named `[meshes.<name>]` profiles configured yet. Register one via:\n")
 		fmt.Fprintf(out, "  %s connect <mesh-name> --broker tcp://<host>:1883 --db postgres://<user>:<pass>@<host>:5432/edge_ledger\n",
 			baseCfg.Brand.CLIName)
@@ -489,7 +577,7 @@ func runMeshList(cmd *cobra.Command, _ []string) error {
 			marker = "*"
 		}
 		fmt.Fprintf(w, "  %s\t| %s\t| %s\t| %s\t| %s\n",
-			marker, name, resolved.Brand.TopicRoot, resolved.BrokerURL, redactDSN(resolved.DatabaseURL))
+			marker, name, resolved.Brand.TopicRoot, config.RedactURL(resolved.BrokerURL), redactDSN(resolved.DatabaseURL))
 	}
 	if err := w.Flush(); err != nil {
 		return err

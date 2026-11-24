@@ -59,6 +59,7 @@ Transitioning beyond passive logging, CarrierPigeons pairs continuous hardware o
 
 🏰 **PigeonCoop (`cmd/pigeoncoop` / `pkg/coop`) — Embedded Broker + Batched CTD Ledger Hub**
 * **Zero-Dependency Embedded MQTT Broker:** Ships a pure-Go MQTT v3.1.1/v5.0 broker (`mochi-mqtt`, `CGO_ENABLED=0`) out of the box, with seamless configuration switch (`mqtt.mode = "external"`) for external Mosquitto clusters.
+* **Edge Auth Trust Boundary (`mqtt.edge_username` / `mqtt.edge_password`):** The shared edge credential isolates `Pigeoneer` nodes from admin/control-plane topics (`requests/runner`, `registry/mesh`, wildcards, and other nodes' `control/<id>`), restricting writes to the MQTT `client_id`'s own `ctd/.../<node_id>/...` and `registry/<node_id>/{status,hello}` topics. Because any host holding this shared credential can choose its MQTT `client_id` and impersonate another edge node's `node_id`, use TLS + client certificates or an external broker with per-node credentials when edge nodes are mutually untrusted.
 * **Hypertuned `COPY` Injection Engine:** Dual-trigger batch worker streams CTD wide events into PostgreSQL via binary `COPY FROM STDIN` (`pgx.CopyFrom`) with automatic poison-row fallback and actor attribution (`db_actor`, `app_actor`).
 * **Implicit Self-Observation & Runners:** Every `PigeonCoop` natively observes its own host hardware and executes Runners using top-level `pigeoncoop.toml` settings—no separate edge daemon or duplicated config section required.
 * **Selector Router & Ntfy Watchdog:** Resolves `RunnerRequestCTD` targets across `--all`, `--node`, and `--tag` unions, records provenance edges in `ctd_traces`, and dispatches Ntfy alerts on LWT state transitions.
@@ -114,7 +115,7 @@ Because `pigeoneer` links only the Go standard library, `BurntSushi/toml`, and `
 | **Headless Linux / RISC-V SBCs** | **`< 0.05% – 0.15%` (1 hart)** | Zero subprocess forks; reads `/proc/loadavg`, `/proc/meminfo`, `/proc/net/dev`, `/sys/class/thermal`, `/sys/class/hwmon` (CPU cooler RPM & PWM), and Coral `/sys/class/apex` directly in-process. |
 | **OpenWrt Routers** | **`< 0.05% – 0.15%` (1 core)** | Zero subprocess forks; reads `/proc/uptime`, `/proc/loadavg`, `/proc/meminfo`, `/proc/net/dev` (including `br-lan` bridges), and `/sys` thermal/fan sensors directly in-process. |
 | **Discrete GPU / Hailo NPU Nodes** | **`~0.5% – 2.5%` (1 core)** | Driven by vendor CLI subprocess startup (`nvidia-smi`, `rocm-smi`, `hailortcli`); Intel GPUs use a single persistent `intel_gpu_top` JSON stream (`~0.1% – 0.3%`). |
-| **Active `SyntheticComputeRnr` / `benchmark`** | **`100% × NumCPU()`** | On-demand synthetic stress workload (`sha256` burn) with near-zero heap allocation; completely idle unless explicitly dispatched. |
+| **Active `SyntheticComputeRnr` / `benchmark`** | **`100% × NumCPU()`** | On-demand CPU-only synthetic stress workload (`sha256` burn) with near-zero heap allocation; completely idle unless explicitly dispatched (GPU/NPU burn kernels are not yet implemented). |
 
 <br>
 
