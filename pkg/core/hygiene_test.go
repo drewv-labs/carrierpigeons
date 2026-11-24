@@ -38,6 +38,12 @@ func TestRepositoryUpstreamVendorNeutrality(t *testing.T) {
 		"io_" + "uring",
 		"lil" + "blu",
 		"big" + "red",
+		"10.0." + "10.",
+		"/us" + "ers/",
+		"dark" + "silicon",
+		"pogger" + "box",
+		"coda" + "box",
+		"coffee" + "can",
 	}
 
 	skipExt := map[string]bool{
@@ -49,14 +55,17 @@ func TestRepositoryUpstreamVendorNeutrality(t *testing.T) {
 		if walkErr != nil {
 			return walkErr
 		}
+		name := d.Name()
 		if d.IsDir() {
-			name := d.Name()
 			if name == ".git" || name == "dist" || name == "vendor" {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if skipExt[strings.ToLower(filepath.Ext(d.Name()))] {
+		if name == ".git" {
+			return nil
+		}
+		if skipExt[strings.ToLower(filepath.Ext(name))] {
 			return nil
 		}
 		raw, err := os.ReadFile(path)

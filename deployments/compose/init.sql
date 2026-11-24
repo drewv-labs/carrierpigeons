@@ -20,7 +20,6 @@ CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id
 CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts ON telemetric_ledger (ingested_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';
-CREATE INDEX IF NOT EXISTS idx_ledger_metrics_path_gin ON telemetric_ledger USING GIN (metrics jsonb_path_ops);
 
 CREATE TABLE IF NOT EXISTS ctd_nodes (
 	node_id TEXT PRIMARY KEY,
@@ -109,8 +108,8 @@ GRANT SELECT, INSERT ON telemetric_ledger, ctd_traces TO ctd_ingestor;
 GRANT SELECT, INSERT, UPDATE ON ctd_nodes, ctd_artifacts, ctd_mesh TO ctd_ingestor;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ctd_ingestor;
 
-REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM pigeoncare_ro;
-REVOKE CREATE ON SCHEMA public FROM pigeoncare_ro;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM PUBLIC, pigeoncare_ro;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC, pigeoncare_ro;
 GRANT USAGE ON SCHEMA public TO pigeoncare_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO pigeoncare_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO pigeoncare_ro;

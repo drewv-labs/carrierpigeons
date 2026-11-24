@@ -2,7 +2,7 @@ services:
   postgres-ledger:
     image: postgres:18-alpine
     container_name: pigeon-db
-    command: ["postgres", "-c", "log_statement=ddl", "-c", "log_connections=on"]
+    command: ["postgres", "-c", "log_statement=ddl", "-c", "log_connections=on", "-c", "password_encryption=scram-sha-256"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-pigeoncoop_admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ctd_dev_password}
