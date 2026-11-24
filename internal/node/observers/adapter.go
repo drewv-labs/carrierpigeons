@@ -217,6 +217,11 @@ func runCommand(ctx context.Context, timeout time.Duration, name string, args ..
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, name, args...)
+	configureProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return nil
+	}
 	cmd.WaitDelay = 2 * time.Second
 	out := &limitedWriter{max: maxObserverStdoutBytes}
 	cmd.Stdout = out

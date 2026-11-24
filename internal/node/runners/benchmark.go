@@ -3,6 +3,8 @@ package runners
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
+	"fmt"
 	"runtime"
 	"strconv"
 	"strings"
@@ -79,6 +81,27 @@ func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[str
 	invokedAs, _ := params["invoked_as"].(string)
 	if invokedAs == "" {
 		invokedAs = b.Name()
+	}
+
+	if targetGPU || targetNPU {
+		var unsupported []string
+		if targetGPU {
+			unsupported = append(unsupported, "target_gpu")
+		}
+		if targetNPU {
+			unsupported = append(unsupported, "target_npu")
+		}
+		reason := fmt.Sprintf("hardware burn kernels not implemented for %s", strings.Join(unsupported, ", "))
+		errEv := core.NewCTDPayload(nodeID, "runner:"+invokedAs, "runner-error").
+			WithPillar(core.PillarRunner).
+			AddParam("error", reason)
+		if reqID != "" {
+			errEv.AddParam("request_id", reqID)
+		}
+		if pub != nil {
+			_ = pub.Publish(errEv)
+		}
+		return errors.New(reason)
 	}
 
 	runID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)

@@ -3,10 +3,12 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"maps"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/drewv-labs/carrierpigeons/pkg/observer"
@@ -28,9 +30,41 @@ func (c *MQTTClient) lookupRunner(name string) (runner.Runner, string, bool) {
 	return task, runner.CanonicalKey(name), ok
 }
 
+// WaitRunners stops accepting new runner dispatches and waits up to timeout for active runner
+// goroutines to finish emitting terminal CTD bookends before MQTT socket teardown.
+func (c *MQTTClient) WaitRunners(timeout time.Duration) bool {
+	c.runnerMu.Lock()
+	c.runnersStopped = true
+	c.runnerMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		c.runnerWG.Wait()
+		close(done)
+	}()
+
+	if timeout <= 0 {
+		<-done
+		return true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 // ListenForRunners binds the MQTT client to the node's exclusive control topic and re-subscribes on reconnect.
 func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, pub core.TelemetryPublisher) error {
 	topic := c.brand.ControlTopic(nodeID)
+
+	c.runnerMu.Lock()
+	c.runnersStopped = false
+	c.runnerMu.Unlock()
 
 	var (
 		mu            sync.Mutex
@@ -40,7 +74,10 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 
 	// Cancel all active runners if the daemon shuts down.
 	go func() {
-		<-parentCtx.Done()
+		select {
+		case <-parentCtx.Done():
+		case <-c.stopCh:
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		for key, entry := range activeRunners {
@@ -87,19 +124,29 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 
 		if !exists {
 			log.Printf("[Runner Dispatch] Unknown runner requested: %q", env.Runner)
-			errEv := core.NewCTDPayload(nodeID, "runner:"+env.Runner, "runner-error").
-				WithPillar(core.PillarRunner).
-				AddParam("error", "unknown runner")
-			if env.RequestID != "" {
-				errEv.AddParam("request_id", env.RequestID)
+			if pub != nil {
+				errEv := core.NewCTDPayload(nodeID, "runner:"+env.Runner, "runner-error").
+					WithPillar(core.PillarRunner).
+					AddParam("error", "unknown runner")
+				if env.RequestID != "" {
+					errEv.AddParam("request_id", env.RequestID)
+				}
+				_ = pub.Publish(errEv)
 			}
-			_ = pub.Publish(errEv)
+			return
+		}
+
+		c.runnerMu.Lock()
+		if c.runnersStopped || parentCtx.Err() != nil {
+			c.runnerMu.Unlock()
+			log.Printf("[Runner Dispatch] Ignoring start for %q during shutdown", env.Runner)
 			return
 		}
 
 		mu.Lock()
 		if _, active := activeRunners[runnerKey]; active {
 			mu.Unlock()
+			c.runnerMu.Unlock()
 			log.Printf("[Runner Dispatch] Runner %q (%s) is already active. Ignoring duplicate start.", env.Runner, runnerKey)
 			return
 		}
@@ -113,6 +160,9 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		activeRunners[runnerKey] = &activeRun{id: runID, cancel: cancel}
 		mu.Unlock()
 
+		c.runnerWG.Add(1)
+		c.runnerMu.Unlock()
+
 		params := make(map[string]any, len(env.Params)+2)
 		maps.Copy(params, env.Params)
 		if env.RequestID != "" {
@@ -121,6 +171,7 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		params["invoked_as"] = env.Runner
 
 		go func() {
+			defer c.runnerWG.Done()
 			defer func() {
 				cancel()
 				mu.Lock()
@@ -128,6 +179,18 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 					delete(activeRunners, runnerKey)
 				}
 				mu.Unlock()
+				if r := recover(); r != nil {
+					log.Printf("[Runner Dispatch] Runner %q panicked: %v", env.Runner, r)
+					if pub != nil {
+						errEv := core.NewCTDPayload(nodeID, "runner:"+env.Runner, "runner-error").
+							WithPillar(core.PillarRunner).
+							AddParam("error", fmt.Sprintf("panic: %v", r))
+						if env.RequestID != "" {
+							errEv.AddParam("request_id", env.RequestID)
+						}
+						_ = pub.Publish(errEv)
+					}
+				}
 			}()
 
 			log.Printf("[Runner Dispatch] Executing %q (canonical=%s, request=%s) on %s", env.Runner, runnerKey, env.RequestID, nodeID)
@@ -137,12 +200,18 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		}()
 	}
 
+	subTimeout := c.effectiveSubscribeTimeout()
 	subscribeFn := func(client mqtt.Client) {
-		if tok := client.Subscribe(topic, 1, handler); tok.Wait() && tok.Error() != nil {
-			log.Printf("[Runner Dispatch] Failed subscribing to %s: %v", topic, tok.Error())
-		} else {
-			log.Printf("[Runner Dispatch] Listening on control topic: %s", topic)
+		tok := client.Subscribe(topic, 1, handler)
+		if !tok.WaitTimeout(subTimeout) {
+			log.Printf("[Runner Dispatch] Timed out subscribing to %s after %s", topic, subTimeout)
+			return
 		}
+		if err := tok.Error(); err != nil {
+			log.Printf("[Runner Dispatch] Failed subscribing to %s: %v", topic, err)
+			return
+		}
+		log.Printf("[Runner Dispatch] Listening on control topic: %s", topic)
 	}
 
 	c.subMu.Lock()
@@ -151,7 +220,9 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 
 	if c.client != nil && c.client.IsConnected() {
 		tok := c.client.Subscribe(topic, 1, handler)
-		tok.Wait()
+		if !tok.WaitTimeout(subTimeout) {
+			return fmt.Errorf("subscribe %s timed out after %s", topic, subTimeout)
+		}
 		if err := tok.Error(); err != nil {
 			return err
 		}

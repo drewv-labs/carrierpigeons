@@ -3,10 +3,13 @@ package relay
 import (
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
@@ -16,7 +19,15 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-const maxPipelinedPublishes = 64
+const (
+	maxPipelinedPublishes = 64
+	maxMQTTPayloadBytes   = 1 << 20 // 1 MiB
+	maxPublishAttempts    = 5
+	defaultBatchTimeout   = 5 * time.Second
+	defaultBackoffBase    = 500 * time.Millisecond
+	defaultBackoffMax     = 30 * time.Second
+	defaultSubscribeWait  = 5 * time.Second
+)
 
 // Options configures a node's MQTT relay, ring-buffer spool, LWT presence, TLS, and NodeHello metadata.
 type Options struct {
@@ -54,6 +65,19 @@ type MQTTClient struct {
 
 	subMu        sync.RWMutex
 	onConnectSub func(mqtt.Client)
+
+	runnerMu       sync.Mutex
+	runnersStopped bool
+	runnerWG       sync.WaitGroup
+
+	deliveryDropped atomic.Uint64
+	backoffAttempt  int
+
+	batchTimeout     time.Duration
+	backoffBase      time.Duration
+	backoffMax       time.Duration
+	maxAttempts      int
+	subscribeTimeout time.Duration
 }
 
 // NewMQTTClient initializes the broker connection with default CTD topic routing.
@@ -168,8 +192,10 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 	client := mqtt.NewClient(opts)
 	c.client = client
 
-	if token := client.Connect(); token.WaitTimeout(3*time.Second) && token.Error() != nil {
-		log.Printf("[Relay] Broker unreachable on boot, spooling up to %d events (%v)", c.spool.Cap(), token.Error())
+	if token := client.Connect(); !token.WaitTimeout(3 * time.Second) {
+		log.Printf("[Relay] Broker connect timed out after 3s on boot, spooling up to %d events", c.spool.Cap())
+	} else if err := token.Error(); err != nil {
+		log.Printf("[Relay] Broker unreachable on boot, spooling up to %d events (%v)", c.spool.Cap(), err)
 	}
 
 	go c.flushLoop()
@@ -185,6 +211,95 @@ func (c *MQTTClient) SpoolLen() int {
 // SpoolDropped returns the total number of evicted events when the ring buffer saturated.
 func (c *MQTTClient) SpoolDropped() uint64 {
 	return c.spool.Dropped()
+}
+
+// DeliveryDropped returns the cumulative number of payloads dropped due to marshaling failures,
+// oversized MQTT packets (>1 MiB), or repeated publish failures while connected.
+func (c *MQTTClient) DeliveryDropped() uint64 {
+	return c.deliveryDropped.Load()
+}
+
+func (c *MQTTClient) effectiveBatchTimeout() time.Duration {
+	if c.batchTimeout > 0 {
+		return c.batchTimeout
+	}
+	return defaultBatchTimeout
+}
+
+func (c *MQTTClient) effectiveBackoffBase() time.Duration {
+	if c.backoffBase > 0 {
+		return c.backoffBase
+	}
+	return defaultBackoffBase
+}
+
+func (c *MQTTClient) effectiveBackoffMax() time.Duration {
+	if c.backoffMax > 0 {
+		return c.backoffMax
+	}
+	return defaultBackoffMax
+}
+
+func (c *MQTTClient) effectiveMaxAttempts() int {
+	if c.maxAttempts > 0 {
+		return c.maxAttempts
+	}
+	return maxPublishAttempts
+}
+
+func (c *MQTTClient) effectiveSubscribeTimeout() time.Duration {
+	if c.subscribeTimeout > 0 {
+		return c.subscribeTimeout
+	}
+	return defaultSubscribeWait
+}
+
+func (c *MQTTClient) recordDeliveryDrop(reason string, p *core.CTDPayload, err error) {
+	dropped := c.deliveryDropped.Add(1)
+	if dropped == 1 || dropped%100 == 0 {
+		comp := ""
+		if p != nil {
+			comp = p.Component
+		}
+		log.Printf("[Relay] Dropped CTD payload (%s, component=%q, total_dropped=%d): %v", reason, comp, dropped, err)
+	}
+}
+
+func (c *MQTTClient) nextBackoff(attempt int) time.Duration {
+	base := c.effectiveBackoffBase()
+	maxDur := c.effectiveBackoffMax()
+	if maxDur < base {
+		maxDur = base
+	}
+	delay := base
+	for range attempt {
+		if delay >= maxDur/2 {
+			delay = maxDur
+			break
+		}
+		delay *= 2
+	}
+	if delay > maxDur {
+		delay = maxDur
+	}
+	half := delay / 2
+	if half <= 0 {
+		return delay
+	}
+	return half + time.Duration(rand.Int64N(int64(delay-half)+1))
+}
+
+func (c *MQTTClient) waitRetryBackoff() bool {
+	sleepDur := c.nextBackoff(c.backoffAttempt)
+	c.backoffAttempt++
+	timer := time.NewTimer(sleepDur)
+	defer timer.Stop()
+	select {
+	case <-c.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // Publish enqueues the payload into the ring-buffer spool without ever blocking observers.
@@ -213,6 +328,11 @@ func (c *MQTTClient) Publish(payload *core.CTDPayload) error {
 func (c *MQTTClient) flushLoop() {
 	defer close(c.flushDone)
 	for {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
 		batch, ok := c.spool.PopBatchBlocking(maxPipelinedPublishes, c.stopCh)
 		if !ok {
 			return
@@ -223,9 +343,10 @@ func (c *MQTTClient) flushLoop() {
 
 func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 	type pendingItem struct {
-		payload *core.CTDPayload
-		topic   string
-		raw     []byte
+		payload  *core.CTDPayload
+		topic    string
+		raw      []byte
+		failures int
 	}
 	pending := make([]pendingItem, 0, len(batch))
 	for _, p := range batch {
@@ -234,7 +355,11 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		}
 		raw, err := json.Marshal(p)
 		if err != nil {
-			log.Printf("[Relay] Failed to marshal payload: %v", err)
+			c.recordDeliveryDrop("marshal error", p, err)
+			continue
+		}
+		if len(raw) > maxMQTTPayloadBytes {
+			c.recordDeliveryDrop("payload exceeds max MQTT packet size", p, fmt.Errorf("%d bytes > %d", len(raw), maxMQTTPayloadBytes))
 			continue
 		}
 		pending = append(pending, pendingItem{
@@ -243,32 +368,41 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 			raw:     raw,
 		})
 	}
-
-	requeuePending := func() {
-		items := make([]*core.CTDPayload, 0, len(pending))
-		for _, item := range pending {
-			items = append(items, item.payload)
-		}
-		c.spool.PrependBatch(items)
+	if len(pending) == 0 {
+		return
 	}
+
+	requeueItems := func(items []pendingItem) {
+		if len(items) == 0 {
+			return
+		}
+		payloads := make([]*core.CTDPayload, 0, len(items))
+		for _, item := range items {
+			payloads = append(payloads, item.payload)
+		}
+		c.spool.PrependBatch(payloads)
+	}
+
+	maxAttempts := c.effectiveMaxAttempts()
 
 	for len(pending) > 0 {
 		select {
 		case <-c.stopCh:
 			// Prepend undelivered items in FIFO order for best-effort final drain in Disconnect().
-			requeuePending()
+			requeueItems(pending)
 			return
 		default:
 		}
 
-		if !c.client.IsConnected() {
-			select {
-			case <-c.stopCh:
-				requeuePending()
-				return
-			case <-time.After(1 * time.Second):
-				continue
+		if c.client == nil || !c.client.IsConnected() {
+			for i := range pending {
+				pending[i].failures = 0
 			}
+			if !c.waitRetryBackoff() {
+				requeueItems(pending)
+				return
+			}
+			continue
 		}
 
 		tokens := make([]mqtt.Token, len(pending))
@@ -276,26 +410,111 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 			tokens[i] = c.client.Publish(item.topic, 1, false, item.raw)
 		}
 
-		var failed []pendingItem
+		type failedItem struct {
+			item        pendingItem
+			explicitErr bool
+		}
+
+		timer := time.NewTimer(c.effectiveBatchTimeout())
+		var failed []failedItem
+		succeeded := 0
+		stopped := false
+		timedOut := false
+		stopIdx := 0
+
 		for i, tok := range tokens {
-			if tok.WaitTimeout(5*time.Second) && tok.Error() == nil {
+			if timedOut {
+				select {
+				case <-tok.Done():
+					if err := tok.Error(); err != nil {
+						log.Printf("[Relay] Flight error publishing to %s, retrying: %v", pending[i].topic, err)
+						failed = append(failed, failedItem{item: pending[i], explicitErr: true})
+					} else {
+						succeeded++
+					}
+				default:
+					failed = append(failed, failedItem{item: pending[i], explicitErr: false})
+				}
 				continue
 			}
-			if tok.Error() != nil {
-				log.Printf("[Relay] Flight error publishing to %s, retrying: %v", pending[i].topic, tok.Error())
+			select {
+			case <-c.stopCh:
+				stopped = true
+				stopIdx = i
+			case <-tok.Done():
+				if err := tok.Error(); err != nil {
+					log.Printf("[Relay] Flight error publishing to %s, retrying: %v", pending[i].topic, err)
+					failed = append(failed, failedItem{item: pending[i], explicitErr: true})
+				} else {
+					succeeded++
+				}
+			case <-timer.C:
+				timedOut = true
+				log.Printf("[Relay] Batch publish timed out waiting for %s (%d/%d remaining)", pending[i].topic, len(tokens)-i, len(tokens))
+				failed = append(failed, failedItem{item: pending[i], explicitErr: false})
 			}
-			failed = append(failed, pending[i])
+			if stopped {
+				break
+			}
 		}
-		if len(failed) == 0 {
-			return
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
-		pending = failed
 
-		select {
-		case <-c.stopCh:
-			requeuePending()
+		if stopped {
+			requeue := make([]pendingItem, 0, len(failed)+len(pending)-stopIdx)
+			for _, f := range failed {
+				requeue = append(requeue, f.item)
+			}
+			for j := stopIdx; j < len(pending); j++ {
+				select {
+				case <-tokens[j].Done():
+					if tokens[j].Error() == nil {
+						continue
+					}
+				default:
+				}
+				requeue = append(requeue, pending[j])
+			}
+			requeueItems(requeue)
 			return
-		case <-time.After(1 * time.Second):
+		}
+
+		if len(failed) == 0 {
+			c.backoffAttempt = 0
+			return
+		}
+
+		if succeeded > 0 {
+			c.backoffAttempt = 0
+		}
+
+		connected := c.client.IsConnected()
+		nextPending := make([]pendingItem, 0, len(failed))
+		for _, f := range failed {
+			item := f.item
+			if !connected {
+				item.failures = 0
+			} else if f.explicitErr || succeeded > 0 {
+				item.failures++
+				if item.failures >= maxAttempts {
+					c.recordDeliveryDrop("exceeded consecutive publish attempts", item.payload, fmt.Errorf("%d consecutive failures on %s", item.failures, item.topic))
+					continue
+				}
+			}
+			nextPending = append(nextPending, item)
+		}
+		pending = nextPending
+		if len(pending) == 0 {
+			return
+		}
+
+		if !c.waitRetryBackoff() {
+			requeueItems(pending)
+			return
 		}
 	}
 }
@@ -308,8 +527,14 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 	if len(remaining) == 0 {
 		return
 	}
-	deadline := time.Now().Add(maxWait)
-	for start := 0; start < len(remaining) && time.Now().Before(deadline); start += maxPipelinedPublishes {
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	for start := 0; start < len(remaining); start += maxPipelinedPublishes {
+		select {
+		case <-timer.C:
+			return
+		default:
+		}
 		end := start + maxPipelinedPublishes
 		if end > len(remaining) {
 			end = len(remaining)
@@ -320,16 +545,23 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 			if p == nil {
 				continue
 			}
-			if raw, err := json.Marshal(p); err == nil {
-				tokens = append(tokens, c.client.Publish(p.RoutingTopic(c.topicPrefix), 1, false, raw))
+			raw, err := json.Marshal(p)
+			if err != nil {
+				c.recordDeliveryDrop("marshal error", p, err)
+				continue
 			}
+			if len(raw) > maxMQTTPayloadBytes {
+				c.recordDeliveryDrop("payload exceeds max MQTT packet size", p, fmt.Errorf("%d bytes > %d", len(raw), maxMQTTPayloadBytes))
+				continue
+			}
+			tokens = append(tokens, c.client.Publish(p.RoutingTopic(c.topicPrefix), 1, false, raw))
 		}
 		for _, tok := range tokens {
-			rem := time.Until(deadline)
-			if rem <= 0 {
+			select {
+			case <-tok.Done():
+			case <-timer.C:
 				return
 			}
-			tok.WaitTimeout(rem)
 		}
 	}
 }
@@ -340,7 +572,7 @@ func (c *MQTTClient) Disconnect() {
 		close(c.stopCh)
 		<-c.flushDone
 		if c.client != nil {
-			c.drainRemainingBeforeClose(2 * time.Second)
+			c.drainRemainingBeforeClose(1500 * time.Millisecond)
 			if c.client.IsConnected() {
 				tok := c.client.Publish(c.brand.RegistryTopic(c.nodeID), 1, true, []byte("OFFLINE"))
 				tok.WaitTimeout(500 * time.Millisecond)
