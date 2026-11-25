@@ -8,14 +8,9 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/spf13/cobra"
-)
-
-var (
-	activityLimit    int
-	ingestRolePass   string
-	readOnlyRolePass string
 )
 
 var coopCmd = &cobra.Command{
@@ -26,49 +21,56 @@ var coopCmd = &cobra.Command{
 var coopStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "View live MNS identity, MQTT broker, CTD Ledger, and PigeonMath status",
-	Run: func(_ *cobra.Command, _ []string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
 		defer cancel()
 
-		activeMesh := wsCfg.ActiveMesh
-		activeSource := wsCfg.ActiveMeshSource
+		state := cliStateFromCommand(cmd)
+		cfg := state.wsCfg
+		out := cmd.OutOrStdout()
+
+		activeMesh := cfg.ActiveMesh
+		activeSource := cfg.ActiveMeshSource
 		if activeMesh == "" {
 			activeMesh = core.DefaultMeshName
 			activeSource = "default"
 		}
-		fmt.Printf("[Workstation]  mesh=%s (source=%s)\n", activeMesh, activeSource)
+		fmt.Fprintf(out, "[Workstation]  mesh=%s (source=%s)\n", activeMesh, activeSource)
 
-		brokerURL := resolveBrokerURL()
-		clientID := fmt.Sprintf("%s-coop-probe-%d", wsCfg.Brand.CLIName, os.Getpid())
-		if mClient, err := dialMQTTClient(brokerURL, clientID, 3*time.Second); err != nil {
-			fmt.Printf("[MQTT Broker]  DEGRADED (%v)\n", err)
+		brokerURL := resolveBrokerURLForConfig(cfg)
+		clientID := fmt.Sprintf("%s-coop-probe-%d", cfg.Brand.CLIName, os.Getpid())
+		if mClient, err := dialMQTTClientWithConfig(cfg, brokerURL, clientID, 3*time.Second); err != nil {
+			fmt.Fprintf(out, "[MQTT Broker]  DEGRADED (%v)\n", err)
 		} else {
-			fmt.Printf("[MQTT Broker]  ONLINE   (%s)\n", brokerURL)
+			fmt.Fprintf(out, "[MQTT Broker]  ONLINE   (%s)\n", config.RedactURL(brokerURL))
 			mClient.Disconnect(100)
 		}
 
-		store, err := openOperatorStore(ctx)
+		store, err := openOperatorStoreForConfig(ctx, cfg)
 		if err != nil {
-			fmt.Printf("[CTD Ledger]   OFFLINE  (%v)\n", err)
-			os.Exit(1)
+			fmt.Fprintf(out, "[CTD Ledger]   OFFLINE  (%v)\n", err)
+			return err
 		}
 		defer store.Close()
 
-		fmt.Printf("[CTD Ledger]   ONLINE\n")
+		fmt.Fprintf(out, "[CTD Ledger]   ONLINE\n")
 
 		if meshID, mErr := store.GetMeshIdentity(ctx); mErr == nil && meshID != nil {
-			fmt.Printf("[Mesh (MNS)]   %s (coop=%s, topic_root=%s)\n",
+			fmt.Fprintf(out, "[Mesh (MNS)]   %s (coop=%s, topic_root=%s)\n",
 				meshID.MeshName, meshID.CoopNodeID, meshID.TopicRoot)
-			if wsCfg.ActiveMesh != "" && meshID.MeshName != "" && meshID.MeshName != wsCfg.ActiveMesh {
-				fmt.Printf("[Mesh Warning] MISMATCH: workstation working mesh is %q, but Coop ledger reports %q!\n",
-					wsCfg.ActiveMesh, meshID.MeshName)
+			if cfg.ActiveMesh != "" && meshID.MeshName != "" && meshID.MeshName != cfg.ActiveMesh {
+				fmt.Fprintf(out, "[Mesh Warning] MISMATCH: workstation working mesh is %q, but Coop ledger reports %q!\n",
+					cfg.ActiveMesh, meshID.MeshName)
 			}
 		}
 
-		mathSchema := wsCfg.Brand.MathSchema
+		mathSchema := cfg.Brand.MathSchema
 		if err := db.ValidateSchemaIdentifier(mathSchema); err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Invalid math_schema configuration: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("invalid math_schema configuration: %w", err)
 		}
 
 		counts, err := store.QueryMaps(ctx, fmt.Sprintf(`
@@ -84,43 +86,61 @@ var coopStatusCmd = &cobra.Command{
 		`, mathSchema))
 		if err == nil && len(counts) > 0 {
 			c := counts[0]
-			fmt.Printf("  Nodes: %v | Events: %v | Artifacts: %v | Traces: %v | Certified PMVs: %v\n",
+			fmt.Fprintf(out, "  Nodes: %v | Events: %v | Artifacts: %v | Traces: %v | Certified PMVs: %v\n",
 				c["registered_nodes"], c["events"], c["artifacts"], c["traces"], c["certified_pmvs"])
 		}
+		return nil
 	},
 }
 
 var coopMigrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Idempotently apply the CTD Ledger, MNS Registry, Node/Tag Registry, and PigeonMath PostgreSQL schema",
-	Run: func(_ *cobra.Command, _ []string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 		defer cancel()
 
-		store, err := openOperatorStore(ctx)
+		state := cliStateFromCommand(cmd)
+		cfg := state.wsCfg
+		out := cmd.OutOrStdout()
+
+		store, err := openOperatorStoreForConfig(ctx, cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Could not connect to ledger: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("could not connect to ledger: %w", err)
 		}
 		defer store.Close()
 
 		if err := store.EnsureSchema(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Fatal: Schema migration failed: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("schema migration failed: %w", err)
 		}
-		fmt.Printf("[+] Verified PostgreSQL schema (telemetric_ledger, ctd_mesh, ctd_nodes, ctd_artifacts, ctd_traces, %s.pmv_catalog).\n",
-			wsCfg.Brand.MathSchema)
+		fmt.Fprintf(out, "[+] Verified PostgreSQL schema (telemetric_ledger, ctd_mesh, ctd_nodes, ctd_artifacts, ctd_traces, %s.pmv_catalog).\n",
+			cfg.Brand.MathSchema)
+		return nil
 	},
 }
 
 var coopProvisionRolesCmd = &cobra.Command{
 	Use:   "provision-roles",
 	Short: "Provision least-privilege PostgreSQL roles (ctd_ingestor write role & pigeoncare_ro read-only role)",
-	RunE: func(_ *cobra.Command, _ []string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 		defer cancel()
 
-		store, err := openOperatorStore(ctx)
+		state := cliStateFromCommand(cmd)
+		cfg := state.wsCfg
+		f := cmd.Flags()
+		ingestPass, _ := f.GetString("ingest-password")
+		roPass, _ := f.GetString("readonly-password")
+
+		store, err := openOperatorStoreForConfig(ctx, cfg)
 		if err != nil {
 			return err
 		}
@@ -129,10 +149,10 @@ var coopProvisionRolesCmd = &cobra.Command{
 		if err := store.EnsureSchema(ctx); err != nil {
 			return err
 		}
-		if err := store.ProvisionRoles(ctx, ingestRolePass, readOnlyRolePass); err != nil {
+		if err := store.ProvisionRoles(ctx, ingestPass, roPass); err != nil {
 			return err
 		}
-		fmt.Println("[+] Provisioned PostgreSQL roles: ctd_ingestor (COPY/INSERT) & pigeoncare_ro (STRICT READ-ONLY on public.* + pigeonmath view privileges).")
+		fmt.Fprintln(cmd.OutOrStdout(), "[+] Provisioned PostgreSQL roles: ctd_ingestor (COPY/INSERT) & pigeoncare_ro (STRICT READ-ONLY on public.* + pigeonmath view privileges).")
 		return nil
 	},
 }
@@ -140,26 +160,35 @@ var coopProvisionRolesCmd = &cobra.Command{
 var coopActivityCmd = &cobra.Command{
 	Use:   "activity",
 	Short: "Show CTD Ledger write/update actor attribution summary",
-	RunE: func(_ *cobra.Command, _ []string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 8*time.Second)
 		defer cancel()
 
-		store, err := openOperatorStore(ctx)
+		state := cliStateFromCommand(cmd)
+		cfg := state.wsCfg
+		out := cmd.OutOrStdout()
+		limit, _ := cmd.Flags().GetInt("limit")
+
+		store, err := openOperatorStoreForConfig(ctx, cfg)
 		if err != nil {
 			return err
 		}
 		defer store.Close()
 
-		items, err := store.GetLedgerActivity(ctx, activityLimit)
+		items, err := store.GetLedgerActivity(ctx, limit)
 		if err != nil {
 			return err
 		}
 		if len(items) == 0 {
-			fmt.Println("No CTD Ledger write/update activity recorded yet.")
+			fmt.Fprintln(out, "No CTD Ledger write/update activity recorded yet.")
 			return nil
 		}
 
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
 		fmt.Fprintln(w, "table\t| action\t| db actor\t| app actor\t| target\t| records\t| last event")
 		fmt.Fprintln(w, "__________________________________________________________________________________________\t")
 		for _, a := range items {
@@ -178,7 +207,7 @@ func init() {
 	coopCmd.AddCommand(coopProvisionRolesCmd)
 	coopCmd.AddCommand(coopActivityCmd)
 
-	coopActivityCmd.Flags().IntVarP(&activityLimit, "limit", "n", 25, "Maximum attribution rows to display")
-	coopProvisionRolesCmd.Flags().StringVar(&ingestRolePass, "ingest-password", "", "Password for ctd_ingestor role")
-	coopProvisionRolesCmd.Flags().StringVar(&readOnlyRolePass, "readonly-password", "", "Password for pigeoncare_ro role")
+	coopActivityCmd.Flags().IntP("limit", "n", 25, "Maximum attribution rows to display")
+	coopProvisionRolesCmd.Flags().String("ingest-password", "", "Password for ctd_ingestor role")
+	coopProvisionRolesCmd.Flags().String("readonly-password", "", "Password for pigeoncare_ro role")
 }

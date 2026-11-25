@@ -138,6 +138,101 @@ func TestOpenAISSEStreamingAndToolLoop(t *testing.T) {
 	}
 }
 
+func TestOpenAINonSSEJSONToolLoopInStreamChat(t *testing.T) {
+	t.Run("explicit_id_and_content", func(t *testing.T) {
+		var turns atomic.Int32
+		var secondReq struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := turns.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if n == 1 {
+				_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"Checking node...","tool_calls":[{"id":"call_non_sse_1","type":"function","function":{"name":"get_node_telemetry","arguments":"{\"node_id\":\"rv64-compute-01\"}"}}]}}]}`)
+				return
+			}
+			if err := json.NewDecoder(r.Body).Decode(&secondReq); err != nil {
+				t.Errorf("failed to decode second request body: %v", err)
+			}
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"Non-SSE OpenAI healthy."}}]}`)
+		}))
+		defer srv.Close()
+
+		adapter := NewOpenAIAdapter(srv.URL+"/v1/chat/completions", "test-key", "gpt-4o", &stubToolExecutor{})
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "status?"}})
+		if err != nil {
+			t.Fatalf("OpenAI StreamChat error: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		got := out.String()
+		if !strings.Contains(got, "Checking node...") ||
+			!strings.Contains(got, "Running tool: get_node_telemetry") ||
+			!strings.Contains(got, "Non-SSE OpenAI healthy.") {
+			t.Fatalf("unexpected non-SSE OpenAI output: %q", got)
+		}
+		if turns.Load() != 2 {
+			t.Fatalf("expected 2 turns, got %d", turns.Load())
+		}
+		if len(secondReq.Messages) != 4 {
+			t.Fatalf("expected 4 messages in follow-up turn, got %d: %+v", len(secondReq.Messages), secondReq.Messages)
+		}
+		assistantMsg := secondReq.Messages[2]
+		if assistantMsg["role"] != "assistant" || assistantMsg["content"] != "Checking node..." {
+			t.Fatalf("unexpected assistant message in history: %+v", assistantMsg)
+		}
+		rawCalls, ok := assistantMsg["tool_calls"].([]any)
+		if !ok || len(rawCalls) != 1 {
+			t.Fatalf("expected 1 assistant tool_call, got %+v", assistantMsg["tool_calls"])
+		}
+		callMap, _ := rawCalls[0].(map[string]any)
+		fnMap, _ := callMap["function"].(map[string]any)
+		if callMap["id"] != "call_non_sse_1" || fnMap["name"] != "get_node_telemetry" || fnMap["arguments"] != `{"node_id":"rv64-compute-01"}` {
+			t.Fatalf("unexpected tool_call payload forwarded to turn 2: %+v", callMap)
+		}
+		toolMsg := secondReq.Messages[3]
+		if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_non_sse_1" || toolMsg["content"] != "get_node_telemetry:rv64-compute-01 load_1m=0.42" {
+			t.Fatalf("unexpected tool observation message in turn 2: %+v", toolMsg)
+		}
+	})
+
+	t.Run("missing_id_synthesizes_indexed_id", func(t *testing.T) {
+		var turns atomic.Int32
+		var secondReq struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := turns.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if n == 1 {
+				_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"get_node_telemetry","arguments":"{\"node_id\":\"rv64-compute-02\"}"}}]}}]}`)
+				return
+			}
+			_ = json.NewDecoder(r.Body).Decode(&secondReq)
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"Done."}}]}`)
+		}))
+		defer srv.Close()
+
+		adapter := NewOpenAIAdapter(srv.URL+"/v1/chat/completions", "test-key", "gpt-4o", &stubToolExecutor{})
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "status?"}})
+		if err != nil {
+			t.Fatalf("OpenAI StreamChat error: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		if !strings.Contains(out.String(), "Running tool: get_node_telemetry") || !strings.Contains(out.String(), "Done.") {
+			t.Fatalf("unexpected output: %q", out.String())
+		}
+		if len(secondReq.Messages) != 4 || secondReq.Messages[3]["tool_call_id"] != "call_0" {
+			t.Fatalf("expected synthesized call_0 tool_call_id, got %+v", secondReq.Messages)
+		}
+	})
+}
+
 func TestOpenAIInvalidToolJSONAndHistoryPreservation(t *testing.T) {
 	// parseToolArgs & executeToolCallRaw must return explicit error string on invalid JSON instead of calling tool with nil args.
 	called := false

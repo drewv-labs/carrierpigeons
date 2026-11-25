@@ -1,11 +1,15 @@
 package coop
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -94,30 +98,56 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("configure PigeonCoop MQTT TLS client: %w", err)
 	}
 
-	// In embedded TLS mode without an explicit CA file, trust the embedded broker's leaf cert
-	// so internal loopback subscribers connect securely without requiring TLSInsecureSkipVerify.
+	// In embedded TLS mode, trust the embedded broker's leaf cert when no explicit CA is provided,
+	// and align ServerName for loopback connections when the cert SANs only list a LAN hostname/IP.
 	selfCAFile := s.cfg.MQTT.TLSCAFile
-	if !isExternal && strings.TrimSpace(s.cfg.MQTT.TLSCertFile) != "" && strings.TrimSpace(s.cfg.MQTT.TLSKeyFile) != "" && strings.TrimSpace(s.cfg.MQTT.TLSCAFile) == "" {
-		pemBytes, readErr := os.ReadFile(s.cfg.MQTT.TLSCertFile)
-		if readErr != nil {
-			return fmt.Errorf("read embedded MQTT TLS cert %s for loopback trust: %w", s.cfg.MQTT.TLSCertFile, readErr)
+	var embeddedLeaf *x509.Certificate
+	loopbackLacksLocalhost := false
+	if !isExternal && strings.TrimSpace(s.cfg.MQTT.TLSCertFile) != "" && strings.TrimSpace(s.cfg.MQTT.TLSKeyFile) != "" {
+		pemBytes, leaf, parseErr := parseEmbeddedLeafCert(s.cfg.MQTT.TLSCertFile)
+		if parseErr != nil {
+			return fmt.Errorf("read embedded MQTT TLS cert %s for loopback trust: %w", s.cfg.MQTT.TLSCertFile, parseErr)
 		}
-		if clientTLS == nil {
-			clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+		embeddedLeaf = leaf
+		if strings.TrimSpace(s.cfg.MQTT.TLSCAFile) == "" {
+			if clientTLS == nil {
+				clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+			}
+			pool := clientTLS.RootCAs
+			if pool == nil {
+				if sysPool, poolErr := x509.SystemCertPool(); poolErr == nil && sysPool != nil {
+					pool = sysPool
+				} else {
+					pool = x509.NewCertPool()
+				}
+			}
+			if !pool.AppendCertsFromPEM(pemBytes) {
+				return fmt.Errorf("no valid PEM certificates in embedded MQTT TLS cert %s", s.cfg.MQTT.TLSCertFile)
+			}
+			clientTLS.RootCAs = pool
+			selfCAFile = s.cfg.MQTT.TLSCertFile
 		}
-		pool := clientTLS.RootCAs
-		if pool == nil {
-			if sysPool, poolErr := x509.SystemCertPool(); poolErr == nil && sysPool != nil {
-				pool = sysPool
+		if leaf.VerifyHostname("127.0.0.1") != nil {
+			loopbackLacksLocalhost = true
+			if clientTLS == nil {
+				clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+			}
+			if serverName := extractLeafServerName(leaf); serverName != "" {
+				if clientTLS.ServerName == "" {
+					clientTLS.ServerName = serverName
+				}
 			} else {
-				pool = x509.NewCertPool()
+				// Leaf cert has neither DNSNames nor IPAddresses; pin the exact leaf certificate over loopback.
+				clientTLS.InsecureSkipVerify = true //nolint:gosec // verified explicitly via VerifyPeerCertificate byte match below
+				expectedRaw := leaf.Raw
+				clientTLS.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+					if len(rawCerts) == 0 || !bytes.Equal(rawCerts[0], expectedRaw) {
+						return errors.New("embedded loopback TLS certificate mismatch")
+					}
+					return nil
+				}
 			}
 		}
-		if !pool.AppendCertsFromPEM(pemBytes) {
-			return fmt.Errorf("no valid PEM certificates in embedded MQTT TLS cert %s", s.cfg.MQTT.TLSCertFile)
-		}
-		clientTLS.RootCAs = pool
-		selfCAFile = s.cfg.MQTT.TLSCertFile
 	}
 
 	// 1. Initialize or attach PostgreSQL Ledger
@@ -211,19 +241,38 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// 4. Implicitly start embedded Observer + Runner runtime on the Coop host using native CoopConfig settings
 	if s.cfg.SelfObserve || s.cfg.Runners.Enabled {
+		selfBrokerURL := s.brokerURL
+		selfTLSInsecureSkipVerify := s.cfg.MQTT.TLSInsecureSkipVerify
+		if !isExternal && loopbackLacksLocalhost {
+			matchedBoundIP := false
+			if s.embedded != nil && embeddedLeaf != nil {
+				if host, port, splitErr := net.SplitHostPort(s.embedded.BoundAddr()); splitErr == nil {
+					if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() && embeddedLeaf.VerifyHostname(host) == nil {
+						selfBrokerURL = "tls://" + net.JoinHostPort(host, port)
+						matchedBoundIP = true
+					}
+				}
+			}
+			if !matchedBoundIP {
+				// edge.Agent constructs TLS config from EdgeConfig (no ServerName field); skip hostname check
+				// strictly on the in-process 127.0.0.1 loopback connection to our own embedded broker.
+				selfTLSInsecureSkipVerify = true
+			}
+		}
+
 		selfCfg := config.EdgeConfig{
 			NodeID:                s.cfg.NodeID,
 			Tags:                  s.cfg.Tags,
 			PollInterval:          s.cfg.PollInterval,
 			SpoolCapacity:         s.cfg.SpoolCapacity,
-			BrokerURL:             s.brokerURL,
+			BrokerURL:             selfBrokerURL,
 			TopicPrefix:           s.cfg.Brand.CTDPrefix(),
 			MQTTUsername:          s.cfg.MQTT.Username,
 			MQTTPassword:          s.cfg.MQTT.Password,
 			TLSCAFile:             selfCAFile,
 			TLSCertFile:           clientCertFile,
 			TLSKeyFile:            clientKeyFile,
-			TLSInsecureSkipVerify: s.cfg.MQTT.TLSInsecureSkipVerify,
+			TLSInsecureSkipVerify: selfTLSInsecureSkipVerify,
 			Observers:             s.cfg.Observers,
 			Runners:               s.cfg.Runners,
 			Brand:                 s.cfg.Brand,
@@ -262,6 +311,45 @@ func (s *Server) BrokerURL() string {
 // MeshName returns the registered MNS identifier for this PigeonCoop instance.
 func (s *Server) MeshName() string {
 	return s.cfg.MeshName
+}
+
+func parseEmbeddedLeafCert(certFile string) ([]byte, *x509.Certificate, error) {
+	pemBytes, err := os.ReadFile(certFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	rest := pemBytes
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return nil, nil, fmt.Errorf("no valid CERTIFICATE PEM block in %s", certFile)
+		}
+		if block.Type == "CERTIFICATE" {
+			leaf, parseErr := x509.ParseCertificate(block.Bytes)
+			if parseErr != nil {
+				return nil, nil, fmt.Errorf("parse X.509 certificate in %s: %w", certFile, parseErr)
+			}
+			return pemBytes, leaf, nil
+		}
+	}
+}
+
+func extractLeafServerName(leaf *x509.Certificate) string {
+	if leaf == nil {
+		return ""
+	}
+	for _, dns := range leaf.DNSNames {
+		if trimmed := strings.TrimSpace(dns); trimmed != "" {
+			return trimmed
+		}
+	}
+	for _, ip := range leaf.IPAddresses {
+		if ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 // Stop gracefully shuts down self-observers, flushes pending COPY batches, stops the embedded broker, and closes DB pools.

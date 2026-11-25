@@ -122,6 +122,34 @@ func TestMCPHTTPAuthAndDNSRebindingProtection(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden for non-loopback Host when EnforceLoopbackHost=true, got %d", rec.Code)
 	}
 
+	// AllowUnauthenticatedNonLoopback permits non-loopback Host/Origin requests when explicitly opted in.
+	nonLoopbackOptIn := NewHTTPHandler(srv, HTTPOptions{
+		AllowUnauthenticatedNonLoopback: true,
+	})
+	lanReq := httptest.NewRequest(http.MethodPost, "http://telemetry-node.local:8089/mcp", strings.NewReader(initBody))
+	lanReq.Host = "telemetry-node.local:8089"
+	lanReq.Header.Set("Origin", "https://dashboard.example.com")
+	lanReq.Header.Set("Content-Type", "application/json")
+	lanReq.Header.Set("Accept", "application/json, text/event-stream")
+	rec = httptest.NewRecorder()
+	nonLoopbackOptIn.ServeHTTP(rec, lanReq)
+	if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+		t.Fatalf("expected AllowUnauthenticatedNonLoopback=true to allow non-loopback Host/Origin, got %d", rec.Code)
+	}
+
+	// EnforceLoopbackHost still wins over AllowUnauthenticatedNonLoopback when bound to loopback.
+	loopbackForced := NewHTTPHandler(srv, HTTPOptions{
+		EnforceLoopbackHost:             true,
+		AllowUnauthenticatedNonLoopback: true,
+	})
+	forcedReq := httptest.NewRequest(http.MethodPost, "http://telemetry-node.local:8089/mcp", strings.NewReader(initBody))
+	forcedReq.Host = "telemetry-node.local:8089"
+	rec = httptest.NewRecorder()
+	loopbackForced.ServeHTTP(rec, forcedReq)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected EnforceLoopbackHost=true to reject non-loopback Host even with AllowUnauthenticatedNonLoopback=true, got %d", rec.Code)
+	}
+
 	// Default MCP server registers get_mesh_identity and omits create_pigeonmath_view unless AllowWriteViews is enabled.
 	if srv.GetTool("get_mesh_identity") == nil {
 		t.Fatal("expected get_mesh_identity tool to be registered")

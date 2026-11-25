@@ -17,9 +17,12 @@ CREATE TABLE IF NOT EXISTS telemetric_ledger (
 
 CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id, component, event_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts ON telemetric_ledger (ingested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_ts_brin ON telemetric_ledger USING BRIN (event_timestamp);
+CREATE INDEX IF NOT EXISTS idx_ledger_ingested_brin ON telemetric_ledger USING BRIN (ingested_at);
 CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';
+CREATE INDEX IF NOT EXISTS idx_ledger_pause_node_ts
+	ON telemetric_ledger (node_id, event_timestamp DESC)
+	WHERE pillar = 'runner' AND component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr');
 
 CREATE TABLE IF NOT EXISTS ctd_nodes (
 	node_id TEXT PRIMARY KEY,
@@ -92,6 +95,11 @@ CREATE TABLE IF NOT EXISTS pigeonmath.pmv_catalog (
 -- Least-Privilege Role Separation:
 -- 1) ctd_ingestor: PigeonCoop COPY/INSERT ingestion role (NOSUPERUSER)
 -- 2) pigeoncare_ro: Read-Only on public CTD Ledger + isolated view management in pigeonmath (NOSUPERUSER)
+--
+-- WARNING (DEV-ONLY CREDENTIALS): The hardcoded passwords below ('ctd_ingest_password',
+-- 'pigeoncare_readonly') are strictly for local loopback development. For any non-loopback
+-- or production deployment, rotate these credentials immediately via:
+--   pigeons coop provision-roles
 DO $$
 BEGIN
 	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ctd_ingestor') THEN

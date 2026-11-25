@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -124,29 +125,66 @@ type DashboardModel struct {
 	userInput       string
 	currentResponse *strings.Builder
 	streamCancel    context.CancelFunc
+	activeStreamID  uint64
 	waiting         bool
 	pendingApproval *ApprovalPromptMsg
 
 	quitting bool
 }
 
-// NewChannelPrompter creates an async PolicyGate Prompter paired with a channel consumed by DashboardModel.
-func NewChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg) {
+// NewManagedChannelPrompter creates an async PolicyGate Prompter paired with an inbox channel
+// and an idempotent close function that unblocks waitForApprovalCmd when the TUI exits.
+func NewManagedChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg, func()) {
 	ch := make(chan ApprovalPromptMsg, 4)
+	done := make(chan struct{})
+	var (
+		mu        sync.RWMutex
+		closed    bool
+		closeOnce sync.Once
+	)
+	closeFn := func() {
+		closeOnce.Do(func() {
+			close(done)
+			mu.Lock()
+			closed = true
+			close(ch)
+			mu.Unlock()
+		})
+	}
 	prompter := func(ctx context.Context, proposal pigeoncare.ActionProposal) (pigeoncare.ConfirmationDecision, error) {
 		replyCh := make(chan pigeoncare.ConfirmationDecision, 1)
+
+		mu.RLock()
+		if closed {
+			mu.RUnlock()
+			return pigeoncare.DecisionDeny, context.Canceled
+		}
 		select {
 		case ch <- ApprovalPromptMsg{Proposal: proposal, ReplyCh: replyCh}:
+			mu.RUnlock()
+		case <-done:
+			mu.RUnlock()
+			return pigeoncare.DecisionDeny, context.Canceled
 		case <-ctx.Done():
+			mu.RUnlock()
 			return pigeoncare.DecisionDeny, ctx.Err()
 		}
+
 		select {
 		case dec := <-replyCh:
 			return dec, nil
+		case <-done:
+			return pigeoncare.DecisionDeny, context.Canceled
 		case <-ctx.Done():
 			return pigeoncare.DecisionDeny, ctx.Err()
 		}
 	}
+	return prompter, ch, closeFn
+}
+
+// NewChannelPrompter creates an async PolicyGate Prompter paired with a channel consumed by DashboardModel.
+func NewChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg) {
+	prompter, ch, _ := NewManagedChannelPrompter()
 	return prompter, ch
 }
 
@@ -412,23 +450,37 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamErrMsg:
+		if msg.streamID != m.activeStreamID {
+			return m, nil
+		}
 		m.waiting = false
 		if m.streamCancel != nil {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
 		m.currentResponse = nil
-		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render(m.brand.AgentName + " Error: " + msg.err.Error())
+		errLine := agentStyle.Render(m.brand.AgentName + " Error: " + msg.err.Error())
+		if len(m.uiHistory) > 0 {
+			m.uiHistory[len(m.uiHistory)-1] = errLine
+		} else {
+			m.uiHistory = append(m.uiHistory, errLine)
+		}
 		return m, nil
 
 	case streamTokenMsg:
+		if msg.streamID != m.activeStreamID {
+			return m, nil
+		}
 		if m.currentResponse == nil {
 			m.currentResponse = &strings.Builder{}
 		}
 		m.currentResponse.WriteString(msg.token)
-		return m, waitForToken(msg.ch)
+		return m, waitForToken(msg.streamID, msg.ch)
 
 	case streamDoneMsg:
+		if msg.streamID != m.activeStreamID {
+			return m, nil
+		}
 		m.waiting = false
 		if m.streamCancel != nil {
 			m.streamCancel()
@@ -439,7 +491,12 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			reply = m.currentResponse.String()
 			m.currentResponse = nil
 		}
-		m.uiHistory[len(m.uiHistory)-1] = agentStyle.Render(m.brand.AgentName + ": " + reply)
+		doneLine := agentStyle.Render(m.brand.AgentName + ": " + reply)
+		if len(m.uiHistory) > 0 {
+			m.uiHistory[len(m.uiHistory)-1] = doneLine
+		} else {
+			m.uiHistory = append(m.uiHistory, doneLine)
+		}
 		m.chatHistory = append(m.chatHistory, llm.Message{Role: "assistant", Content: reply})
 		return m, tea.Batch(m.fetchOverviewCmd(), m.fetchMathCmd())
 
@@ -541,16 +598,23 @@ func (m DashboardModel) quit() (tea.Model, tea.Cmd) {
 		m.streamCancel()
 		m.streamCancel = nil
 	}
+	m.waiting = false
+	m.currentResponse = nil
+	m.activeStreamID++
 	m.quitting = true
 	return m, tea.Quit
 }
 
 func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyEsc {
-		if m.waiting && m.streamCancel != nil {
-			m.streamCancel()
-			m.streamCancel = nil
+		if m.waiting {
+			if m.streamCancel != nil {
+				m.streamCancel()
+				m.streamCancel = nil
+			}
 			m.waiting = false
+			m.currentResponse = nil
+			m.activeStreamID++
 			m.statusBanner = "Cancelled active stream."
 			return m, nil
 		}
@@ -579,6 +643,8 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.userInput = ""
 		m.currentResponse = &strings.Builder{}
 		m.waiting = true
+		m.activeStreamID++
+		streamID := m.activeStreamID
 
 		ctx, cancel := context.WithCancel(context.Background())
 		m.streamCancel = cancel
@@ -588,9 +654,9 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, func() tea.Msg {
 			ch, err := careSvc.StreamChat(ctx, historySnap)
 			if err != nil {
-				return streamErrMsg{err}
+				return streamErrMsg{streamID: streamID, err: err}
 			}
-			return waitForToken(ch)()
+			return waitForToken(streamID, ch)()
 		}
 
 	case tea.KeyBackspace, tea.KeyDelete:

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
-	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -24,21 +23,6 @@ const defaultMNSRetainedMaxAge = 24 * time.Hour
 // mnsRetainedMaxAge bounds how old a retained MQTT MNS announcement may be before
 // `connect` rejects it as stale. Package-level var for deterministic unit testing.
 var mnsRetainedMaxAge = defaultMNSRetainedMaxAge
-
-var (
-	connectBrokerURL          string
-	connectDBURL              string
-	connectRODBURL            string
-	connectMQTTUser           string
-	connectMQTTPass           string
-	connectTLSCA              string
-	connectTLSCert            string
-	connectTLSKey             string
-	connectTLSInsecure        bool
-	connectTopicRoot          string
-	connectSkipVerify         bool
-	connectAllowPartialVerify bool
-)
 
 var connectCmd = &cobra.Command{
 	Use:   "connect <mesh-name|->",
@@ -55,8 +39,9 @@ var disconnectCmd = &cobra.Command{
 	Short: "Clear the persisted current working mesh and revert to top-level pigeons.toml defaults",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		prev, _ := config.ReadCurrentMesh()
-		if err := config.ClearCurrentMesh(); err != nil {
+		state := cliStateFromCommand(cmd)
+		prev, _ := config.ReadCurrentMeshForBrand(state.brand)
+		if err := config.ClearCurrentMeshForBrand(state.brand); err != nil {
 			return err
 		}
 		out := cmd.OutOrStdout()
@@ -111,18 +96,18 @@ func init() {
 	meshCmd.AddCommand(meshCurrentCmd)
 
 	f := connectCmd.Flags()
-	f.StringVar(&connectBrokerURL, "broker", "", "Register or update mesh MQTT broker URL (e.g. tcp://192.0.2.10:1883)")
-	f.StringVar(&connectDBURL, "db", "", "Register or update mesh PostgreSQL operator DSN")
-	f.StringVar(&connectRODBURL, "ro-db", "", "Register or update mesh Read-Only PostgreSQL DSN")
-	f.StringVar(&connectMQTTUser, "mqtt-user", "", "Register or update mesh MQTT username")
-	f.StringVar(&connectMQTTPass, "mqtt-pass", "", "Register or update mesh MQTT password")
-	f.StringVar(&connectTLSCA, "tls-ca", "", "Register or update mesh MQTT TLS CA certificate path")
-	f.StringVar(&connectTLSCert, "tls-cert", "", "Register or update mesh MQTT TLS client certificate path")
-	f.StringVar(&connectTLSKey, "tls-key", "", "Register or update mesh MQTT TLS client key path")
-	f.BoolVar(&connectTLSInsecure, "tls-insecure", false, "Skip TLS hostname/CA verification for lab self-signed brokers")
-	f.StringVar(&connectTopicRoot, "topic-root", "", "Register or update mesh MQTT topic root override")
-	f.BoolVar(&connectSkipVerify, "no-verify", false, "Switch working mesh offline without live MNS handshake verification")
-	f.BoolVar(&connectAllowPartialVerify, "allow-partial-verify", false, "Allow switching when at least one MNS source verifies and no source conflicts")
+	f.String("broker", "", "Register or update mesh MQTT broker URL (e.g. tcp://192.0.2.10:1883)")
+	f.String("db", "", "Register or update mesh PostgreSQL operator DSN")
+	f.String("ro-db", "", "Register or update mesh Read-Only PostgreSQL DSN")
+	f.String("mqtt-user", "", "Register or update mesh MQTT username")
+	f.String("mqtt-pass", "", "Register or update mesh MQTT password")
+	f.String("tls-ca", "", "Register or update mesh MQTT TLS CA certificate path")
+	f.String("tls-cert", "", "Register or update mesh MQTT TLS client certificate path")
+	f.String("tls-key", "", "Register or update mesh MQTT TLS client key path")
+	f.Bool("tls-insecure", false, "Skip TLS hostname/CA verification for lab self-signed brokers")
+	f.String("topic-root", "", "Register or update mesh MQTT topic root override")
+	f.Bool("no-verify", false, "Switch working mesh offline without live MNS handshake verification")
+	f.Bool("allow-partial-verify", false, "Allow switching when at least one MNS source verifies and no source conflicts")
 }
 
 func buildConnectProfilePatch(cmd *cobra.Command) config.MeshProfilePatch {
@@ -177,7 +162,7 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 
 	rawTarget := strings.TrimSpace(args[0])
 	if rawTarget == "-" {
-		prev, err := config.ReadPreviousMesh()
+		prev, err := config.ReadPreviousMeshForBrand(state.brand)
 		if err != nil {
 			return err
 		}
@@ -193,12 +178,9 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 	targetMesh := rawTarget
 	patch := buildConnectProfilePatch(cmd)
 
-	baseCfg, err := config.LoadBaseWorkstationConfig(cfgPath)
+	baseCfg, err := config.LoadBaseWorkstationConfigForBrand(cfgPath, state.brand)
 	if err != nil {
 		return err
-	}
-	if baseCfg.Brand == brand.Default() && state.brand != brand.Default() {
-		baseCfg.Brand = state.brand
 	}
 
 	existingProfile, hasProfile := baseCfg.Meshes[targetMesh]
@@ -249,13 +231,13 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 
 	var savedConfigPath string
 	if !patch.IsEmpty() {
-		savedConfigPath, err = config.UpsertWorkstationMeshProfile(cfgPath, targetMesh, patch)
+		savedConfigPath, err = config.UpsertWorkstationMeshProfileForBrand(cfgPath, state.brand, targetMesh, patch)
 		if err != nil {
 			return err
 		}
 	}
 
-	statePath, err := config.WriteCurrentMesh(targetMesh)
+	statePath, err := config.WriteCurrentMeshForBrand(state.brand, targetMesh)
 	if err != nil {
 		return err
 	}
@@ -483,6 +465,7 @@ func probePostgresMeshIdentity(ctx context.Context, cfg config.WorkstationConfig
 		roStore, roErr := db.NewReadOnlyAgentStore(ctx, roDSN, actor, db.ReadOnlyOptions{
 			AllowSuperuser: cfg.AllowSuperuserReadOnly,
 			MathSchema:     cfg.Brand.MathSchema,
+			EnvPrefix:      cfg.Brand.EnvPrefix,
 		})
 		if roErr != nil {
 			roProbeErr = roErr
@@ -528,12 +511,9 @@ func runMeshList(cmd *cobra.Command, _ []string) error {
 	state := cliStateFromCommand(cmd)
 	cfgPath, meshName := persistentConfigFlags(cmd)
 
-	baseCfg, err := config.LoadBaseWorkstationConfig(cfgPath)
+	baseCfg, err := config.LoadBaseWorkstationConfigForBrand(cfgPath, state.brand)
 	if err != nil {
 		return err
-	}
-	if baseCfg.Brand == brand.Default() && state.brand != brand.Default() {
-		baseCfg.Brand = state.brand
 	}
 
 	activeName := ""
@@ -543,7 +523,7 @@ func runMeshList(cmd *cobra.Command, _ []string) error {
 		if eff.ActiveMeshSource != "" {
 			activeSource = eff.ActiveMeshSource
 		}
-	} else if stateMesh, _ := config.ReadCurrentMesh(); stateMesh != "" {
+	} else if stateMesh, _ := config.ReadCurrentMeshForBrand(state.brand); stateMesh != "" {
 		activeName = stateMesh
 		activeSource = "state (unconfigured!)"
 	}

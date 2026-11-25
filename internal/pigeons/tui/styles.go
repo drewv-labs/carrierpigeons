@@ -13,22 +13,26 @@ var (
 )
 
 type streamTokenMsg struct {
-	token string
-	ch    <-chan string
+	streamID uint64
+	token    string
+	ch       <-chan string
 }
 
-type streamDoneMsg struct{}
+type streamDoneMsg struct {
+	streamID uint64
+}
 
 type streamErrMsg struct {
-	err error
+	streamID uint64
+	err      error
 }
 
-func waitForToken(ch <-chan string) tea.Cmd {
+func waitForToken(streamID uint64, ch <-chan string) tea.Cmd {
 	return func() tea.Msg {
 		tok, ok := <-ch
 		if !ok {
-			return streamDoneMsg{}
+			return streamDoneMsg{streamID: streamID}
 		}
-		return streamTokenMsg{token: tok, ch: ch}
+		return streamTokenMsg{streamID: streamID, token: tok, ch: ch}
 	}
 }

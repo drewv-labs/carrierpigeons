@@ -20,16 +20,21 @@ import (
 )
 
 const (
-	telemetryWorkerCount = 4
-	telemetryQueueCap    = 4096
-	controlWorkerCount   = 4
-	controlQueueCap      = 256
-	runnerReqWorkerCount = 2
-	runnerReqQueueCap    = 256
-	ntfyMaxConcurrency   = 8
-	subscribeWaitTimeout = 5 * time.Second
-	runnerPublishTimeout = 3 * time.Second
+	telemetryWorkerCount   = 4
+	telemetryQueueCap      = 4096
+	controlWorkerCount     = 4
+	controlQueueCap        = 256
+	runnerReqWorkerCount   = 2
+	runnerReqQueueCap      = 256
+	ntfyMaxConcurrency     = 8
+	subscribeWaitTimeout   = 5 * time.Second
+	runnerPublishTimeout   = 3 * time.Second
+	defaultMNSRefresh      = 1 * time.Hour
+	defaultShutdownGrace   = 5 * time.Second
+	shutdownPostCancelWait = 500 * time.Millisecond
 )
+
+var subscriberClientSeq atomic.Uint64
 
 type rawTelemetryMsg struct {
 	topic   string
@@ -71,47 +76,54 @@ type TransitionLedger interface {
 
 // SubscriberOptions configures Coop's MQTT ingestion, MNS announcement, Ntfy alerting, TLS, and COPY batching parameters.
 type SubscriberOptions struct {
-	BrokerURL   string
-	MeshName    string
-	CoopNodeID  string
-	Username    string
-	Password    string
-	TLSConfig   *tls.Config
-	Ingest      ingest.Options
-	NtfyEnabled bool
-	NtfyURL     string
-	Brand       brand.Spec
+	BrokerURL          string
+	MeshName           string
+	CoopNodeID         string
+	Username           string
+	Password           string
+	TLSConfig          *tls.Config
+	Ingest             ingest.Options
+	NtfyEnabled        bool
+	NtfyURL            string
+	Brand              brand.Spec
+	MNSRefreshInterval time.Duration
 }
 
 // Subscriber manages Coop's MQTT subscriptions, batched PostgreSQL COPY injection, and RunnerRequestCTD routing.
 type Subscriber struct {
-	client           mqtt.Client
-	ledger           Ledger
-	batcher          *ingest.Batcher
-	meshName         string
-	coopNodeID       string
-	brand            brand.Spec
-	topicRoot        string
-	ntfyEnabled      bool
-	ntfyURL          string
-	ntfySem          chan struct{}
-	ntfyCtx          context.Context
-	ntfyCancel       context.CancelFunc
-	ntfyWG           sync.WaitGroup
-	telemetryQueue   chan rawTelemetryMsg
-	telemetryStop    chan struct{}
-	telemetryWG      sync.WaitGroup
-	telemetryDropped atomic.Uint64
-	ctrlQueue        chan func()
-	ctrlStop         chan struct{}
-	ctrlWG           sync.WaitGroup
-	controlDropped   atomic.Uint64
-	runnerReqQueue   chan rawRunnerReqMsg
-	runnerReqStop    chan struct{}
-	runnerReqWG      sync.WaitGroup
-	runnerReqDropped atomic.Uint64
-	runnerPubTimeout time.Duration
-	closeOnce        sync.Once
+	client             mqtt.Client
+	ledger             Ledger
+	batcher            *ingest.Batcher
+	meshName           string
+	coopNodeID         string
+	brand              brand.Spec
+	topicRoot          string
+	ntfyEnabled        bool
+	ntfyURL            string
+	ntfySem            chan struct{}
+	ntfyCtx            context.Context
+	ntfyCancel         context.CancelFunc
+	ntfyWG             sync.WaitGroup
+	workCtx            context.Context
+	workCancel         context.CancelFunc
+	mnsRefreshInterval time.Duration
+	mnsStop            chan struct{}
+	mnsWG              sync.WaitGroup
+	telemetryQueue     chan rawTelemetryMsg
+	telemetryStop      chan struct{}
+	telemetryWG        sync.WaitGroup
+	telemetryDropped   atomic.Uint64
+	ctrlQueue          chan func()
+	ctrlStop           chan struct{}
+	ctrlWG             sync.WaitGroup
+	controlDropped     atomic.Uint64
+	runnerReqQueue     chan rawRunnerReqMsg
+	runnerReqStop      chan struct{}
+	runnerReqWG        sync.WaitGroup
+	runnerReqDropped   atomic.Uint64
+	runnerPubTimeout   time.Duration
+	shutdownGrace      time.Duration
+	closeOnce          sync.Once
 }
 
 // NewSubscriber creates a new MQTT listener with default batching and Ntfy settings.
@@ -165,26 +177,36 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 	bSpec = bSpec.MergeWithDefaults()
 
 	ntfyCtx, ntfyCancel := context.WithCancel(context.Background())
+	workCtx, workCancel := context.WithCancel(context.Background())
+	mnsInterval := cfg.MNSRefreshInterval
+	if mnsInterval <= 0 {
+		mnsInterval = defaultMNSRefresh
+	}
 
 	sub := &Subscriber{
-		ledger:           ledger,
-		batcher:          ingest.NewBatcher(ledger, cfg.Ingest),
-		meshName:         meshName,
-		coopNodeID:       cfg.CoopNodeID,
-		brand:            bSpec,
-		topicRoot:        strings.Trim(bSpec.TopicRoot, "/"),
-		ntfyEnabled:      cfg.NtfyEnabled,
-		ntfyURL:          cfg.NtfyURL,
-		ntfySem:          make(chan struct{}, ntfyMaxConcurrency),
-		ntfyCtx:          ntfyCtx,
-		ntfyCancel:       ntfyCancel,
-		telemetryQueue:   make(chan rawTelemetryMsg, telemetryQueueCap),
-		telemetryStop:    make(chan struct{}),
-		ctrlQueue:        make(chan func(), controlQueueCap),
-		ctrlStop:         make(chan struct{}),
-		runnerReqQueue:   make(chan rawRunnerReqMsg, runnerReqQueueCap),
-		runnerReqStop:    make(chan struct{}),
-		runnerPubTimeout: runnerPublishTimeout,
+		ledger:             ledger,
+		batcher:            ingest.NewBatcher(ledger, cfg.Ingest),
+		meshName:           meshName,
+		coopNodeID:         cfg.CoopNodeID,
+		brand:              bSpec,
+		topicRoot:          strings.Trim(bSpec.TopicRoot, "/"),
+		ntfyEnabled:        cfg.NtfyEnabled,
+		ntfyURL:            cfg.NtfyURL,
+		ntfySem:            make(chan struct{}, ntfyMaxConcurrency),
+		ntfyCtx:            ntfyCtx,
+		ntfyCancel:         ntfyCancel,
+		workCtx:            workCtx,
+		workCancel:         workCancel,
+		mnsRefreshInterval: mnsInterval,
+		mnsStop:            make(chan struct{}),
+		telemetryQueue:     make(chan rawTelemetryMsg, telemetryQueueCap),
+		telemetryStop:      make(chan struct{}),
+		ctrlQueue:          make(chan func(), controlQueueCap),
+		ctrlStop:           make(chan struct{}),
+		runnerReqQueue:     make(chan rawRunnerReqMsg, runnerReqQueueCap),
+		runnerReqStop:      make(chan struct{}),
+		runnerPubTimeout:   runnerPublishTimeout,
+		shutdownGrace:      defaultShutdownGrace,
 	}
 
 	for range telemetryWorkerCount {
@@ -208,7 +230,7 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(cfg.BrokerURL)
-	opts.SetClientID(fmt.Sprintf("%s-ingestor-%s-%d", strings.ToLower(bSpec.CoopName), cfg.CoopNodeID, os.Getpid()))
+	opts.SetClientID(fmt.Sprintf("%s-ingestor-%s-%d-%d", strings.ToLower(bSpec.CoopName), cfg.CoopNodeID, os.Getpid(), subscriberClientSeq.Add(1)))
 	if cfg.Username != "" {
 		opts.SetUsername(cfg.Username)
 		opts.SetPassword(cfg.Password)
@@ -226,7 +248,12 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 		opts.SetWill(meshTopic, string(lwtPayload), 1, true)
 	}
 
+	initReady := make(chan struct{})
+	var initOnce sync.Once
+
 	opts.OnConnect = func(client mqtt.Client) {
+		defer initOnce.Do(func() { close(initReady) })
+
 		for _, subSpec := range []struct {
 			topic   string
 			handler mqtt.MessageHandler
@@ -236,24 +263,25 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 			{registryTopic, sub.enqueueControl(sub.processRegistryUpdate)},
 			{runnerReqTopic, sub.handleRunnerRequest},
 		} {
+			select {
+			case <-sub.mnsStop:
+				return
+			default:
+			}
 			if err := waitTokenTimeout(client.Subscribe(subSpec.topic, 1, subSpec.handler), subscribeWaitTimeout); err != nil {
 				log.Printf("[Coop Broker] Failed subscribing to %s: %v", subSpec.topic, err)
 			}
 		}
 
+		select {
+		case <-sub.mnsStop:
+			return
+		default:
+		}
+
 		// Publish retained Mesh Name System (MNS) identity so workstation CLI/TUI handshakes
 		// can verify the remote PigeonCoop's registered mesh name before switching profiles.
-		rawIdentity, err := json.Marshal(core.MeshIdentity{
-			MeshName:   sub.meshName,
-			CoopNodeID: sub.coopNodeID,
-			TopicRoot:  sub.topicRoot,
-			UpdatedAt:  time.Now().UTC(),
-		})
-		if err == nil {
-			if err := waitTokenTimeout(client.Publish(meshTopic, 1, true, rawIdentity), 2*time.Second); err != nil {
-				log.Printf("[Coop Broker] Failed publishing retained MNS identity to %s: %v", meshTopic, err)
-			}
-		}
+		sub.publishMeshIdentity(client)
 
 		log.Printf("[%s] Subscribed to telemetry (%s), registry (%s), & runner requests (%s) [mesh=%s]",
 			bSpec.CoopName, telemetryTopic, registryTopic, runnerReqTopic, sub.meshName)
@@ -263,6 +291,8 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 	if err := waitTokenTimeout(client.Connect(), 5*time.Second); err != nil {
 		client.Disconnect(50)
 		ntfyCancel()
+		workCancel()
+		close(sub.mnsStop)
 		close(sub.telemetryStop)
 		sub.telemetryWG.Wait()
 		close(sub.ctrlStop)
@@ -274,8 +304,60 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 		return nil, err
 	}
 
+	initTimer := time.NewTimer(5 * time.Second)
+	select {
+	case <-initReady:
+		initTimer.Stop()
+	case <-initTimer.C:
+		log.Printf("[Coop Broker] Timed out waiting 5s for initial OnConnect subscriptions")
+	}
+
 	sub.client = client
+	sub.mnsWG.Add(1)
+	go sub.mnsRefreshLoop()
 	return sub, nil
+}
+
+func (s *Subscriber) workContext() context.Context {
+	if s.workCtx != nil {
+		return s.workCtx
+	}
+	return context.Background()
+}
+
+func (s *Subscriber) publishMeshIdentity(client mqtt.Client) {
+	if client == nil {
+		return
+	}
+	rawIdentity, err := json.Marshal(core.MeshIdentity{
+		MeshName:   s.meshName,
+		CoopNodeID: s.coopNodeID,
+		TopicRoot:  s.topicRoot,
+		UpdatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return
+	}
+	meshTopic := s.brand.MeshTopic()
+	if err := waitTokenTimeout(client.Publish(meshTopic, 1, true, rawIdentity), 2*time.Second); err != nil {
+		log.Printf("[Coop Broker] Failed publishing retained MNS identity to %s: %v", meshTopic, err)
+	}
+}
+
+func (s *Subscriber) mnsRefreshLoop() {
+	defer s.mnsWG.Done()
+	ticker := time.NewTicker(s.mnsRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.mnsStop:
+			return
+		case <-ticker.C:
+			if s.client != nil && s.client.IsConnected() {
+				s.publishMeshIdentity(s.client)
+			}
+		}
+	}
 }
 
 func (s *Subscriber) telemetryWorker() {
@@ -307,6 +389,9 @@ func (s *Subscriber) controlWorker() {
 			}
 		case <-s.ctrlStop:
 			for {
+				if s.workCtx != nil && s.workCtx.Err() != nil {
+					return
+				}
 				select {
 				case fn := <-s.ctrlQueue:
 					if fn != nil {
@@ -328,6 +413,9 @@ func (s *Subscriber) runnerReqWorker() {
 			s.processRunnerRequest(m.client, m.topic, m.payload)
 		case <-s.runnerReqStop:
 			for {
+				if s.workCtx != nil && s.workCtx.Err() != nil {
+					return
+				}
 				select {
 				case m := <-s.runnerReqQueue:
 					s.processRunnerRequest(m.client, m.topic, m.payload)
@@ -454,7 +542,7 @@ func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload 
 		action = "start"
 	}
 
-	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	resolveCtx, resolveCancel := context.WithTimeout(s.workContext(), 5*time.Second)
 	targets, err := s.ledger.ResolveNodes(resolveCtx, req.Selectors)
 	if err != nil {
 		resolveCancel()
@@ -543,7 +631,7 @@ func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload 
 	}
 
 	if len(succeededTargets) > 0 {
-		traceCtx, traceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		traceCtx, traceCancel := context.WithTimeout(s.workContext(), 5*time.Second)
 		for _, targetNode := range succeededTargets {
 			if err := s.ledger.InsertTrace(traceCtx, core.TraceEdge{
 				SourceID: reqArtifactID,
@@ -576,6 +664,14 @@ func (s *Subscriber) IngestedCount() uint64 {
 	return s.batcher.IngestedCount()
 }
 
+// BatcherDroppedCount returns total CTD events dropped by the COPY batcher due to queue saturation or flush failure.
+func (s *Subscriber) BatcherDroppedCount() uint64 {
+	if s.batcher == nil {
+		return 0
+	}
+	return s.batcher.DroppedCount()
+}
+
 // TelemetryDroppedCount returns total telemetry messages dropped due to decode queue saturation.
 func (s *Subscriber) TelemetryDroppedCount() uint64 {
 	return s.telemetryDropped.Load()
@@ -591,10 +687,14 @@ func (s *Subscriber) RunnerRequestDroppedCount() uint64 {
 	return s.runnerReqDropped.Load()
 }
 
-// Disconnect drains all pending telemetry/control/runner workers, Ntfy alerts, and CTD batches
-// and cleanly marks the retained MNS topic offline before closing the MQTT connection.
+// Disconnect stops the MNS heartbeat, marks the retained MNS topic offline, closes the MQTT connection,
+// and drains telemetry, control/runner workers (bounded by a hard shutdown grace deadline), Ntfy alerts, and COPY batches.
 func (s *Subscriber) Disconnect() {
 	s.closeOnce.Do(func() {
+		if s.mnsStop != nil {
+			close(s.mnsStop)
+		}
+		s.mnsWG.Wait()
 		if s.ntfyCancel != nil {
 			s.ntfyCancel()
 		}
@@ -612,17 +712,55 @@ func (s *Subscriber) Disconnect() {
 			close(s.telemetryStop)
 		}
 		s.telemetryWG.Wait()
+
+		var batcherWG sync.WaitGroup
+		if s.batcher != nil {
+			batcherWG.Add(1)
+			go func() {
+				defer batcherWG.Done()
+				s.batcher.Close()
+			}()
+		}
+
 		if s.ctrlStop != nil {
 			close(s.ctrlStop)
 		}
-		s.ctrlWG.Wait()
 		if s.runnerReqStop != nil {
 			close(s.runnerReqStop)
 		}
-		s.runnerReqWG.Wait()
 		s.ntfyWG.Wait()
-		if s.batcher != nil {
-			s.batcher.Close()
+
+		workersDone := make(chan struct{})
+		go func() {
+			s.ctrlWG.Wait()
+			s.runnerReqWG.Wait()
+			close(workersDone)
+		}()
+
+		grace := s.shutdownGrace
+		if grace <= 0 {
+			grace = defaultShutdownGrace
 		}
+		timer := time.NewTimer(grace)
+		select {
+		case <-workersDone:
+			timer.Stop()
+			if s.workCancel != nil {
+				s.workCancel()
+			}
+		case <-timer.C:
+			if s.workCancel != nil {
+				s.workCancel()
+			}
+			settle := time.NewTimer(shutdownPostCancelWait)
+			select {
+			case <-workersDone:
+				settle.Stop()
+			case <-settle.C:
+				log.Printf("[Coop Broker] Shutdown grace (%s) expired with DB workers still blocked; proceeding with teardown", grace)
+			}
+		}
+
+		batcherWG.Wait()
 	})
 }

@@ -118,7 +118,9 @@ func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[str
 	if reqID != "" {
 		startEvent.AddParam("request_id", reqID)
 	}
-	_ = pub.Publish(startEvent)
+	if pub != nil {
+		_ = pub.Publish(startEvent)
+	}
 
 	// Enforce the requested duration while respecting external abort cancellation
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(durationSec)*time.Second)
@@ -171,7 +173,9 @@ func (b *BenchmarkRunner) Run(ctx context.Context, nodeID string, params map[str
 	if reqID != "" {
 		endEvent.AddParam("request_id", reqID)
 	}
-	_ = pub.Publish(endEvent)
+	if pub != nil {
+		_ = pub.Publish(endEvent)
+	}
 
 	return nil
 }

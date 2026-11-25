@@ -4,7 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 )
 
 func TestCoopConfigValidateSecurityFailClosed(t *testing.T) {
@@ -523,5 +526,281 @@ func TestRedactURLAndBrandPrefixedEnvHelpers(t *testing.T) {
 	}
 	if got := ResolveWorkstationRODBURLEnv(""); got != "postgres://pigeons_ro@192.0.2.3:5432/db" {
 		t.Fatalf("expected PIGEONS_RO_DB_URL fallback when no brand prefix, got %q", got)
+	}
+}
+
+func TestUpsertWorkstationMeshProfilePreservesArrayOfTables(t *testing.T) {
+	if hdr, isArr, ok := parseTOMLTableHeaderPath("[[custom_items]] # trailing"); !ok || !isArr || hdr != "custom_items" {
+		t.Fatalf("expected [[custom_items]] to parse as array table, got hdr=%q isArr=%v ok=%v", hdr, isArr, ok)
+	}
+	if hdr, isArr, ok := parseTOMLTableHeaderPath("[meshes.alpha]"); !ok || isArr || hdr != "meshes.alpha" {
+		t.Fatalf("expected [meshes.alpha] to parse as standard table, got hdr=%q isArr=%v ok=%v", hdr, isArr, ok)
+	}
+	for _, bad := range []string{"[[1, 2]]", "[[unclosed]", "[single]]", "[]", "[[]]"} {
+		if hdr, isArr, ok := parseTOMLTableHeaderPath(bad); ok {
+			t.Fatalf("expected %q not to parse as table header, got hdr=%q isArr=%v", bad, hdr, isArr)
+		}
+	}
+
+	dir := t.TempDir()
+	wsPath := filepath.Join(dir, "pigeons.toml")
+	initialTOML := `# Preserve header comment
+operator = "drew"
+
+[[pre_items]]
+name = "before-alpha"
+weight = 1
+
+[meshes.alpha]
+broker_url = "tcp://192.0.2.10:1883"
+database_url = "postgres://pigeoncoop_admin:old_pw@192.0.2.10:5432/edge_ledger"
+
+[meshes.alpha.llm]
+provider = "ollama"
+model = "old-model"
+
+[[custom_items]]
+name = "keep-me-1"
+tags = ["a", "b"]
+
+[[custom_items]]
+name = "keep-me-2"
+
+[[meshes.other.hooks]]
+event = "on_connect"
+cmd = "echo other"
+
+[[meshes.alpha.hooks]]
+event = "on_connect"
+cmd = "echo alpha"
+
+[meshes.beta]
+broker_url = "tcp://192.0.2.20:1883"
+`
+	if err := os.WriteFile(wsPath, []byte(initialTOML), 0o600); err != nil {
+		t.Fatalf("write initial toml: %v", err)
+	}
+
+	newBroker := "tcp://192.0.2.11:1883"
+	newDB := "postgres://pigeoncoop_admin:new_pw@192.0.2.11:5432/edge_ledger"
+	if _, err := UpsertWorkstationMeshProfile(wsPath, "alpha", MeshProfilePatch{
+		BrokerURL:   &newBroker,
+		DatabaseURL: &newDB,
+	}); err != nil {
+		t.Fatalf("UpsertWorkstationMeshProfile(alpha): %v", err)
+	}
+
+	rawAfter, err := os.ReadFile(wsPath)
+	if err != nil {
+		t.Fatalf("read updated toml: %v", err)
+	}
+	got := string(rawAfter)
+	for _, want := range []string{
+		"# Preserve header comment",
+		"[[pre_items]]",
+		`name = "before-alpha"`,
+		"[[custom_items]]",
+		`name = "keep-me-1"`,
+		`name = "keep-me-2"`,
+		"[[meshes.other.hooks]]",
+		`cmd = "echo other"`,
+		"[[meshes.alpha.hooks]]",
+		`cmd = "echo alpha"`,
+		"[meshes.beta]",
+		`broker_url = "tcp://192.0.2.20:1883"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected updated TOML to preserve %q verbatim, got:\n%s", want, got)
+		}
+	}
+
+	cfgAlpha, err := LoadWorkstationConfigForMesh(wsPath, "alpha")
+	if err != nil {
+		t.Fatalf("LoadWorkstationConfigForMesh(alpha): %v", err)
+	}
+	if cfgAlpha.BrokerURL != newBroker || cfgAlpha.DatabaseURL != newDB {
+		t.Fatalf("unexpected alpha config after upsert: broker=%q db=%q", cfgAlpha.BrokerURL, cfgAlpha.DatabaseURL)
+	}
+	if cfgAlpha.LLM.Model != "old-model" {
+		t.Fatalf("expected existing [meshes.alpha.llm] fields preserved, got %q", cfgAlpha.LLM.Model)
+	}
+}
+
+func TestBrandIsolatedConfigAndStateConcurrency(t *testing.T) {
+	initialActive := brand.Active()
+	rootDir := t.TempDir()
+	fakeHome := filepath.Join(rootDir, "home")
+	if err := os.MkdirAll(fakeHome, 0o700); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	t.Setenv("HOME", fakeHome)
+	// Ensure default pigeons env vars do not bleed into custom brand isolation.
+	t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(rootDir, "pigeons-state", "current_mesh"))
+	t.Setenv("PIGEONS_CONFIG", filepath.Join(rootDir, "pigeons.toml"))
+	t.Setenv("PIGEONS_MESH", "pigeons-only-mesh")
+	if err := os.WriteFile(filepath.Join(rootDir, "pigeons.toml"), []byte("operator = \"pigeons-op\"\n[meshes.pigeons-only-mesh]\nbroker_url = \"tcp://127.0.0.1:1883\"\n"), 0o600); err != nil {
+		t.Fatalf("write pigeons.toml: %v", err)
+	}
+
+	brandA := brand.Spec{
+		ProductName: "AlphaTelemetry",
+		CLIName:     "alphacli",
+		TopicRoot:   "alpha",
+		EnvPrefix:   "ALPHA",
+	}
+	brandB := brand.Spec{
+		ProductName: "BetaTelemetry",
+		CLIName:     "betacli",
+		TopicRoot:   "beta",
+		EnvPrefix:   "BETA",
+	}
+
+	// Zero-value brand.Spec defaults to brand.Default() conventions.
+	defPath, err := CurrentMeshStatePathForBrand(brand.Spec{})
+	if err != nil {
+		t.Fatalf("CurrentMeshStatePathForBrand(zero): %v", err)
+	}
+	if defPath != filepath.Join(rootDir, "pigeons-state", "current_mesh") {
+		t.Fatalf("expected zero-value brand to use PIGEONS_CURRENT_MESH_FILE, got %q", defPath)
+	}
+
+	// Custom brands ignore PIGEONS_CURRENT_MESH_FILE and resolve ~/.config/<cli_slug>/current_mesh.
+	pathAHome, err := CurrentMeshStatePathForBrand(brandA)
+	if err != nil {
+		t.Fatalf("CurrentMeshStatePathForBrand(brandA): %v", err)
+	}
+	wantAHome := filepath.Join(fakeHome, ".config", "alphacli", "current_mesh")
+	if pathAHome != wantAHome {
+		t.Fatalf("expected brandA default state path %q, got %q", wantAHome, pathAHome)
+	}
+
+	// Custom <BRAND>_CURRENT_MESH_FILE and <BRAND>_CONFIG override isolated state & config paths.
+	stateFileA := filepath.Join(rootDir, "state-a", "current_mesh")
+	stateFileB := filepath.Join(rootDir, "state-b", "current_mesh")
+	cfgFileA := filepath.Join(rootDir, "cfg-a", "alphacli.toml")
+	cfgFileB := filepath.Join(rootDir, "cfg-b", "betacli.toml")
+
+	t.Setenv("ALPHA_CURRENT_MESH_FILE", stateFileA)
+	t.Setenv("BETA_CURRENT_MESH_FILE", stateFileB)
+	t.Setenv("ALPHA_CONFIG", cfgFileA)
+	t.Setenv("BETA_CONFIG", cfgFileB)
+	t.Setenv("ALPHA_OPERATOR", "alpha-op")
+	t.Setenv("BETA_OPERATOR", "beta-op")
+
+	if err := os.MkdirAll(filepath.Dir(cfgFileA), 0o700); err != nil {
+		t.Fatalf("mkdir cfg-a: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgFileB), 0o700); err != nil {
+		t.Fatalf("mkdir cfg-b: %v", err)
+	}
+	if err := os.WriteFile(cfgFileA, []byte("[meshes.alpha-one]\nbroker_url = \"tcp://192.0.2.10:1883\"\n[meshes.alpha-two]\nbroker_url = \"tcp://192.0.2.11:1883\"\n"), 0o600); err != nil {
+		t.Fatalf("write cfgFileA: %v", err)
+	}
+	if err := os.WriteFile(cfgFileB, []byte("[meshes.beta-one]\nbroker_url = \"tcp://192.0.2.20:1883\"\n[meshes.beta-two]\nbroker_url = \"tcp://192.0.2.21:1883\"\n"), 0o600); err != nil {
+		t.Fatalf("write cfgFileB: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	runBrandCycle := func(spec brand.Spec, m1, m2, wantCfgPath, wantOp, wantTopicRoot, upsertBroker string) {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if _, err := WriteCurrentMeshForBrand(spec, m1); err != nil {
+				t.Errorf("%s WriteCurrentMeshForBrand(%s): %v", spec.CLIName, m1, err)
+				return
+			}
+			if _, err := WriteCurrentMeshForBrand(spec, m2); err != nil {
+				t.Errorf("%s WriteCurrentMeshForBrand(%s): %v", spec.CLIName, m2, err)
+				return
+			}
+			cur, err := ReadCurrentMeshForBrand(spec)
+			if err != nil || cur != m2 {
+				t.Errorf("%s ReadCurrentMeshForBrand = %q (err=%v), want %q", spec.CLIName, cur, err, m2)
+				return
+			}
+			prev, err := ReadPreviousMeshForBrand(spec)
+			if err != nil || prev != m1 {
+				t.Errorf("%s ReadPreviousMeshForBrand = %q (err=%v), want %q", spec.CLIName, prev, err, m1)
+				return
+			}
+
+			baseCfg, err := LoadBaseWorkstationConfigForBrand("", spec)
+			if err != nil {
+				t.Errorf("%s LoadBaseWorkstationConfigForBrand: %v", spec.CLIName, err)
+				return
+			}
+			if baseCfg.ConfigPath != wantCfgPath {
+				t.Errorf("%s ConfigPath = %q, want %q", spec.CLIName, baseCfg.ConfigPath, wantCfgPath)
+				return
+			}
+			if baseCfg.Brand.TopicRoot != wantTopicRoot {
+				t.Errorf("%s Brand.TopicRoot = %q, want %q", spec.CLIName, baseCfg.Brand.TopicRoot, wantTopicRoot)
+				return
+			}
+
+			wsCfg, err := LoadWorkstationConfigForMeshAndBrand("", "", spec)
+			if err != nil {
+				t.Errorf("%s LoadWorkstationConfigForMeshAndBrand: %v", spec.CLIName, err)
+				return
+			}
+			if wsCfg.ActiveMesh != m2 || wsCfg.ActiveMeshSource != "state" {
+				t.Errorf("%s ActiveMesh=%q source=%q, want %q (state)", spec.CLIName, wsCfg.ActiveMesh, wsCfg.ActiveMeshSource, m2)
+				return
+			}
+			if wsCfg.Operator != wantOp {
+				t.Errorf("%s Operator=%q, want %q", spec.CLIName, wsCfg.Operator, wantOp)
+				return
+			}
+
+			savedPath, err := UpsertWorkstationMeshProfileForBrand("", spec, m2, MeshProfilePatch{
+				BrokerURL: &upsertBroker,
+			})
+			if err != nil {
+				t.Errorf("%s UpsertWorkstationMeshProfileForBrand: %v", spec.CLIName, err)
+				return
+			}
+			if savedPath != wantCfgPath {
+				t.Errorf("%s upsert savedPath=%q, want %q", spec.CLIName, savedPath, wantCfgPath)
+				return
+			}
+
+			if err := ClearCurrentMeshForBrand(spec); err != nil {
+				t.Errorf("%s ClearCurrentMeshForBrand: %v", spec.CLIName, err)
+				return
+			}
+			afterClear, err := ReadCurrentMeshForBrand(spec)
+			if err != nil || afterClear != "" {
+				t.Errorf("%s ReadCurrentMeshForBrand after clear = %q (err=%v), want empty", spec.CLIName, afterClear, err)
+				return
+			}
+		}
+	}
+
+	wg.Add(2)
+	go runBrandCycle(brandA, "alpha-one", "alpha-two", cfgFileA, "alpha-op", "alpha", "tcp://192.0.2.111:1883")
+	go runBrandCycle(brandB, "beta-one", "beta-two", cfgFileB, "beta-op", "beta", "tcp://192.0.2.222:1883")
+	wg.Wait()
+
+	// Verify brand-prefixed MESH env override is also isolated per brand.
+	t.Setenv("ALPHA_MESH", "alpha-one")
+	t.Setenv("BETA_MESH", "beta-one")
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		cfg, err := LoadWorkstationConfigForMeshAndBrand("", "", brandA)
+		if err != nil || cfg.ActiveMesh != "alpha-one" || cfg.ActiveMeshSource != "env" {
+			t.Errorf("brandA env mesh resolution failed: cfg=%+v err=%v", cfg, err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		cfg, err := LoadWorkstationConfigForMeshAndBrand("", "", brandB)
+		if err != nil || cfg.ActiveMesh != "beta-one" || cfg.ActiveMeshSource != "env" {
+			t.Errorf("brandB env mesh resolution failed: cfg=%+v err=%v", cfg, err)
+		}
+	}()
+	wg.Wait()
+
+	if brand.Active() != initialActive {
+		t.Fatalf("global brand.Active() mutated: got %+v, want %+v", brand.Active(), initialActive)
 	}
 }

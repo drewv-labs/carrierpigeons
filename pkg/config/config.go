@@ -797,8 +797,8 @@ func DefaultWorkstationConfig() WorkstationConfig {
 	}
 }
 
-func activeCLIDirSlug() string {
-	bSpec := brand.Active().MergeWithDefaults()
+func brandCLIDirSlug(b brand.Spec) string {
+	bSpec := b.MergeWithDefaults()
 	dirSlug := strings.ToLower(strings.TrimSpace(bSpec.CLIName))
 	if dirSlug == "" {
 		return "pigeons"
@@ -806,30 +806,46 @@ func activeCLIDirSlug() string {
 	return dirSlug
 }
 
-// CurrentMeshStatePath resolves `~/.config/<cli_slug>/current_mesh` (or `PIGEONS_CURRENT_MESH_FILE` override).
-func CurrentMeshStatePath() (string, error) {
-	if p := strings.TrimSpace(os.Getenv("PIGEONS_CURRENT_MESH_FILE")); p != "" {
+func brandWorkstationConfigFilename(b brand.Spec) string {
+	return brandCLIDirSlug(b) + ".toml"
+}
+
+func activeCLIDirSlug() string {
+	return brandCLIDirSlug(brand.Active())
+}
+
+// CurrentMeshStatePathForBrand resolves `~/.config/<cli_slug>/current_mesh`
+// (or `<BRAND_ENV_PREFIX>_CURRENT_MESH_FILE` override) for the given brand.
+func CurrentMeshStatePathForBrand(b brand.Spec) (string, error) {
+	bSpec := b.MergeWithDefaults()
+	envKey := bSpec.EnvPrefix + "_CURRENT_MESH_FILE"
+	if p := strings.TrimSpace(os.Getenv(envKey)); p != "" {
 		return p, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {
 		return "", fmt.Errorf("resolve user home directory for current_mesh state: %w", err)
 	}
-	return filepath.Join(home, ".config", activeCLIDirSlug(), "current_mesh"), nil
+	return filepath.Join(home, ".config", brandCLIDirSlug(bSpec), "current_mesh"), nil
 }
 
-func previousMeshStatePath() (string, error) {
-	curPath, err := CurrentMeshStatePath()
+// CurrentMeshStatePath resolves `~/.config/<cli_slug>/current_mesh` (or `PIGEONS_CURRENT_MESH_FILE` override).
+func CurrentMeshStatePath() (string, error) {
+	return CurrentMeshStatePathForBrand(brand.Active())
+}
+
+func previousMeshStatePathForBrand(b brand.Spec) (string, error) {
+	curPath, err := CurrentMeshStatePathForBrand(b)
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(filepath.Dir(curPath), "previous_mesh"), nil
 }
 
-// ReadCurrentMesh reads the persisted "current working mesh" name from `~/.config/pigeons/current_mesh`.
+// ReadCurrentMeshForBrand reads the persisted "current working mesh" name for the given brand.
 // Returns ("", nil) when no active mesh state file exists.
-func ReadCurrentMesh() (string, error) {
-	path, err := CurrentMeshStatePath()
+func ReadCurrentMeshForBrand(b brand.Spec) (string, error) {
+	path, err := CurrentMeshStatePathForBrand(b)
 	if err != nil {
 		return "", nil
 	}
@@ -850,9 +866,15 @@ func ReadCurrentMesh() (string, error) {
 	return name, nil
 }
 
-// ReadPreviousMesh reads the prior working mesh name saved during the last `pigeons connect` switch (for `pigeons connect -`).
-func ReadPreviousMesh() (string, error) {
-	path, err := previousMeshStatePath()
+// ReadCurrentMesh reads the persisted "current working mesh" name from `~/.config/pigeons/current_mesh`.
+// Returns ("", nil) when no active mesh state file exists.
+func ReadCurrentMesh() (string, error) {
+	return ReadCurrentMeshForBrand(brand.Active())
+}
+
+// ReadPreviousMeshForBrand reads the prior working mesh name saved during the last `<cli> connect` switch for the given brand.
+func ReadPreviousMeshForBrand(b brand.Spec) (string, error) {
+	path, err := previousMeshStatePathForBrand(b)
 	if err != nil {
 		return "", err
 	}
@@ -871,6 +893,11 @@ func ReadPreviousMesh() (string, error) {
 		return "", fmt.Errorf("invalid previous mesh name in %s: %w", path, err)
 	}
 	return name, nil
+}
+
+// ReadPreviousMesh reads the prior working mesh name saved during the last `pigeons connect` switch (for `pigeons connect -`).
+func ReadPreviousMesh() (string, error) {
+	return ReadPreviousMeshForBrand(brand.Active())
 }
 
 func writeAtomicFile0600(targetPath string, content []byte) error {
@@ -908,19 +935,20 @@ func writeAtomicFile0600(targetPath string, content []byte) error {
 	return nil
 }
 
-// WriteCurrentMesh atomically persists the active "current working mesh" in `~/.config/pigeons/current_mesh`
-// and records any distinct prior mesh in `~/.config/pigeons/previous_mesh` so `pigeons connect -` toggles cleanly.
-func WriteCurrentMesh(meshName string) (string, error) {
+// WriteCurrentMeshForBrand atomically persists the active "current working mesh" for the given brand
+// and records any distinct prior mesh in `previous_mesh` so `<cli> connect -` toggles cleanly.
+func WriteCurrentMeshForBrand(b brand.Spec, meshName string) (string, error) {
+	bSpec := b.MergeWithDefaults()
 	meshName = strings.TrimSpace(meshName)
 	if err := core.ValidateMeshName(meshName); err != nil {
 		return "", err
 	}
-	statePath, err := CurrentMeshStatePath()
+	statePath, err := CurrentMeshStatePathForBrand(bSpec)
 	if err != nil {
 		return "", err
 	}
-	if prev, prevErr := ReadCurrentMesh(); prevErr == nil && prev != "" && prev != meshName {
-		if prevPath, pErr := previousMeshStatePath(); pErr == nil {
+	if prev, prevErr := ReadCurrentMeshForBrand(bSpec); prevErr == nil && prev != "" && prev != meshName {
+		if prevPath, pErr := previousMeshStatePathForBrand(bSpec); pErr == nil {
 			_ = writeAtomicFile0600(prevPath, []byte(prev+"\n"))
 		}
 	}
@@ -930,14 +958,21 @@ func WriteCurrentMesh(meshName string) (string, error) {
 	return statePath, nil
 }
 
-// ClearCurrentMesh removes `~/.config/pigeons/current_mesh`, reverting workstation commands to top-level defaults.
-func ClearCurrentMesh() error {
-	statePath, err := CurrentMeshStatePath()
+// WriteCurrentMesh atomically persists the active "current working mesh" in `~/.config/pigeons/current_mesh`
+// and records any distinct prior mesh in `~/.config/pigeons/previous_mesh` so `pigeons connect -` toggles cleanly.
+func WriteCurrentMesh(meshName string) (string, error) {
+	return WriteCurrentMeshForBrand(brand.Active(), meshName)
+}
+
+// ClearCurrentMeshForBrand removes `current_mesh` for the given brand, reverting workstation commands to top-level defaults.
+func ClearCurrentMeshForBrand(b brand.Spec) error {
+	bSpec := b.MergeWithDefaults()
+	statePath, err := CurrentMeshStatePathForBrand(bSpec)
 	if err != nil {
 		return err
 	}
-	if prev, prevErr := ReadCurrentMesh(); prevErr == nil && prev != "" {
-		if prevPath, pErr := previousMeshStatePath(); pErr == nil {
+	if prev, prevErr := ReadCurrentMeshForBrand(bSpec); prevErr == nil && prev != "" {
+		if prevPath, pErr := previousMeshStatePathForBrand(bSpec); pErr == nil {
 			_ = writeAtomicFile0600(prevPath, []byte(prev+"\n"))
 		}
 	}
@@ -945,6 +980,11 @@ func ClearCurrentMesh() error {
 		return fmt.Errorf("remove %s: %w", statePath, err)
 	}
 	return nil
+}
+
+// ClearCurrentMesh removes `~/.config/pigeons/current_mesh`, reverting workstation commands to top-level defaults.
+func ClearCurrentMesh() error {
+	return ClearCurrentMeshForBrand(brand.Active())
 }
 
 func resolveConfigFile(explicitPath, envKey, filename string) string {
@@ -975,22 +1015,47 @@ func resolveConfigFile(explicitPath, envKey, filename string) string {
 	return ""
 }
 
-func resolveWritableWorkstationConfigPath(explicitPath string) (string, error) {
+func resolveWorkstationConfigFileForBrand(explicitPath string, b brand.Spec) string {
+	if p := strings.TrimSpace(explicitPath); p != "" {
+		return p
+	}
+	bSpec := b.MergeWithDefaults()
+	envKey := bSpec.EnvPrefix + "_CONFIG"
+	if p := strings.TrimSpace(os.Getenv(envKey)); p != "" {
+		return p
+	}
+	dirSlug := brandCLIDirSlug(bSpec)
+	filename := dirSlug + ".toml"
+
+	candidates := []string{filename}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates, filepath.Join(home, ".config", dirSlug, filename))
+	}
+	candidates = append(candidates, filepath.Join("/etc", dirSlug, filename))
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+func resolveWritableWorkstationConfigPathForBrand(explicitPath string, b brand.Spec) (string, error) {
 	if p := strings.TrimSpace(explicitPath); p != "" {
 		return p, nil
 	}
-	if p := strings.TrimSpace(os.Getenv("PIGEONS_CONFIG")); p != "" {
+	bSpec := b.MergeWithDefaults()
+	envKey := bSpec.EnvPrefix + "_CONFIG"
+	if p := strings.TrimSpace(os.Getenv(envKey)); p != "" {
 		return p, nil
 	}
-	dirSlug := activeCLIDirSlug()
-	candidates := []string{"pigeons.toml"}
+	dirSlug := brandCLIDirSlug(bSpec)
+	filename := dirSlug + ".toml"
+	candidates := []string{filename}
 	var defaultUserPath string
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-		defaultUserPath = filepath.Join(home, ".config", dirSlug, "pigeons.toml")
+		defaultUserPath = filepath.Join(home, ".config", dirSlug, filename)
 		candidates = append(candidates, defaultUserPath)
-		if dirSlug != "pigeons" {
-			candidates = append(candidates, filepath.Join(home, ".config", "pigeons", "pigeons.toml"))
-		}
 	}
 	for _, c := range candidates {
 		if info, err := os.Stat(c); err == nil && !info.IsDir() {
@@ -1000,18 +1065,79 @@ func resolveWritableWorkstationConfigPath(explicitPath string) (string, error) {
 	if defaultUserPath != "" {
 		return defaultUserPath, nil
 	}
-	return "pigeons.toml", nil
+	return filename, nil
 }
 
-func parseTOMLTableHeaderPath(line string) (string, bool) {
+func splitTOMLKeyPath(inner string) ([]string, bool) {
+	var parts []string
+	var cur strings.Builder
+	inSingle, inDouble, escaped := false, false, false
+	hasQuote := false
+	for i := 0; i < len(inner); i++ {
+		ch := inner[i]
+		if escaped {
+			cur.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if inDouble && ch == '\\' {
+			cur.WriteByte(ch)
+			escaped = true
+			continue
+		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			hasQuote = true
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			hasQuote = true
+			continue
+		}
+		if !inSingle && !inDouble {
+			if ch == '.' {
+				part := strings.TrimSpace(cur.String())
+				if part == "" && !hasQuote {
+					return nil, false
+				}
+				parts = append(parts, part)
+				cur.Reset()
+				hasQuote = false
+				continue
+			}
+			// Reject unquoted characters invalid in TOML key paths (e.g. multiline array literals like [[1, 2]]).
+			if ch == ',' || ch == '[' || ch == ']' || ch == '=' {
+				return nil, false
+			}
+		}
+		cur.WriteByte(ch)
+	}
+	if inSingle || inDouble || escaped {
+		return nil, false
+	}
+	part := strings.TrimSpace(cur.String())
+	if part == "" && !hasQuote {
+		return nil, false
+	}
+	parts = append(parts, part)
+	return parts, true
+}
+
+func parseTOMLTableHeaderPath(line string) (path string, isArray bool, ok bool) {
 	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "[[") {
-		return "", false
+	if !strings.HasPrefix(trimmed, "[") {
+		return "", false, false
+	}
+	isArray = strings.HasPrefix(trimmed, "[[")
+	startIdx := 1
+	if isArray {
+		startIdx = 2
 	}
 	// Strip trailing comment outside quotes.
 	inSingle, inDouble, escaped := false, false, false
 	closeIdx := -1
-	for i := 1; i < len(trimmed); i++ {
+	for i := startIdx; i < len(trimmed); i++ {
 		ch := trimmed[i]
 		if escaped {
 			escaped = false
@@ -1030,29 +1156,37 @@ func parseTOMLTableHeaderPath(line string) (string, bool) {
 			continue
 		}
 		if !inSingle && !inDouble && ch == ']' {
+			if isArray {
+				if i+1 < len(trimmed) && trimmed[i+1] == ']' {
+					closeIdx = i
+					break
+				}
+				return "", false, false
+			}
 			closeIdx = i
 			break
 		}
 	}
 	if closeIdx < 0 {
-		return "", false
+		return "", false, false
 	}
-	rest := strings.TrimSpace(trimmed[closeIdx+1:])
+	closeEnd := closeIdx + 1
+	if isArray {
+		closeEnd = closeIdx + 2
+	}
+	rest := strings.TrimSpace(trimmed[closeEnd:])
 	if rest != "" && !strings.HasPrefix(rest, "#") {
-		return "", false
+		return "", false, false
 	}
-	inner := strings.TrimSpace(trimmed[1:closeIdx])
+	inner := strings.TrimSpace(trimmed[startIdx:closeIdx])
 	if inner == "" {
-		return "", false
+		return "", false, false
 	}
-	rawParts := strings.Split(inner, ".")
-	normParts := make([]string, 0, len(rawParts))
-	for _, part := range rawParts {
-		p := strings.TrimSpace(part)
-		p = strings.Trim(p, `"'`)
-		normParts = append(normParts, p)
+	parts, valid := splitTOMLKeyPath(inner)
+	if !valid {
+		return "", false, false
 	}
-	return strings.Join(normParts, "."), true
+	return strings.Join(parts, "."), isArray, true
 }
 
 func isMeshSectionHeader(headerPath, meshName string) bool {
@@ -1083,9 +1217,10 @@ func renderMeshProfileTOML(meshName string, p MeshProfileConfig) (string, error)
 	return strings.Join(filtered, "\n") + "\n", nil
 }
 
-// UpsertWorkstationMeshProfile writes or updates `[meshes.<meshName>]` in `pigeons.toml`,
-// preserving existing comments and unrelated sections across the rest of the file.
-func UpsertWorkstationMeshProfile(explicitPath, meshName string, patch MeshProfilePatch) (string, error) {
+// UpsertWorkstationMeshProfileForBrand writes or updates `[meshes.<meshName>]` in the brand's workstation config,
+// preserving existing comments, unrelated sections, and `[[array_of_tables]]` blocks across the rest of the file.
+func UpsertWorkstationMeshProfileForBrand(explicitPath string, b brand.Spec, meshName string, patch MeshProfilePatch) (string, error) {
+	bSpec := b.MergeWithDefaults()
 	meshName = strings.TrimSpace(meshName)
 	if err := core.ValidateMeshName(meshName); err != nil {
 		return "", err
@@ -1096,7 +1231,7 @@ func UpsertWorkstationMeshProfile(explicitPath, meshName string, patch MeshProfi
 		}
 	}
 
-	targetPath, err := resolveWritableWorkstationConfigPath(explicitPath)
+	targetPath, err := resolveWritableWorkstationConfigPathForBrand(explicitPath, bSpec)
 	if err != nil {
 		return "", err
 	}
@@ -1120,7 +1255,11 @@ func UpsertWorkstationMeshProfile(explicitPath, meshName string, patch MeshProfi
 
 	var updatedText string
 	if len(existingRaw) == 0 {
-		updatedText = "# Pigeons Workstation Control Plane Configuration\n\n" + renderedBlock
+		headerTitle := "Pigeons"
+		if brandCLIDirSlug(bSpec) != "pigeons" {
+			headerTitle = bSpec.ProductName
+		}
+		updatedText = fmt.Sprintf("# %s Workstation Control Plane Configuration\n\n%s", headerTitle, renderedBlock)
 	} else {
 		lines := strings.Split(string(existingRaw), "\n")
 		var outLines []string
@@ -1128,8 +1267,8 @@ func UpsertWorkstationMeshProfile(explicitPath, meshName string, patch MeshProfi
 		replaced := false
 
 		for _, line := range lines {
-			if hdr, ok := parseTOMLTableHeaderPath(line); ok {
-				if isMeshSectionHeader(hdr, meshName) {
+			if hdr, isArray, ok := parseTOMLTableHeaderPath(line); ok {
+				if !isArray && isMeshSectionHeader(hdr, meshName) {
 					if !replaced {
 						outLines = append(outLines, strings.TrimRight(renderedBlock, "\n"))
 						replaced = true
@@ -1165,6 +1304,12 @@ func UpsertWorkstationMeshProfile(explicitPath, meshName string, patch MeshProfi
 		return "", err
 	}
 	return targetPath, nil
+}
+
+// UpsertWorkstationMeshProfile writes or updates `[meshes.<meshName>]` in `pigeons.toml`,
+// preserving existing comments and unrelated sections across the rest of the file.
+func UpsertWorkstationMeshProfile(explicitPath, meshName string, patch MeshProfilePatch) (string, error) {
+	return UpsertWorkstationMeshProfileForBrand(explicitPath, brand.Active(), meshName, patch)
 }
 
 func firstEnv(keys ...string) string {
@@ -1616,11 +1761,13 @@ func applyWorkstationEnvAndReadOnlyDerivation(cfg WorkstationConfig) (Workstatio
 	return cfg, nil
 }
 
-// LoadBaseWorkstationConfig decodes `pigeons.toml` and validates all `[meshes.*]` identifiers
-// without resolving or enforcing `~/.config/pigeons/current_mesh` state.
-func LoadBaseWorkstationConfig(explicitPath string) (WorkstationConfig, error) {
+// LoadBaseWorkstationConfigForBrand decodes the brand's workstation config (`<cli>.toml`) and validates all `[meshes.*]` identifiers
+// without resolving or enforcing `~/.config/<cli>/current_mesh` state.
+func LoadBaseWorkstationConfigForBrand(explicitPath string, b brand.Spec) (WorkstationConfig, error) {
+	bSpec := b.MergeWithDefaults()
 	cfg := DefaultWorkstationConfig()
-	path := resolveConfigFile(explicitPath, "PIGEONS_CONFIG", "pigeons.toml")
+	cfg.Brand = bSpec
+	path := resolveWorkstationConfigFileForBrand(explicitPath, bSpec)
 	if path != "" {
 		if _, err := toml.DecodeFile(path, &cfg); err != nil {
 			return cfg, fmt.Errorf("decode %s: %w", path, err)
@@ -1630,7 +1777,7 @@ func LoadBaseWorkstationConfig(explicitPath string) (WorkstationConfig, error) {
 		return cfg, fmt.Errorf("config file not found: %s", explicitPath)
 	}
 
-	cfg.Brand = cfg.Brand.MergeWithDefaults()
+	cfg.Brand = mergeBrandOverlay(bSpec, cfg.Brand)
 	cfg.MeshName = strings.TrimSpace(cfg.MeshName)
 	if cfg.MeshName != "" {
 		if err := core.ValidateMeshName(cfg.MeshName); err != nil {
@@ -1650,6 +1797,12 @@ func LoadBaseWorkstationConfig(explicitPath string) (WorkstationConfig, error) {
 	return cfg, nil
 }
 
+// LoadBaseWorkstationConfig decodes `pigeons.toml` and validates all `[meshes.*]` identifiers
+// without resolving or enforcing `~/.config/pigeons/current_mesh` state.
+func LoadBaseWorkstationConfig(explicitPath string) (WorkstationConfig, error) {
+	return LoadBaseWorkstationConfigForBrand(explicitPath, brand.Active())
+}
+
 // FinalizeWorkstationConfig applies environment variable overrides and Read-Only DSN derivation to a base or profile-merged config.
 func FinalizeWorkstationConfig(cfg WorkstationConfig) (WorkstationConfig, error) {
 	return applyWorkstationEnvAndReadOnlyDerivation(cfg)
@@ -1658,33 +1811,52 @@ func FinalizeWorkstationConfig(cfg WorkstationConfig) (WorkstationConfig, error)
 // LoadWorkstationConfig loads `pigeons.toml` (if present), resolves the active mesh (`PIGEONS_MESH` or `current_mesh`),
 // overlays `[meshes.<active>]`, and applies environment variable overrides.
 func LoadWorkstationConfig(explicitPath string) (WorkstationConfig, error) {
-	return LoadWorkstationConfigForMesh(explicitPath, "")
+	return LoadWorkstationConfigForMeshAndBrand(explicitPath, "", brand.Active())
 }
 
 // LoadWorkstationConfigForMesh loads `pigeons.toml`, selects `explicitMesh` (or `PIGEONS_MESH` / `current_mesh` state),
 // overlays `[meshes.<mesh>]`, and applies environment variable overrides.
 func LoadWorkstationConfigForMesh(explicitPath, explicitMesh string) (WorkstationConfig, error) {
-	cfg, err := LoadBaseWorkstationConfig(explicitPath)
+	return LoadWorkstationConfigForMeshAndBrand(explicitPath, explicitMesh, brand.Active())
+}
+
+// LoadWorkstationConfigForMeshAndBrand loads the brand's workstation config, selects `meshOverride`
+// (or `<BRAND>_MESH` / brand `current_mesh` state), overlays `[meshes.<mesh>]`, and applies environment overrides.
+func LoadWorkstationConfigForMeshAndBrand(explicitPath, meshOverride string, b brand.Spec) (WorkstationConfig, error) {
+	bSpec := b.MergeWithDefaults()
+	cfg, err := LoadBaseWorkstationConfigForBrand(explicitPath, bSpec)
 	if err != nil {
 		return cfg, err
 	}
 
 	bp := cfg.Brand.EnvPrefix
-	targetMesh := strings.TrimSpace(explicitMesh)
+	targetMesh := strings.TrimSpace(meshOverride)
 	source := ""
 	if targetMesh != "" {
 		source = "flag"
-	} else if envMesh := prefixedEnv(bp, "MESH", "PIGEONS_MESH"); envMesh != "" {
-		targetMesh = envMesh
-		source = "env"
 	} else {
-		stateMesh, stateErr := ReadCurrentMesh()
-		if stateErr != nil {
-			return cfg, stateErr
+		var envMesh string
+		if bSpec.EnvPrefix != brand.Default().EnvPrefix {
+			if bp != bSpec.EnvPrefix {
+				envMesh = prefixedEnv(bp, "MESH", bSpec.EnvPrefix+"_MESH")
+			} else {
+				envMesh = prefixedEnv(bp, "MESH")
+			}
+		} else {
+			envMesh = prefixedEnv(bp, "MESH", "PIGEONS_MESH")
 		}
-		if stateMesh != "" {
-			targetMesh = stateMesh
-			source = "state"
+		if envMesh != "" {
+			targetMesh = envMesh
+			source = "env"
+		} else {
+			stateMesh, stateErr := ReadCurrentMeshForBrand(bSpec)
+			if stateErr != nil {
+				return cfg, stateErr
+			}
+			if stateMesh != "" {
+				targetMesh = stateMesh
+				source = "state"
+			}
 		}
 	}
 
@@ -1701,8 +1873,8 @@ func LoadWorkstationConfigForMesh(explicitPath, explicitMesh string) (Workstatio
 		} else {
 			available := cfg.ConfiguredMeshNames()
 			return cfg, fmt.Errorf(
-				"mesh %q (from %s) is not configured in pigeons.toml (available meshes: %v; run `%s connect %s --broker <tcp://host:1883> --db <postgres://...>` to register it)",
-				targetMesh, source, available, cfg.Brand.CLIName, targetMesh,
+				"mesh %q (from %s) is not configured in %s (available meshes: %v; run `%s connect %s --broker <tcp://host:1883> --db <postgres://...>` to register it)",
+				targetMesh, source, brandWorkstationConfigFilename(bSpec), available, cfg.Brand.CLIName, targetMesh,
 			)
 		}
 	} else if cfg.MeshName != "" {

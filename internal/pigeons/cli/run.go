@@ -11,15 +11,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	runAll   bool
-	runNodes []string
-	runTags  []string
-	runKV    []string
-	runSecs  int
-	runNoTUI bool
-)
-
 func cleanSelectorTokens(raw []string, lowercase bool) []string {
 	var out []string
 	seen := make(map[string]struct{})
@@ -114,33 +105,43 @@ var runCmd = &cobra.Command{
   pigeons run SyntheticComputeRnr --node=rv64-compute-01 --node=rv64-vision-02 --tag={compute-bench}
   pigeons run benchmark --all --secs 30 --param target_system=true`,
 	Args: cobra.ExactArgs(1),
-	RunE: func(_ *cobra.Command, args []string) error {
-		req, err := buildRunnerRequest(args[0], wsCfg.Operator, runAll, runNodes, runTags, runKV, runSecs)
+	RunE: func(cmd *cobra.Command, args []string) error {
+		state := cliStateFromCommand(cmd)
+		cfg := state.wsCfg
+		f := cmd.Flags()
+		all, _ := f.GetBool("all")
+		nodes, _ := f.GetStringArray("node")
+		tags, _ := f.GetStringArray("tag")
+		kv, _ := f.GetStringArray("param")
+		secs, _ := f.GetInt("secs")
+		noTUI, _ := f.GetBool("no-tui")
+
+		req, err := buildRunnerRequest(args[0], cfg.Operator, all, nodes, tags, kv, secs)
 		if err != nil {
 			return err
 		}
 
-		brokerURL := resolveBrokerURL()
-		if err := publishRunnerRequest(brokerURL, req); err != nil {
+		brokerURL := resolveBrokerURLForConfig(cfg)
+		if err := publishRunnerRequestWithConfig(cfg, brokerURL, req); err != nil {
 			return err
 		}
 
-		fmt.Printf("[+] Submitted RunnerRequestCTD %s (%s) -> %s (all=%v, nodes=%v, tags=%v)\n",
-			req.RequestID, req.Runner, wsCfg.Brand.CoopName, req.Selectors.All, req.Selectors.Nodes, req.Selectors.Tags)
+		fmt.Fprintf(cmd.OutOrStdout(), "[+] Submitted RunnerRequestCTD %s (%s) -> %s (all=%v, nodes=%v, tags=%v)\n",
+			req.RequestID, req.Runner, cfg.Brand.CoopName, req.Selectors.All, req.Selectors.Nodes, req.Selectors.Tags)
 
-		if runNoTUI {
+		if noTUI {
 			return nil
 		}
-		return launchDashboard(tui.TabRunnerManager, req.RequestID, "", "")
+		return launchDashboardWithConfig(cfg, tui.TabRunnerManager, req.RequestID, "", "")
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(runCmd)
-	runCmd.Flags().BoolVar(&runAll, "all", false, "Dispatch runner across all active nodes in the mesh")
-	runCmd.Flags().StringArrayVar(&runNodes, "node", nil, "Target node ID (repeatable, chainable with --tag)")
-	runCmd.Flags().StringArrayVar(&runTags, "tag", nil, "Target node tag (repeatable, e.g. --tag=compute-bench or --tag={gpu-worker})")
-	runCmd.Flags().StringArrayVarP(&runKV, "param", "p", nil, "Runner key=value parameter (repeatable)")
-	runCmd.Flags().IntVar(&runSecs, "secs", 0, "Optional duration_sec override (defaults to 0 = indefinite for PauseRnr)")
-	runCmd.Flags().BoolVar(&runNoTUI, "no-tui", false, "Return immediately after dispatching RunnerRequestCTD without opening TUI")
+	runCmd.Flags().Bool("all", false, "Dispatch runner across all active nodes in the mesh")
+	runCmd.Flags().StringArray("node", nil, "Target node ID (repeatable, chainable with --tag)")
+	runCmd.Flags().StringArray("tag", nil, "Target node tag (repeatable, e.g. --tag=compute-bench or --tag={gpu-worker})")
+	runCmd.Flags().StringArrayP("param", "p", nil, "Runner key=value parameter (repeatable)")
+	runCmd.Flags().Int("secs", 0, "Optional duration_sec override (defaults to 0 = indefinite for PauseRnr)")
+	runCmd.Flags().Bool("no-tui", false, "Return immediately after dispatching RunnerRequestCTD without opening TUI")
 }

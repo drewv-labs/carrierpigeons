@@ -308,10 +308,20 @@ func TestMQTTClientDisconnectedDoesNotDropPayloads(t *testing.T) {
 
 	_ = c.Publish(core.NewCTDPayload("rv64-test-01", "cpu", "active"))
 	time.Sleep(50 * time.Millisecond)
+
+	// While disconnected and running, payloads must remain spooled and never be dropped.
+	if got := c.DeliveryDroppedCount(); got != 0 {
+		t.Fatalf("expected 0 drops while disconnected and running, got %d", got)
+	}
+
+	// On shutdown while still disconnected, remaining spooled items are accounted as dropped.
 	c.Disconnect()
 
-	if got := c.DeliveryDropped(); got != 0 {
-		t.Fatalf("expected 0 drops while disconnected, got %d", got)
+	if got := c.DeliveryDroppedCount(); got != 1 {
+		t.Fatalf("expected DeliveryDroppedCount=1 on disconnected shutdown, got %d", got)
+	}
+	if got := c.SpoolLen(); got != 0 {
+		t.Fatalf("expected spool drained on shutdown, got len=%d", got)
 	}
 }
 
@@ -577,5 +587,140 @@ func TestWaitRunnersTimeoutOnStuckRunner(t *testing.T) {
 	close(unblock)
 	if ok := c.WaitRunners(time.Second); !ok {
 		t.Fatal("expected WaitRunners to return true after stuck runner unblocked")
+	}
+}
+
+func TestMQTTClientShutdownTimeoutAccountsUnsentAndUnacked(t *testing.T) {
+	t.Run("partial_ack_unacked_and_unsent_chunks", func(t *testing.T) {
+		var seq atomic.Int32
+		mc := &fakeMQTTClient{
+			publishHook: func(_ string, _ []byte) mqtt.Token {
+				if seq.Add(1) <= 10 {
+					return newCompletedToken(nil)
+				}
+				return newStalledToken()
+			},
+		}
+		mc.connected.Store(true)
+
+		total := maxPipelinedPublishes + 10
+		c := newTestRelay(mc, total+16)
+		for i := range total {
+			_ = c.Publish(core.NewCTDPayload("rv64-test-01", "cpu", "active").AddMetric("seq", i))
+		}
+
+		c.drainRemainingBeforeClose(35 * time.Millisecond)
+
+		// 10 acked in chunk 1; 54 unacked in chunk 1 + 10 unsent in chunk 2 = 64 dropped.
+		if got := c.DeliveryDroppedCount(); got != 64 {
+			t.Fatalf("expected DeliveryDroppedCount=64 (54 unacked + 10 unsent), got %d", got)
+		}
+		if got := c.SpoolLen(); got != 0 {
+			t.Fatalf("expected spool empty after drainRemainingBeforeClose, got %d", got)
+		}
+	})
+
+	t.Run("timer_expired_before_next_chunk_counts_unsent", func(t *testing.T) {
+		var calls atomic.Int32
+		mc := &fakeMQTTClient{
+			publishHook: func(_ string, _ []byte) mqtt.Token {
+				if calls.Add(1) == 1 {
+					time.Sleep(25 * time.Millisecond)
+				}
+				return newCompletedToken(nil)
+			},
+		}
+		mc.connected.Store(true)
+
+		total := maxPipelinedPublishes + 5
+		c := newTestRelay(mc, total+16)
+		for i := range total {
+			_ = c.Publish(core.NewCTDPayload("rv64-test-01", "cpu", "active").AddMetric("seq", i))
+		}
+
+		c.drainRemainingBeforeClose(10 * time.Millisecond)
+
+		// All 64 tokens in chunk 1 completed; 5 items in chunk 2 were never sent.
+		if got := c.DeliveryDroppedCount(); got != 5 {
+			t.Fatalf("expected DeliveryDroppedCount=5 unsent items, got %d", got)
+		}
+		if got := c.SpoolLen(); got != 0 {
+			t.Fatalf("expected spool empty after drainRemainingBeforeClose, got %d", got)
+		}
+	})
+
+	t.Run("token_error_during_drain_counted", func(t *testing.T) {
+		mc := &fakeMQTTClient{
+			publishHook: func(_ string, _ []byte) mqtt.Token {
+				return newCompletedToken(errors.New("publish rejected"))
+			},
+		}
+		mc.connected.Store(true)
+
+		c := newTestRelay(mc, 16)
+		for i := range 3 {
+			_ = c.Publish(core.NewCTDPayload("rv64-test-01", "cpu", "active").AddMetric("seq", i))
+		}
+
+		c.drainRemainingBeforeClose(100 * time.Millisecond)
+
+		if got := c.DeliveryDroppedCount(); got != 3 {
+			t.Fatalf("expected DeliveryDroppedCount=3 for errored shutdown tokens, got %d", got)
+		}
+	})
+}
+
+func TestMQTTClientConnectedInfiniteTimeoutDropsPoisonAndDrainsSubsequent(t *testing.T) {
+	var poisonAttempts atomic.Int32
+	var healthyDelivered atomic.Int32
+	mc := &fakeMQTTClient{
+		publishHook: func(topic string, _ []byte) mqtt.Token {
+			if strings.HasSuffix(topic, "/poison") {
+				poisonAttempts.Add(1)
+				return newStalledToken()
+			}
+			healthyDelivered.Add(1)
+			return newCompletedToken(nil)
+		},
+	}
+	mc.connected.Store(true)
+
+	c := newTestRelay(mc, 32)
+	c.batchTimeout = 10 * time.Millisecond
+	c.backoffBase = 2 * time.Millisecond
+	c.backoffMax = 5 * time.Millisecond
+	c.maxAttempts = 3
+	c.maxTimeoutAttempts = 4
+
+	go c.flushLoop()
+	defer c.Disconnect()
+
+	// Enqueue the poison event first so flushLoop picks it up in its own batch (succeeded == 0).
+	_ = c.Publish(core.NewCTDPayload("rv64-test-01", "poison", "active"))
+	deadline := time.Now().Add(2 * time.Second)
+	for poisonAttempts.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if poisonAttempts.Load() < 1 {
+		t.Fatal("expected poison payload to enter deliverBatchWithRetry")
+	}
+
+	// Enqueue healthy events behind the stalled poison batch.
+	_ = c.Publish(core.NewCTDPayload("rv64-test-01", "healthy", "active").AddMetric("seq", 1))
+	_ = c.Publish(core.NewCTDPayload("rv64-test-01", "healthy", "active").AddMetric("seq", 2))
+
+	deadline = time.Now().Add(2 * time.Second)
+	for (c.DeliveryDroppedCount() < 1 || healthyDelivered.Load() < 2) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := poisonAttempts.Load(); got != 4 {
+		t.Fatalf("expected 4 poison timeout attempts before drop, got %d", got)
+	}
+	if got := c.DeliveryDroppedCount(); got != 1 {
+		t.Fatalf("expected DeliveryDroppedCount=1 after poison timeout drop, got %d", got)
+	}
+	if got := healthyDelivered.Load(); got != 2 {
+		t.Fatalf("expected 2 subsequent healthy payloads to drain after poison drop, got %d", got)
 	}
 }

@@ -1,13 +1,18 @@
 package db
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -291,32 +296,346 @@ func TestEnforceNonSuperuserQueryAndEvaluation(t *testing.T) {
 }
 
 func TestEnsureSchemaAndCopyBatchSQLHygiene(t *testing.T) {
-	if !strings.Contains(ensureSchemaReadyQuery, "to_regclass('public.idx_ledger_metrics_path_gin') IS NULL") {
-		t.Fatal("ensureSchemaReadyQuery must check that idx_ledger_metrics_path_gin has been dropped before taking fast-path")
+	requiredReadyFragments := []string{
+		"to_regclass('public.idx_ledger_metrics_path_gin') IS NULL",
+		"to_regclass('public.idx_ledger_ts_desc') IS NULL",
+		"to_regclass('public.idx_ledger_ingested_ts') IS NULL",
+		"to_regclass('public.idx_ledger_ts_brin') IS NOT NULL",
+		"to_regclass('public.idx_ledger_ingested_brin') IS NOT NULL",
+		"to_regclass('public.idx_ledger_pause_node_ts') IS NOT NULL",
 	}
-	if !strings.Contains(ensureSchemaDDL, "DROP INDEX IF EXISTS idx_ledger_metrics_path_gin;") {
-		t.Fatal("ensureSchemaDDL must drop legacy idx_ledger_metrics_path_gin")
+	for _, frag := range requiredReadyFragments {
+		if !strings.Contains(ensureSchemaReadyQuery, frag) {
+			t.Fatalf("ensureSchemaReadyQuery missing %q", frag)
+		}
+	}
+
+	requiredDDLFragments := []string{
+		"DROP INDEX IF EXISTS idx_ledger_metrics_path_gin;",
+		"DROP INDEX IF EXISTS idx_ledger_ts_desc;",
+		"DROP INDEX IF EXISTS idx_ledger_ingested_ts;",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id, component, event_timestamp DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_ts_brin ON telemetric_ledger USING BRIN (event_timestamp);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_ingested_brin ON telemetric_ledger USING BRIN (ingested_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_pause_node_ts",
+		"WHERE pillar = 'runner' AND component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr');",
+	}
+	for _, frag := range requiredDDLFragments {
+		if !strings.Contains(ensureSchemaDDL, frag) {
+			t.Fatalf("ensureSchemaDDL missing %q", frag)
+		}
 	}
 	if strings.Contains(ensureSchemaDDL, "CREATE INDEX IF NOT EXISTS idx_ledger_metrics_path_gin") ||
-		strings.Contains(ensureSchemaDDL, "jsonb_path_ops") {
-		t.Fatal("ensureSchemaDDL must not recreate unused idx_ledger_metrics_path_gin")
+		strings.Contains(ensureSchemaDDL, "jsonb_path_ops") ||
+		strings.Contains(ensureSchemaDDL, "CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc") ||
+		strings.Contains(ensureSchemaDDL, "CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts") {
+		t.Fatal("ensureSchemaDDL must not recreate dropped legacy indexes")
 	}
 
 	initSQLPath := filepath.Join("..", "..", "..", "deployments", "compose", "init.sql")
-	initSQL, err := os.ReadFile(initSQLPath)
+	initSQLBytes, err := os.ReadFile(initSQLPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", initSQLPath, err)
 	}
-	if strings.Contains(string(initSQL), "idx_ledger_metrics_path_gin") {
-		t.Fatalf("%s must not create unused idx_ledger_metrics_path_gin", initSQLPath)
+	initSQL := string(initSQLBytes)
+	if strings.Contains(initSQL, "idx_ledger_metrics_path_gin") ||
+		strings.Contains(initSQL, "idx_ledger_ts_desc") ||
+		strings.Contains(initSQL, "idx_ledger_ingested_ts") {
+		t.Fatalf("%s must not create dropped legacy indexes", initSQLPath)
 	}
-	if !strings.Contains(string(initSQL), "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM PUBLIC, pigeoncare_ro;") ||
-		!strings.Contains(string(initSQL), "REVOKE CREATE ON SCHEMA public FROM PUBLIC, pigeoncare_ro;") {
-		t.Fatalf("%s must revoke write/CREATE privileges from both PUBLIC and pigeoncare_ro", initSQLPath)
+	requiredInitFragments := []string{
+		"CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id, component, event_timestamp DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_ts_brin ON telemetric_ledger USING BRIN (event_timestamp);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_ingested_brin ON telemetric_ledger USING BRIN (ingested_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';",
+		"idx_ledger_pause_node_ts",
+		"WHERE pillar = 'runner' AND component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr');",
+		"REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM PUBLIC, pigeoncare_ro;",
+		"REVOKE CREATE ON SCHEMA public FROM PUBLIC, pigeoncare_ro;",
+	}
+	for _, frag := range requiredInitFragments {
+		if !strings.Contains(initSQL, frag) {
+			t.Fatalf("%s missing %q", initSQLPath, frag)
+		}
 	}
 
-	if !strings.Contains(upsertBatchNodeLastSeenSQL, "WHERE ctd_nodes.last_seen IS NULL") ||
-		!strings.Contains(upsertBatchNodeLastSeenSQL, "ctd_nodes.last_seen < EXCLUDED.last_seen - INTERVAL '5 seconds'") {
-		t.Fatalf("upsertBatchNodeLastSeenSQL missing 5s throttle predicate: %s", upsertBatchNodeLastSeenSQL)
+	for name, sqlStmt := range map[string]string{
+		"upsertBatchNodeLastSeenSQL": upsertBatchNodeLastSeenSQL,
+		"upsertNodeLastSeenSQL":      upsertNodeLastSeenSQL,
+	} {
+		if !strings.Contains(sqlStmt, "WHERE ctd_nodes.last_seen IS NULL") ||
+			!strings.Contains(sqlStmt, "ctd_nodes.last_seen < EXCLUDED.last_seen - INTERVAL '5 seconds'") ||
+			!strings.Contains(sqlStmt, "GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen)") {
+			t.Fatalf("%s missing 5s throttle predicate: %s", name, sqlStmt)
+		}
 	}
+}
+
+func TestGetClusterStatusQueryUsesPartialPauseIndex(t *testing.T) {
+	if !strings.Contains(getClusterStatusQuery, "AND p.pillar = 'runner'") {
+		t.Fatalf("getClusterStatusQuery pause_rnr LATERAL must filter p.pillar = 'runner' to hit idx_ledger_pause_node_ts")
+	}
+	if !strings.Contains(getClusterStatusQuery, "p.component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr')") {
+		t.Fatalf("getClusterStatusQuery pause_rnr LATERAL missing expected pause component predicate")
+	}
+}
+
+func TestBatchInsertDivideAndConquerMarshalErrors(t *testing.T) {
+	t.Run("single row fails marshaling before touching pool", func(t *testing.T) {
+		store := &PostgresStore{}
+		bad := core.NewCTDPayload("node-single-nan", "cpu", "active")
+		bad.Metrics["nan_val"] = math.NaN()
+
+		copied, err := store.BatchInsertEvents(context.Background(), []*core.CTDPayload{bad})
+		if copied != 0 {
+			t.Fatalf("expected 0 copied rows, got %d", copied)
+		}
+		if err == nil {
+			t.Fatal("expected non-nil marshal error for batch-size-1 NaN payload")
+		}
+		if !strings.Contains(err.Error(), "node-single-nan") {
+			t.Fatalf("expected error to include node-single-nan, got: %v", err)
+		}
+
+		if err := store.InsertEvent(context.Background(), bad); err == nil || !strings.Contains(err.Error(), "node-single-nan") {
+			t.Fatalf("expected direct InsertEvent to return marshal error before Begin(), got: %v", err)
+		}
+	})
+
+	t.Run("all rows fail marshaling returns joined error", func(t *testing.T) {
+		store := &PostgresStore{}
+		p1 := core.NewCTDPayload("node-a", "cpu", "active")
+		p1.Metrics["nan_val"] = math.NaN()
+		p2 := core.NewCTDPayload("node-b", "mem", "active")
+		p2.Metrics["inf_val"] = math.Inf(1)
+
+		copied, err := store.BatchInsertEvents(context.Background(), []*core.CTDPayload{p1, p2})
+		if copied != 0 {
+			t.Fatalf("expected 0 copied rows, got %d", copied)
+		}
+		if err == nil {
+			t.Fatal("expected non-nil joined error when all rows fail marshaling")
+		}
+		if !strings.Contains(err.Error(), "node-a") || !strings.Contains(err.Error(), "node-b") {
+			t.Fatalf("expected error to include both failed nodes, got: %v", err)
+		}
+	})
+
+	t.Run("partial marshal failure still copies valid rows and returns joined error", func(t *testing.T) {
+		var seenRows int
+		store := &PostgresStore{
+			copyBatchFn: func(_ context.Context, copyRows [][]any, _ map[string]time.Time, _ []*core.Artifact, _ []*core.TraceEdge) (int64, error) {
+				seenRows = len(copyRows)
+				return int64(len(copyRows)), nil
+			},
+		}
+		ok1 := core.NewCTDPayload("node-ok-1", "cpu", "active")
+		ok1.Metrics["temp"] = 42.5
+		bad1 := core.NewCTDPayload("node-bad-metrics", "gpu", "active")
+		bad1.Metrics["nan"] = math.NaN()
+		ok2 := core.NewCTDPayload("node-ok-2", "disk", "active")
+		ok2.Params["mount"] = "/nvme"
+		bad2 := core.NewCTDPayload("node-bad-inf", "net", "active")
+		bad2.Metrics["inf"] = math.Inf(-1)
+
+		copied, err := store.BatchInsertEvents(context.Background(), []*core.CTDPayload{ok1, bad1, ok2, bad2})
+		if copied != 2 || seenRows != 2 {
+			t.Fatalf("expected 2 copied rows (seen=%d), got %d", seenRows, copied)
+		}
+		if err == nil {
+			t.Fatal("expected non-nil joined error when some rows fail marshaling")
+		}
+		if !strings.Contains(err.Error(), "node-bad-metrics") || !strings.Contains(err.Error(), "node-bad-inf") {
+			t.Fatalf("expected joined error to mention both failed nodes, got: %v", err)
+		}
+	})
+
+	t.Run("bisect with marshal error preserves both marshal and row errors", func(t *testing.T) {
+		poisonErr := errors.New("poison row constraint failure")
+		store := &PostgresStore{
+			copyBatchFn: func(_ context.Context, copyRows [][]any, _ map[string]time.Time, _ []*core.Artifact, _ []*core.TraceEdge) (int64, error) {
+				return 0, &pgconn.PgError{Code: "22P02"}
+			},
+			insertEventFn: func(_ context.Context, p *core.CTDPayload) error {
+				if p.NodeID == "node-poison" {
+					return poisonErr
+				}
+				return nil
+			},
+		}
+		ok := core.NewCTDPayload("node-good", "cpu", "active")
+		poison := core.NewCTDPayload("node-poison", "cpu", "active")
+		badMarshal := core.NewCTDPayload("node-nan", "cpu", "active")
+		badMarshal.Metrics["bad"] = math.NaN()
+
+		copied, err := store.BatchInsertEvents(context.Background(), []*core.CTDPayload{ok, poison, badMarshal})
+		if copied != 1 {
+			t.Fatalf("expected 1 copied row after bisection, got %d", copied)
+		}
+		if !errors.Is(err, poisonErr) {
+			t.Fatalf("expected joined error to wrap poisonErr, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "node-nan") {
+			t.Fatalf("expected joined error to include marshal failure for node-nan, got: %v", err)
+		}
+	})
+}
+
+type recordedExec struct {
+	sql  string
+	args []any
+}
+
+type fakePGXTx struct {
+	pgx.Tx
+	execs   []recordedExec
+	queryFn func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func (f *fakePGXTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	f.execs = append(f.execs, recordedExec{sql: sql, args: args})
+	return pgconn.CommandTag{}, nil
+}
+
+func (f *fakePGXTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return f.queryFn(ctx, sql, args...)
+}
+
+type fakePGXRows struct {
+	pgx.Rows
+	remaining int
+	scanFn    func(dest ...any) error
+	err       error
+}
+
+func (r *fakePGXRows) Close() {}
+
+func (r *fakePGXRows) Next() bool {
+	if r.remaining <= 0 {
+		return false
+	}
+	r.remaining--
+	return true
+}
+
+func (r *fakePGXRows) Scan(dest ...any) error {
+	if r.scanFn != nil {
+		return r.scanFn(dest...)
+	}
+	return nil
+}
+
+func (r *fakePGXRows) Err() error {
+	return r.err
+}
+
+func TestInsertEventUpsertsNodeLastSeen(t *testing.T) {
+	store := &PostgresStore{}
+	tx := &fakePGXTx{}
+	ts := time.Date(2026, 11, 24, 18, 0, 0, 0, time.UTC)
+	p := core.NewCTDPayload("node-single-01", "host-os", "active")
+	p.EventTimestamp = ts
+
+	metricsJSON, paramsJSON, err := prepareEventJSON(p)
+	if err != nil {
+		t.Fatalf("prepareEventJSON failed: %v", err)
+	}
+	if err := store.insertPreparedEventWithTx(context.Background(), tx, p, metricsJSON, paramsJSON); err != nil {
+		t.Fatalf("insertPreparedEventWithTx failed: %v", err)
+	}
+	if len(tx.execs) != 2 {
+		t.Fatalf("expected 2 Exec statements (ledger insert + ctd_nodes last_seen upsert), got %d", len(tx.execs))
+	}
+	if !strings.Contains(tx.execs[0].sql, "INSERT INTO telemetric_ledger") {
+		t.Fatalf("unexpected first exec SQL: %s", tx.execs[0].sql)
+	}
+	if tx.execs[1].sql != upsertNodeLastSeenSQL {
+		t.Fatalf("expected second exec SQL to equal upsertNodeLastSeenSQL, got: %s", tx.execs[1].sql)
+	}
+	if len(tx.execs[1].args) != 2 || tx.execs[1].args[0] != "node-single-01" || !tx.execs[1].args[1].(time.Time).Equal(ts) {
+		t.Fatalf("unexpected upsertNodeLastSeenSQL args: %#v", tx.execs[1].args)
+	}
+}
+
+func TestGetLineageDAGPropagatesArtifactErrors(t *testing.T) {
+	now := time.Now().UTC()
+
+	newTraceRows := func() pgx.Rows {
+		return &fakePGXRows{
+			remaining: 1,
+			scanFn: func(dest ...any) error {
+				*dest[0].(*string) = "art-root"
+				*dest[1].(*string) = "PRODUCED"
+				*dest[2].(*string) = "art-child"
+				*dest[3].(*string) = "node-01"
+				*dest[4].(*string) = "run-01"
+				*dest[5].(*[]byte) = []byte(`{}`)
+				*dest[6].(*time.Time) = now
+				return nil
+			},
+		}
+	}
+
+	t.Run("artifact query error returns error instead of truncated DAG", func(t *testing.T) {
+		wantErr := errors.New("artifact query timeout")
+		call := 0
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				call++
+				if call == 1 {
+					return newTraceRows(), nil
+				}
+				return nil, wantErr
+			},
+		}
+		dag, err := (&PostgresStore{}).getLineageDAGWithTx(context.Background(), tx, "art-root", 5)
+		if !errors.Is(err, wantErr) || dag != nil {
+			t.Fatalf("expected (nil, %v), got (%v, %v)", wantErr, dag, err)
+		}
+	})
+
+	t.Run("artifact scan error returns error instead of skipping row", func(t *testing.T) {
+		wantErr := errors.New("artifact column type mismatch")
+		call := 0
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				call++
+				if call == 1 {
+					return newTraceRows(), nil
+				}
+				return &fakePGXRows{
+					remaining: 1,
+					scanFn:    func(_ ...any) error { return wantErr },
+				}, nil
+			},
+		}
+		dag, err := (&PostgresStore{}).getLineageDAGWithTx(context.Background(), tx, "art-root", 5)
+		if !errors.Is(err, wantErr) || dag != nil {
+			t.Fatalf("expected (nil, %v), got (%v, %v)", wantErr, dag, err)
+		}
+	})
+
+	t.Run("artifact rows Err returns error instead of truncated DAG", func(t *testing.T) {
+		wantErr := errors.New("stream reset during artifact fetch")
+		call := 0
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				call++
+				if call == 1 {
+					return newTraceRows(), nil
+				}
+				return &fakePGXRows{
+					remaining: 0,
+					err:       wantErr,
+				}, nil
+			},
+		}
+		dag, err := (&PostgresStore{}).getLineageDAGWithTx(context.Background(), tx, "art-root", 5)
+		if !errors.Is(err, wantErr) || dag != nil {
+			t.Fatalf("expected (nil, %v), got (%v, %v)", wantErr, dag, err)
+		}
+	})
 }

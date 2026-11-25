@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -13,16 +12,21 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var listTagFilter string
-
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List registered mesh nodes, hardware architecture, tags, cooler RPM, and status",
-	RunE: func(_ *cobra.Command, _ []string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 		defer cancel()
 
-		store, err := openOperatorStore(ctx)
+		state := cliStateFromCommand(cmd)
+		tagFilter, _ := cmd.Flags().GetString("tag")
+
+		store, err := openOperatorStoreForConfig(ctx, state.wsCfg)
 		if err != nil {
 			return fmt.Errorf("connect CTD Ledger: %w", err)
 		}
@@ -33,9 +37,9 @@ var listCmd = &cobra.Command{
 			return err
 		}
 
-		wantTag := strings.ToLower(strings.Trim(strings.TrimSpace(listTagFilter), "{}"))
+		wantTag := strings.ToLower(strings.Trim(strings.TrimSpace(tagFilter), "{}"))
 
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 3, ' ', 0)
 		fmt.Fprintln(w, "node\t| arch/os\t| tags\t| cpu fan rpm\t| last seen\t| status")
 		fmt.Fprintln(w, "______________________________________________________________________________________\t")
 
@@ -74,5 +78,5 @@ var listCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(listCmd)
-	listCmd.Flags().StringVar(&listTagFilter, "tag", "", "Filter listed nodes by tag")
+	listCmd.Flags().String("tag", "", "Filter listed nodes by tag")
 }

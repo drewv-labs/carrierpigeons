@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -14,19 +13,25 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	verydetailed bool
-	addSupport   bool
-)
-
 var psCmd = &cobra.Command{
 	Use:   "ps",
 	Short: "Show active cluster status and telemetry health",
-	RunE: func(_ *cobra.Command, _ []string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 		defer cancel()
 
-		store, err := openOperatorStore(ctx)
+		state := cliStateFromCommand(cmd)
+		cfg := state.wsCfg
+		out := cmd.OutOrStdout()
+		f := cmd.Flags()
+		verydetailed, _ := f.GetBool("verydetailed")
+		addSupport, _ := f.GetBool("add-support")
+
+		store, err := openOperatorStoreForConfig(ctx, cfg)
 		if err != nil {
 			return fmt.Errorf("connect CTD Ledger: %w", err)
 		}
@@ -37,7 +42,7 @@ var psCmd = &cobra.Command{
 			return err
 		}
 
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
 		if verydetailed {
 			fmt.Fprintln(w, "node\t| arch\t| tags\t| last component\t| state\t| detail")
 		} else {
@@ -88,15 +93,15 @@ var psCmd = &cobra.Command{
 		_ = w.Flush()
 
 		if addSupport && needsSupport {
-			fmt.Println("\nAbnormal node states detected in the cluster.")
-			fmt.Printf("Contact %s Agent support? [Y/n] ", wsCfg.Brand.AgentName)
+			fmt.Fprintln(out, "\nAbnormal node states detected in the cluster.")
+			fmt.Fprintf(out, "Contact %s Agent support? [Y/n] ", cfg.Brand.AgentName)
 
-			reader := bufio.NewReader(os.Stdin)
+			reader := bufio.NewReader(cmd.InOrStdin())
 			response, _ := reader.ReadString('\n')
 			response = strings.TrimSpace(strings.ToLower(response))
 
 			if response == "" || response == "y" || response == "yes" {
-				fmt.Printf("\n[+] Handoff approved. Booting %s...\n", wsCfg.Brand.AgentName)
+				fmt.Fprintf(out, "\n[+] Handoff approved. Booting %s...\n", cfg.Brand.AgentName)
 
 				var contextBuilder strings.Builder
 				contextBuilder.WriteString("The following nodes are currently degraded or unreachable:\n")
@@ -104,7 +109,7 @@ var psCmd = &cobra.Command{
 					fmt.Fprintf(&contextBuilder, "- %s\n", issue)
 				}
 
-				return launchDashboard(tui.TabPigeonCare, "", contextBuilder.String(), "")
+				return launchDashboardWithConfig(cfg, tui.TabPigeonCare, "", contextBuilder.String(), "")
 			}
 		}
 		return nil
@@ -113,6 +118,6 @@ var psCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(psCmd)
-	psCmd.Flags().BoolVarP(&verydetailed, "verydetailed", "v", false, "Include detailed hardware & status qualifiers")
-	psCmd.Flags().BoolVar(&addSupport, "add-support", false, "Prompt for PigeonCare support handoff on abnormal node states")
+	psCmd.Flags().BoolP("verydetailed", "v", false, "Include detailed hardware & status qualifiers")
+	psCmd.Flags().Bool("add-support", false, "Prompt for PigeonCare support handoff on abnormal node states")
 }

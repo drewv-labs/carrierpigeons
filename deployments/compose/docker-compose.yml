@@ -27,25 +27,62 @@ services:
       MQTT_PASSWORD: ${MQTT_PASSWORD:-ctd_mqtt_dev_password}
       MQTT_EDGE_USERNAME: ${MQTT_EDGE_USERNAME:-pigeoneer}
       MQTT_EDGE_PASSWORD: ${MQTT_EDGE_PASSWORD:-ctd_edge_dev_password}
+      # Optional comma-separated per-node credentials (node_id:password,...) for strict
+      # Mosquitto %u per-node ACL isolation (recommended when edge nodes are untrusted).
+      MQTT_EDGE_NODES: ${MQTT_EDGE_NODES:-}
+      # Dev-only opt-in: set true on trusted single-tenant LANs to allow the shared
+      # MQTT_EDGE_USERNAME account to publish/subscribe across edge node IDs (still
+      # blocking pigeons/requests/runner, pigeons/registry/mesh, and # wildcards).
+      MQTT_ALLOW_SHARED_EDGE_ACL: ${MQTT_ALLOW_SHARED_EDGE_ACL:-false}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        if [ ! -f /mosquitto/data/passwd ]; then
-          touch /mosquitto/data/passwd
-          chmod 0600 /mosquitto/data/passwd
-          mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_USERNAME}" "$${MQTT_PASSWORD}"
-          if [ -n "$${MQTT_EDGE_USERNAME}" ] && [ "$${MQTT_EDGE_USERNAME}" != "$${MQTT_USERNAME}" ]; then
-            mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_EDGE_USERNAME}" "$${MQTT_EDGE_PASSWORD}"
-          fi
-          chown mosquitto:mosquitto /mosquitto/data/passwd 2>/dev/null || true
+        touch /mosquitto/data/passwd
+        chmod 0600 /mosquitto/data/passwd
+        mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_USERNAME}" "$${MQTT_PASSWORD}"
+        if [ -n "$${MQTT_EDGE_USERNAME}" ] && [ "$${MQTT_EDGE_USERNAME}" != "$${MQTT_USERNAME}" ]; then
+          mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_EDGE_USERNAME}" "$${MQTT_EDGE_PASSWORD}"
         fi
+        if [ -n "$${MQTT_EDGE_NODES}" ]; then
+          OLD_IFS="$$IFS"
+          IFS=','
+          for entry in $${MQTT_EDGE_NODES}; do
+            node_user="$${entry%%:*}"
+            node_pass="$${entry#*:}"
+            if [ -n "$${node_user}" ] && [ "$${node_pass}" != "$${entry}" ] && [ -n "$${node_pass}" ]; then
+              mosquitto_passwd -b /mosquitto/data/passwd "$${node_user}" "$${node_pass}"
+            fi
+          done
+          IFS="$$OLD_IFS"
+        fi
+        chown mosquitto:mosquitto /mosquitto/data/passwd 2>/dev/null || true
+
+        awk -v admin_user="$${MQTT_USERNAME}" '{
+          if ($$0 == "user pigeoncoop") {
+            print "user " admin_user
+          } else {
+            print $$0
+          }
+        }' /mosquitto/config/acl.conf > /mosquitto/data/acl.conf
+        if [ "$${MQTT_ALLOW_SHARED_EDGE_ACL:-false}" = "true" ] && [ -n "$${MQTT_EDGE_USERNAME}" ] && [ "$${MQTT_EDGE_USERNAME}" != "$${MQTT_USERNAME}" ]; then
+          {
+            printf '\n# Dev-only shared edge user fallback (MQTT_ALLOW_SHARED_EDGE_ACL=true)\n'
+            printf 'user %s\n' "$${MQTT_EDGE_USERNAME}"
+            printf 'topic write pigeons/ctd/+/+/+\n'
+            printf 'topic write pigeons/registry/+/status\n'
+            printf 'topic write pigeons/registry/+/hello\n'
+            printf 'topic read pigeons/control/+\n'
+          } >> /mosquitto/data/acl.conf
+        fi
+        chmod 0600 /mosquitto/data/acl.conf
+        chown mosquitto:mosquitto /mosquitto/data/acl.conf 2>/dev/null || true
         exec /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
     ports:
       - "${PIGEONS_BIND_IP:-127.0.0.1}:1883:1883"
-      - "${PIGEONS_BIND_IP:-127.0.0.1}:9001:9001"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./acl.conf:/mosquitto/config/acl.conf:ro
       - pigeon_mqtt_data:/mosquitto/data
     restart: unless-stopped
     networks:

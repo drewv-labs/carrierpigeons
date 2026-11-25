@@ -51,6 +51,10 @@ func runIntelGPUTopOnce(ctx context.Context, pub core.TelemetryPublisher, nodeID
 	intervalMs := max(pollInterval(ctx).Milliseconds(), int64(250))
 	cmd := exec.CommandContext(streamCtx, "intel_gpu_top", "-J", "-s", strconv.FormatInt(intervalMs, 10))
 	configureProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return nil
+	}
 	cmd.WaitDelay = 2 * time.Second
 
 	stdout, err := cmd.StdoutPipe()

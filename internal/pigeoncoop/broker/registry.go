@@ -48,7 +48,7 @@ func (s *Subscriber) processHelloUpdate(topic string, payload []byte) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(s.workContext(), 5*time.Second)
 	defer cancel()
 
 	tags, err := s.ledger.UpsertNodeHello(ctx, hello)
@@ -73,7 +73,7 @@ func (s *Subscriber) processRegistryUpdate(topic string, payload []byte) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(s.workContext(), 5*time.Second)
 	changed := true
 	if tl, ok := s.ledger.(TransitionLedger); ok {
 		prev, didChange, err := tl.UpdateNodePresenceTransition(ctx, nodeID, status)

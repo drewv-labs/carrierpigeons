@@ -282,7 +282,7 @@ func NewHTTPHandler(s *server.MCPServer, opts HTTPOptions) http.Handler {
 				http.Error(w, "Unauthorized: invalid Bearer token", http.StatusUnauthorized)
 				return
 			}
-		} else if !opts.EnforceLoopbackHost {
+		} else if !opts.EnforceLoopbackHost && !opts.AllowUnauthenticatedNonLoopback {
 			// Loopback-only mode without token: enforce Host and Origin checks to defeat browser DNS-rebinding/CSRF.
 			if !config.IsLoopbackListen(r.Host) {
 				http.Error(w, "Forbidden: non-loopback Host header rejected without auth token", http.StatusForbidden)

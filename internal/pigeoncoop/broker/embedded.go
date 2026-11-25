@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
@@ -21,25 +23,28 @@ import (
 
 // EmbeddedOptions configures PigeonCoop's built-in pure-Go MQTT v3.1.1/v5.0 broker.
 type EmbeddedOptions struct {
-	ListenAddr       string
-	Username         string
-	Password         string
-	EdgeUsername     string
-	EdgePassword     string
-	EdgeClientPrefix string
-	TLSCertFile      string
-	TLSKeyFile       string
-	TopicRoot        string
+	ListenAddr        string
+	Username          string
+	Password          string
+	EdgeUsername      string
+	EdgePassword      string
+	EdgeClientPrefix  string
+	TLSCertFile       string
+	TLSKeyFile        string
+	TLSClientCAFile   string
+	RequireClientCert bool
+	TopicRoot         string
 }
 
 type perNodeAuthHook struct {
 	mochi.HookBase
-	adminUser  string
-	adminPass  string
-	edgeUser   string
-	edgePass   string
-	edgePrefix string
-	topicRoot  string
+	adminUser         string
+	adminPass         string
+	edgeUser          string
+	edgePass          string
+	edgePrefix        string
+	topicRoot         string
+	requireClientCert bool
 }
 
 func (h *perNodeAuthHook) ID() string {
@@ -65,27 +70,72 @@ func extractEdgeNodeID(clientID, edgePrefix string) string {
 	return id
 }
 
+func certMatchesNodeID(cert *x509.Certificate, nodeID string) bool {
+	if cert == nil || nodeID == "" {
+		return false
+	}
+	if cert.Subject.CommonName == nodeID || slices.Contains(cert.DNSNames, nodeID) {
+		return true
+	}
+	if ip := net.ParseIP(nodeID); ip != nil {
+		for _, certIP := range cert.IPAddresses {
+			if ip.Equal(certIP) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func verifiedClientCert(cl *mochi.Client) *x509.Certificate {
+	if cl == nil {
+		return nil
+	}
+	tlsConn, ok := cl.Net.Conn.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+	state := tlsConn.ConnectionState()
+	if state.HandshakeComplete && len(state.VerifiedChains) > 0 && len(state.PeerCertificates) > 0 {
+		return state.PeerCertificates[0]
+	}
+	return nil
+}
+
 func (h *perNodeAuthHook) OnConnectAuthenticate(cl *mochi.Client, pk packets.Packet) bool {
 	if cl == nil {
 		return false
 	}
+
+	verifiedCert := verifiedClientCert(cl)
+	if h.requireClientCert && verifiedCert == nil {
+		return false
+	}
+
 	user := string(pk.Connect.Username)
 	pass := string(pk.Connect.Password)
 
-	if h.adminUser != "" && h.adminPass != "" && constantTimeEqual(user, h.adminUser) && constantTimeEqual(pass, h.adminPass) {
-		return true
+	if h.adminUser != "" && constantTimeEqual(user, h.adminUser) {
+		return h.adminPass != "" && constantTimeEqual(pass, h.adminPass)
 	}
-	if h.edgeUser != "" && h.edgePass != "" && constantTimeEqual(user, h.edgeUser) && constantTimeEqual(pass, h.edgePass) {
-		nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
-		if err := core.ValidateTopicToken(nodeID); err != nil {
-			return false
-		}
-		if pk.Connect.WillFlag && !h.allowEdgeWrite(nodeID, pk.Connect.WillTopic) {
-			return false
-		}
-		return true
+
+	edgeCredMatch := h.edgeUser != "" && h.edgePass != "" && constantTimeEqual(user, h.edgeUser) && constantTimeEqual(pass, h.edgePass)
+	certOnlyEdge := h.edgeUser == "" && h.edgePass == "" && h.requireClientCert
+	if !edgeCredMatch && !certOnlyEdge {
+		return false
 	}
-	return false
+
+	nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
+	if err := core.ValidateTopicToken(nodeID); err != nil {
+		return false
+	}
+	if verifiedCert != nil && !certMatchesNodeID(verifiedCert, nodeID) {
+		return false
+	}
+	if pk.Connect.WillFlag && !h.allowEdgeWrite(nodeID, pk.Connect.WillTopic) {
+		return false
+	}
+	return true
 }
 
 func (h *perNodeAuthHook) allowEdgeWrite(nodeID, topic string) bool {
@@ -114,7 +164,16 @@ func (h *perNodeAuthHook) OnACLCheck(cl *mochi.Client, topic string, write bool)
 	if h.adminUser != "" && h.adminPass != "" && constantTimeEqual(user, h.adminUser) {
 		return topic == h.topicRoot || strings.HasPrefix(topic, h.topicRoot+"/") || topic == "#"
 	}
-	if h.edgeUser != "" && h.edgePass != "" && constantTimeEqual(user, h.edgeUser) {
+
+	edgeCredMatch := h.edgeUser != "" && h.edgePass != "" && constantTimeEqual(user, h.edgeUser)
+	certOnlyEdge := false
+	if h.edgeUser == "" && h.edgePass == "" && h.requireClientCert {
+		if cert := verifiedClientCert(cl); cert != nil {
+			nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
+			certOnlyEdge = certMatchesNodeID(cert, nodeID)
+		}
+	}
+	if edgeCredMatch || certOnlyEdge {
 		nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
 		if err := core.ValidateTopicToken(nodeID); err != nil {
 			return false
@@ -150,6 +209,15 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 	)
 	certFile := strings.TrimSpace(opts.TLSCertFile)
 	keyFile := strings.TrimSpace(opts.TLSKeyFile)
+	clientCAFile := strings.TrimSpace(opts.TLSClientCAFile)
+	if clientCAFile != "" || opts.RequireClientCert {
+		if certFile == "" || keyFile == "" {
+			return nil, fmt.Errorf("embedded MQTT client-cert mTLS requires tls_cert_file and tls_key_file")
+		}
+		if opts.RequireClientCert && clientCAFile == "" {
+			return nil, fmt.Errorf("embedded MQTT require_client_cert requires tls_client_ca_file")
+		}
+	}
 	if certFile != "" || keyFile != "" {
 		if certFile == "" || keyFile == "" {
 			return nil, fmt.Errorf("embedded MQTT TLS requires both tls_cert_file and tls_key_file")
@@ -161,6 +229,22 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 		tlsCfg := &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{cert},
+		}
+		if clientCAFile != "" {
+			caPEM, caErr := os.ReadFile(clientCAFile)
+			if caErr != nil {
+				return nil, fmt.Errorf("read embedded MQTT client CA file %s: %w", clientCAFile, caErr)
+			}
+			clientCAPool := x509.NewCertPool()
+			if !clientCAPool.AppendCertsFromPEM(caPEM) {
+				return nil, fmt.Errorf("no valid PEM certificates in embedded MQTT client CA file %s", clientCAFile)
+			}
+			tlsCfg.ClientCAs = clientCAPool
+			if opts.RequireClientCert {
+				tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+			} else {
+				tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
+			}
 		}
 		ln, err = tls.Listen("tcp", listenAddr, tlsCfg)
 		tlsActive = true
@@ -203,14 +287,15 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 		edgePrefix += "-"
 	}
 
-	if adminUser != "" || edgeUser != "" {
+	if adminUser != "" || edgeUser != "" || opts.RequireClientCert {
 		hook := &perNodeAuthHook{
-			adminUser:  adminUser,
-			adminPass:  opts.Password,
-			edgeUser:   edgeUser,
-			edgePass:   opts.EdgePassword,
-			edgePrefix: edgePrefix,
-			topicRoot:  topicRoot,
+			adminUser:         adminUser,
+			adminPass:         opts.Password,
+			edgeUser:          edgeUser,
+			edgePass:          opts.EdgePassword,
+			edgePrefix:        edgePrefix,
+			topicRoot:         topicRoot,
+			requireClientCert: opts.RequireClientCert,
 		}
 		err = srv.AddHook(hook, nil)
 	} else {

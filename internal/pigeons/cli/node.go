@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"text/tabwriter"
 	"time"
 
@@ -15,13 +14,20 @@ var nodeCmd = &cobra.Command{
 	Use:   "node [node_id]",
 	Short: "Inspect latest component telemetry and tags for a specific node",
 	Args:  cobra.ExactArgs(1),
-	RunE: func(_ *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		nodeID := args[0]
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 		defer cancel()
 
-		store, err := openOperatorStore(ctx)
+		state := cliStateFromCommand(cmd)
+		out := cmd.OutOrStdout()
+
+		store, err := openOperatorStoreForConfig(ctx, state.wsCfg)
 		if err != nil {
 			return fmt.Errorf("connect CTD Ledger: %w", err)
 		}
@@ -39,12 +45,12 @@ var nodeCmd = &cobra.Command{
 		}
 
 		if len(rows) == 0 {
-			fmt.Printf("No telemetry records found for node %q.\n", nodeID)
+			fmt.Fprintf(out, "No telemetry records found for node %q.\n", nodeID)
 			return nil
 		}
 
-		fmt.Printf("Node: %s\n\n", nodeID)
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		fmt.Fprintf(out, "Node: %s\n\n", nodeID)
+		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
 		fmt.Fprintln(w, "component\t| pillar\t| status\t| last seen\t| metrics")
 		fmt.Fprintln(w, "____________________________________________________________________________________\t")
 

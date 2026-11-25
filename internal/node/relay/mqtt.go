@@ -20,13 +20,14 @@ import (
 )
 
 const (
-	maxPipelinedPublishes = 64
-	maxMQTTPayloadBytes   = 1 << 20 // 1 MiB
-	maxPublishAttempts    = 5
-	defaultBatchTimeout   = 5 * time.Second
-	defaultBackoffBase    = 500 * time.Millisecond
-	defaultBackoffMax     = 30 * time.Second
-	defaultSubscribeWait  = 5 * time.Second
+	maxPipelinedPublishes     = 64
+	maxMQTTPayloadBytes       = 1 << 20 // 1 MiB
+	maxPublishAttempts        = 5
+	maxTimeoutPublishAttempts = 10
+	defaultBatchTimeout       = 5 * time.Second
+	defaultBackoffBase        = 500 * time.Millisecond
+	defaultBackoffMax         = 30 * time.Second
+	defaultSubscribeWait      = 5 * time.Second
 )
 
 // Options configures a node's MQTT relay, ring-buffer spool, LWT presence, TLS, and NodeHello metadata.
@@ -73,11 +74,12 @@ type MQTTClient struct {
 	deliveryDropped atomic.Uint64
 	backoffAttempt  int
 
-	batchTimeout     time.Duration
-	backoffBase      time.Duration
-	backoffMax       time.Duration
-	maxAttempts      int
-	subscribeTimeout time.Duration
+	batchTimeout       time.Duration
+	backoffBase        time.Duration
+	backoffMax         time.Duration
+	maxAttempts        int
+	maxTimeoutAttempts int
+	subscribeTimeout   time.Duration
 }
 
 // NewMQTTClient initializes the broker connection with default CTD topic routing.
@@ -213,9 +215,18 @@ func (c *MQTTClient) SpoolDropped() uint64 {
 	return c.spool.Dropped()
 }
 
+func (c *MQTTClient) isConnected() bool {
+	return c.client != nil && c.client.IsConnected() && c.client.IsConnectionOpen()
+}
+
 // DeliveryDropped returns the cumulative number of payloads dropped due to marshaling failures,
-// oversized MQTT packets (>1 MiB), or repeated publish failures while connected.
+// oversized MQTT packets (>1 MiB), repeated publish failures while connected, or shutdown timeouts.
 func (c *MQTTClient) DeliveryDropped() uint64 {
+	return c.deliveryDropped.Load()
+}
+
+// DeliveryDroppedCount returns the cumulative number of payloads dropped during delivery or shutdown drain.
+func (c *MQTTClient) DeliveryDroppedCount() uint64 {
 	return c.deliveryDropped.Load()
 }
 
@@ -245,6 +256,16 @@ func (c *MQTTClient) effectiveMaxAttempts() int {
 		return c.maxAttempts
 	}
 	return maxPublishAttempts
+}
+
+func (c *MQTTClient) effectiveMaxTimeoutAttempts() int {
+	if c.maxTimeoutAttempts > 0 {
+		return c.maxTimeoutAttempts
+	}
+	if c.maxAttempts > 0 {
+		return c.maxAttempts * 2
+	}
+	return maxTimeoutPublishAttempts
 }
 
 func (c *MQTTClient) effectiveSubscribeTimeout() time.Duration {
@@ -384,6 +405,7 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 	}
 
 	maxAttempts := c.effectiveMaxAttempts()
+	maxTimeoutAttempts := c.effectiveMaxTimeoutAttempts()
 
 	for len(pending) > 0 {
 		select {
@@ -394,7 +416,7 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		default:
 		}
 
-		if c.client == nil || !c.client.IsConnected() {
+		if !c.isConnected() {
 			for i := range pending {
 				pending[i].failures = 0
 			}
@@ -492,16 +514,22 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 			c.backoffAttempt = 0
 		}
 
-		connected := c.client.IsConnected()
+		connected := c.isConnected()
 		nextPending := make([]pendingItem, 0, len(failed))
 		for _, f := range failed {
 			item := f.item
 			if !connected {
 				item.failures = 0
-			} else if f.explicitErr || succeeded > 0 {
+			} else {
 				item.failures++
-				if item.failures >= maxAttempts {
-					c.recordDeliveryDrop("exceeded consecutive publish attempts", item.payload, fmt.Errorf("%d consecutive failures on %s", item.failures, item.topic))
+				threshold := maxTimeoutAttempts
+				reason := "exceeded consecutive publish timeouts"
+				if f.explicitErr || succeeded > 0 {
+					threshold = maxAttempts
+					reason = "exceeded consecutive publish attempts"
+				}
+				if item.failures >= threshold {
+					c.recordDeliveryDrop(reason, item.payload, fmt.Errorf("%d consecutive failures on %s", item.failures, item.topic))
 					continue
 				}
 			}
@@ -519,12 +547,26 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 	}
 }
 
-func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
-	if c.client == nil || !c.client.IsConnected() {
-		return
+func countNonNilPayloads(items []*core.CTDPayload) uint64 {
+	var n uint64
+	for _, p := range items {
+		if p != nil {
+			n++
+		}
 	}
+	return n
+}
+
+func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 	remaining := c.spool.DrainAll()
 	if len(remaining) == 0 {
+		return
+	}
+	if !c.isConnected() {
+		if dropped := countNonNilPayloads(remaining); dropped > 0 {
+			total := c.deliveryDropped.Add(dropped)
+			log.Printf("[Relay] Disconnected during shutdown; dropped %d unsent spooled CTD events (total_dropped=%d)", dropped, total)
+		}
 		return
 	}
 	timer := time.NewTimer(maxWait)
@@ -532,6 +574,10 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 	for start := 0; start < len(remaining); start += maxPipelinedPublishes {
 		select {
 		case <-timer.C:
+			if unsent := countNonNilPayloads(remaining[start:]); unsent > 0 {
+				total := c.deliveryDropped.Add(unsent)
+				log.Printf("[Relay] Shutdown drain timed out; dropped %d unsent CTD events (total_dropped=%d)", unsent, total)
+			}
 			return
 		default:
 		}
@@ -556,10 +602,31 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 			}
 			tokens = append(tokens, c.client.Publish(p.RoutingTopic(c.topicPrefix), 1, false, raw))
 		}
-		for _, tok := range tokens {
+		for i, tok := range tokens {
 			select {
 			case <-tok.Done():
+				if err := tok.Error(); err != nil {
+					total := c.deliveryDropped.Add(1)
+					log.Printf("[Relay] Shutdown drain publish error (total_dropped=%d): %v", total, err)
+				}
 			case <-timer.C:
+				var unacked uint64
+				for j := i; j < len(tokens); j++ {
+					select {
+					case <-tokens[j].Done():
+						if tokens[j].Error() != nil {
+							unacked++
+						}
+					default:
+						unacked++
+					}
+				}
+				unsent := countNonNilPayloads(remaining[end:])
+				if dropped := unacked + unsent; dropped > 0 {
+					total := c.deliveryDropped.Add(dropped)
+					log.Printf("[Relay] Shutdown drain timed out; dropped %d CTD events (%d unacked, %d unsent, total_dropped=%d)",
+						dropped, unacked, unsent, total)
+				}
 				return
 			}
 		}
@@ -571,9 +638,9 @@ func (c *MQTTClient) Disconnect() {
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
 		<-c.flushDone
+		c.drainRemainingBeforeClose(1500 * time.Millisecond)
 		if c.client != nil {
-			c.drainRemainingBeforeClose(1500 * time.Millisecond)
-			if c.client.IsConnected() {
+			if c.isConnected() {
 				tok := c.client.Publish(c.brand.RegistryTopic(c.nodeID), 1, true, []byte("OFFLINE"))
 				tok.WaitTimeout(500 * time.Millisecond)
 			}

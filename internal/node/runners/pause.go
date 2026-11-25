@@ -75,7 +75,9 @@ func (p *PauseRunner) Run(ctx context.Context, nodeID string, params map[string]
 		if reqID != "" {
 			errEv.AddParam("request_id", reqID)
 		}
-		_ = pub.Publish(errEv)
+		if pub != nil {
+			_ = pub.Publish(errEv)
+		}
 		return fmt.Errorf("observer pause controller unavailable on node %s", nodeID)
 	}
 
@@ -101,7 +103,9 @@ func (p *PauseRunner) Run(ctx context.Context, nodeID string, params map[string]
 	if reqID != "" {
 		startEvent.AddParam("request_id", reqID)
 	}
-	_ = pub.Publish(startEvent)
+	if pub != nil {
+		_ = pub.Publish(startEvent)
+	}
 
 	endStatus := "runner-end"
 	if durationSec <= 0 {
@@ -130,7 +134,9 @@ func (p *PauseRunner) Run(ctx context.Context, nodeID string, params map[string]
 	if reqID != "" {
 		endEvent.AddParam("request_id", reqID)
 	}
-	_ = pub.Publish(endEvent)
+	if pub != nil {
+		_ = pub.Publish(endEvent)
+	}
 	release()
 
 	return nil

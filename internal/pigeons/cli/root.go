@@ -82,25 +82,18 @@ func loadWorkstationConfigForBrand(cfgPath, meshName string, instanceBrand brand
 		}
 	}
 
-	loaded, err := config.LoadWorkstationConfigForMesh(cfgPath, effectiveMesh)
+	loaded, err := config.LoadWorkstationConfigForMeshAndBrand(cfgPath, effectiveMesh, b)
 	if err != nil {
 		// Allow mesh recovery/switching commands (`connect`, `disconnect`, `mesh`) to run even if
-		// `~/.config/pigeons/current_mesh` points to a removed profile.
+		// `<cli>/current_mesh` points to a removed profile.
 		if allowBrokenCurrentMesh && strings.TrimSpace(meshName) == "" {
-			base, baseErr := config.LoadBaseWorkstationConfig(cfgPath)
+			base, baseErr := config.LoadBaseWorkstationConfigForBrand(cfgPath, b)
 			if baseErr != nil {
 				return config.WorkstationConfig{}, baseErr
-			}
-			if base.Brand == brand.Default() && b != brand.Default() {
-				base.Brand = b
 			}
 			return config.FinalizeWorkstationConfig(base)
 		}
 		return config.WorkstationConfig{}, err
-	}
-	if loaded.Brand == brand.Default() && b != brand.Default() {
-		loaded.Brand = b
-		return config.FinalizeWorkstationConfig(loaded)
 	}
 	return loaded, nil
 }
@@ -207,20 +200,25 @@ func dialMQTTClient(brokerURL, clientID string, timeout time.Duration) (mqtt.Cli
 	return dialMQTTClientWithConfig(wsCfg, brokerURL, clientID, timeout)
 }
 
-func openOperatorStore(ctx context.Context) (*db.PostgresStore, error) {
-	actor := fmt.Sprintf("%s-cli:%s", wsCfg.Brand.CLIName, wsCfg.Operator)
-	return db.NewPostgresStoreWithOptions(ctx, wsCfg.DatabaseURL, db.StoreOptions{
+func openOperatorStoreForConfig(ctx context.Context, cfg config.WorkstationConfig) (*db.PostgresStore, error) {
+	actor := fmt.Sprintf("%s-cli:%s", cfg.Brand.CLIName, cfg.Operator)
+	return db.NewPostgresStoreWithOptions(ctx, cfg.DatabaseURL, db.StoreOptions{
 		AppActor:   actor,
 		MaxConns:   6,
 		MinConns:   1,
-		MathSchema: wsCfg.Brand.MathSchema,
+		MathSchema: cfg.Brand.MathSchema,
 	})
+}
+
+func openOperatorStore(ctx context.Context) (*db.PostgresStore, error) {
+	return openOperatorStoreForConfig(ctx, wsCfg)
 }
 
 func openReadOnlyStoreForConfig(ctx context.Context, cfg config.WorkstationConfig, actor string) (*db.ReadOnlyAgentStore, error) {
 	return db.NewReadOnlyAgentStore(ctx, cfg.ReadOnlyDatabaseURL, actor, db.ReadOnlyOptions{
 		AllowSuperuser: cfg.AllowSuperuserReadOnly,
 		MathSchema:     cfg.Brand.MathSchema,
+		EnvPrefix:      cfg.Brand.EnvPrefix,
 	})
 }
 
@@ -270,7 +268,8 @@ func launchDashboardWithConfig(cfg config.WorkstationConfig, initialTab tui.TabI
 		permCfg.Mode = modeOverride
 	}
 
-	prompter, approvalInbox := tui.NewChannelPrompter()
+	prompter, approvalInbox, closePrompter := tui.NewManagedChannelPrompter()
+	defer closePrompter()
 	brokerURL := resolveBrokerURLForConfig(cfg)
 	dispatcher := func(_ context.Context, req core.RunnerRequestCTD) error {
 		return publishRunnerRequestWithConfig(cfg, brokerURL, req)
@@ -307,7 +306,17 @@ func launchDashboard(initialTab tui.TabID, focusReq, faultContext, modeOverride 
 
 func isContextAwareCommand(src *cobra.Command) bool {
 	switch src {
-	case rootCmd, tuiCmd, connectCmd, disconnectCmd, meshCmd, meshListCmd, meshCurrentCmd, runnerBenchmarkCmd:
+	case rootCmd, tuiCmd,
+		connectCmd, disconnectCmd, meshCmd, meshListCmd, meshCurrentCmd,
+		careCmd,
+		coopCmd, coopStatusCmd, coopMigrateCmd, coopProvisionRolesCmd, coopActivityCmd,
+		listCmd,
+		mathCmd, mathListCmd, mathInspectCmd, mathCreateCmd,
+		nodeCmd,
+		psCmd,
+		runCmd,
+		runnerCmd, runnerBenchmarkCmd, runnerAbortCmd,
+		tagCmd:
 		return true
 	default:
 		return false

@@ -20,7 +20,7 @@ var fencedSQLBlockRe = regexp.MustCompile("(?is)```(?:sql)?\\s*(.*?)```")
 const sqlOptimizerSystemPrompt = `You are PigeonCare acting as the PostgreSQL 18 analytical query optimizer for PigeonMath.
 Schema reference (strictly READ ONLY on public tables):
 - public.telemetric_ledger(id, node_id, pillar, component, status, event_timestamp, metrics JSONB, params JSONB, ingested_at, db_actor, app_actor)
-  Indexes: (node_id, event_timestamp DESC), (event_timestamp DESC), (ingested_at DESC), GIN(metrics jsonb_path_ops)
+  Indexes: idx_ledger_node_ts (node_id, event_timestamp DESC), idx_ledger_node_comp_ts (node_id, component, event_timestamp DESC), idx_ledger_runner_ts (event_timestamp DESC WHERE pillar = 'runner'), idx_ledger_pause_node_ts (node_id, event_timestamp DESC WHERE pillar = 'runner' AND component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr')), idx_ledger_ts_brin (BRIN on event_timestamp), idx_ledger_ingested_brin (BRIN on ingested_at)
 - public.ctd_nodes(node_id, arch, os, status, boot_tags TEXT[], operator_tags TEXT[], tags TEXT[], last_seen, updated_at, updated_by, meta JSONB)
 - public.ctd_artifacts(id, kind, node_id, meta JSONB, created_at, updated_at, updated_by)
 - public.ctd_traces(id, source_id, verb, target_id, node_id, run_id, meta JSONB, event_timestamp, db_actor)
@@ -242,8 +242,7 @@ func (e *Engine) SubmitAndCertifyPMV(
 				fmt.Errorf("certification check returned empty verdict for %s", normName),
 			)
 		}
-		postCheckVerdict = trimmedVerdict
-		if strings.HasPrefix(strings.ToUpper(trimmedVerdict), "REJECTED:") {
+		if !strings.HasPrefix(strings.ToUpper(trimmedVerdict), "CERTIFIED:") {
 			return failCertification(
 				trimmedVerdict,
 				map[string]any{
@@ -251,9 +250,10 @@ func (e *Engine) SubmitAndCertifyPMV(
 					"post_check_passed": false,
 					"verdict":           trimmedVerdict,
 				},
-				fmt.Errorf("certification rejected %s: %s", normName, trimmedVerdict),
+				fmt.Errorf("certification failed closed for %s: %s", normName, trimmedVerdict),
 			)
 		}
+		postCheckVerdict = trimmedVerdict
 	}
 
 	// Step 5: Materialize view strictly inside `pigeonmath` schema (`pigeonmath.pmv_*`) now that certification succeeded.

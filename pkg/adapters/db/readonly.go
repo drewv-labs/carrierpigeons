@@ -16,13 +16,27 @@ type ReadOnlyOptions struct {
 	AllowSuperuser bool
 	MaxRows        int
 	MathSchema     string
+	EnvPrefix      string
 }
 
-// ReadOnlyAgentStore wraps a PostgresStore behind the narrow AgentSafeDB capability boundary,\n// physically withholding all write/mutation methods against the public CTD Ledger.
+// ReadOnlyAgentStore wraps a PostgresStore behind the narrow AgentSafeDB capability boundary,
+// physically withholding all write/mutation methods against the public CTD Ledger.
 type ReadOnlyAgentStore struct {
 	inner     *PostgresStore
 	ownsInner bool
 	maxRows   int
+}
+
+func resolveAllowSuperuserRO(opts ReadOnlyOptions) bool {
+	if opts.AllowSuperuser {
+		return true
+	}
+	if prefix := strings.TrimSuffix(strings.ToUpper(strings.TrimSpace(opts.EnvPrefix)), "_"); prefix != "" {
+		if val := strings.TrimSpace(os.Getenv(prefix + "_ALLOW_SUPERUSER_RO")); val != "" {
+			return strings.EqualFold(val, "true")
+		}
+	}
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("PIGEONS_ALLOW_SUPERUSER_RO")), "true")
 }
 
 // NewReadOnlyAgentStore opens a dedicated connection pool for PigeonCare or PigeonMCP
@@ -32,9 +46,7 @@ func NewReadOnlyAgentStore(ctx context.Context, connStr, appActor string, opts .
 	if len(opts) > 0 {
 		roOpt = opts[0]
 	}
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("PIGEONS_ALLOW_SUPERUSER_RO")), "true") {
-		roOpt.AllowSuperuser = true
-	}
+	roOpt.AllowSuperuser = resolveAllowSuperuserRO(roOpt)
 
 	if strings.TrimSpace(connStr) == "" {
 		connStr = ResolveReadOnlyDBURL()

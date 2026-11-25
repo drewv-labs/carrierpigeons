@@ -119,7 +119,9 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 		if reqID != "" {
 			ev.AddParam("request_id", reqID)
 		}
-		_ = pub.Publish(ev)
+		if pub != nil {
+			_ = pub.Publish(ev)
+		}
 		return errors.New(reason)
 	}
 
@@ -241,7 +243,9 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 	if reqID != "" {
 		startEv.AddParam("request_id", reqID)
 	}
-	_ = pub.Publish(startEv)
+	if pub != nil {
+		_ = pub.Publish(startEv)
+	}
 
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
@@ -295,7 +299,9 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 	if reqID != "" {
 		endEv.AddParam("request_id", reqID)
 	}
-	_ = pub.Publish(endEv)
+	if pub != nil {
+		_ = pub.Publish(endEv)
+	}
 
 	return runErr
 }

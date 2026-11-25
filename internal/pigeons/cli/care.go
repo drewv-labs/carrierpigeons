@@ -5,17 +5,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var careModeFlag string
-
 var careCmd = &cobra.Command{
 	Use:   "care",
 	Short: "Launch interactive PigeonCare SRE diagnostics (Default / Auto Edit / YOLO permission modes)",
-	RunE: func(_ *cobra.Command, _ []string) error {
-		return launchDashboard(tui.TabPigeonCare, "", "", careModeFlag)
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		state := cliStateFromCommand(cmd)
+		mode, _ := cmd.Flags().GetString("mode")
+		return launchDashboardWithConfig(state.wsCfg, tui.TabPigeonCare, "", "", mode)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(careCmd)
-	careCmd.Flags().StringVar(&careModeFlag, "mode", "", "Override permission mode ('default', 'auto_edit', or 'yolo')")
+	careCmd.Flags().String("mode", "", "Override permission mode ('default', 'auto_edit', or 'yolo')")
 }

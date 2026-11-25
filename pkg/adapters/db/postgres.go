@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -314,6 +315,10 @@ type StoreOptions struct {
 type PostgresStore struct {
 	pool       *pgxpool.Pool
 	mathSchema string
+
+	// Optional unexported test seams for unit testing without a live database.
+	copyBatchFn   func(ctx context.Context, copyRows [][]any, nodeLastSeen map[string]time.Time, artifacts []*core.Artifact, traces []*core.TraceEdge) (int64, error)
+	insertEventFn func(ctx context.Context, p *core.CTDPayload) error
 }
 
 // NewPostgresStore initializes a connection pool to the PostgreSQL CTD Ledger.
@@ -475,6 +480,11 @@ const ensureSchemaReadyQuery = `
 			  AND column_name IN ('ingested_at', 'db_actor', 'app_actor')
 		)
 		AND to_regclass('public.idx_ledger_metrics_path_gin') IS NULL
+		AND to_regclass('public.idx_ledger_ts_desc') IS NULL
+		AND to_regclass('public.idx_ledger_ingested_ts') IS NULL
+		AND to_regclass('public.idx_ledger_ts_brin') IS NOT NULL
+		AND to_regclass('public.idx_ledger_ingested_brin') IS NOT NULL
+		AND to_regclass('public.idx_ledger_pause_node_ts') IS NOT NULL
 `
 
 const ensureSchemaDDL = `
@@ -499,11 +509,16 @@ const ensureSchemaDDL = `
 	DROP INDEX IF EXISTS idx_ledger_pillar;
 	DROP INDEX IF EXISTS idx_ledger_metrics_gin;
 	DROP INDEX IF EXISTS idx_ledger_metrics_path_gin;
+	DROP INDEX IF EXISTS idx_ledger_ts_desc;
+	DROP INDEX IF EXISTS idx_ledger_ingested_ts;
 	CREATE INDEX IF NOT EXISTS idx_ledger_node_ts ON telemetric_ledger (node_id, event_timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_ledger_node_comp_ts ON telemetric_ledger (node_id, component, event_timestamp DESC);
-	CREATE INDEX IF NOT EXISTS idx_ledger_ts_desc ON telemetric_ledger (event_timestamp DESC);
-	CREATE INDEX IF NOT EXISTS idx_ledger_ingested_ts ON telemetric_ledger (ingested_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_ledger_ts_brin ON telemetric_ledger USING BRIN (event_timestamp);
+	CREATE INDEX IF NOT EXISTS idx_ledger_ingested_brin ON telemetric_ledger USING BRIN (ingested_at);
 	CREATE INDEX IF NOT EXISTS idx_ledger_runner_ts ON telemetric_ledger (event_timestamp DESC) WHERE pillar = 'runner';
+	CREATE INDEX IF NOT EXISTS idx_ledger_pause_node_ts
+		ON telemetric_ledger (node_id, event_timestamp DESC)
+		WHERE pillar = 'runner' AND component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr');
 
 	CREATE TABLE IF NOT EXISTS ctd_nodes (
 		node_id TEXT PRIMARY KEY,
@@ -868,11 +883,55 @@ func isBisectablePGError(err error) bool {
 	return strings.HasPrefix(code, "22") || strings.HasPrefix(code, "23")
 }
 
-// InsertEvent writes a single CTD envelope and shreds embedded Artifacts/Traces.
+const upsertNodeLastSeenSQL = `
+	INSERT INTO ctd_nodes (node_id, last_seen, updated_at)
+	VALUES ($1, $2, $2)
+	ON CONFLICT (node_id) DO UPDATE
+	SET last_seen = GREATEST(ctd_nodes.last_seen, EXCLUDED.last_seen),
+	    updated_at = EXCLUDED.updated_at
+	WHERE ctd_nodes.last_seen IS NULL
+	   OR ctd_nodes.last_seen < EXCLUDED.last_seen - INTERVAL '5 seconds'
+`
+
+func prepareEventJSON(p *core.CTDPayload) ([]byte, []byte, error) {
+	metricsJSON, err := payloadMetricsJSON(p)
+	if err != nil {
+		log.Printf("[Postgres] Failed marshaling metrics for node=%q component=%q: %v", p.NodeID, p.Component, err)
+		return nil, nil, fmt.Errorf("marshal metrics (node=%q component=%q): %w", p.NodeID, p.Component, err)
+	}
+	paramsJSON, err := payloadParamsJSON(p)
+	if err != nil {
+		log.Printf("[Postgres] Failed marshaling params for node=%q component=%q: %v", p.NodeID, p.Component, err)
+		return nil, nil, fmt.Errorf("marshal params (node=%q component=%q): %w", p.NodeID, p.Component, err)
+	}
+	return metricsJSON, paramsJSON, nil
+}
+
+// InsertEvent writes a single CTD envelope, throttles `ctd_nodes.last_seen`, and shreds embedded Artifacts/Traces.
 func (s *PostgresStore) InsertEvent(ctx context.Context, p *core.CTDPayload) error {
 	if p == nil {
 		return fmt.Errorf("cannot insert nil CTDPayload")
 	}
+	metricsJSON, paramsJSON, err := prepareEventJSON(p)
+	if err != nil {
+		return err
+	}
+	if s.insertEventFn != nil {
+		return s.insertEventFn(ctx, p)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.insertPreparedEventWithTx(ctx, tx, p, metricsJSON, paramsJSON); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) insertPreparedEventWithTx(ctx context.Context, tx pgx.Tx, p *core.CTDPayload, metricsJSON, paramsJSON []byte) error {
 	pillar := p.Pillar
 	if pillar == "" {
 		pillar = core.PillarObserver
@@ -882,27 +941,18 @@ func (s *PostgresStore) InsertEvent(ctx context.Context, p *core.CTDPayload) err
 		ts = time.Now().UTC()
 	}
 
-	metricsJSON, err := payloadMetricsJSON(p)
-	if err != nil {
-		return fmt.Errorf("marshal metrics: %w", err)
-	}
-	paramsJSON, err := payloadParamsJSON(p)
-	if err != nil {
-		return fmt.Errorf("marshal params: %w", err)
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	_, err = tx.Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 		INSERT INTO telemetric_ledger (node_id, pillar, component, status, event_timestamp, metrics, params)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`, p.NodeID, string(pillar), p.Component, p.Status, ts, metricsJSON, paramsJSON)
 	if err != nil {
 		return fmt.Errorf("insert telemetric_ledger: %w", err)
+	}
+
+	if strings.TrimSpace(p.NodeID) != "" {
+		if _, err := tx.Exec(ctx, upsertNodeLastSeenSQL, p.NodeID, ts); err != nil {
+			return fmt.Errorf("upsert ctd_nodes last_seen: %w", err)
+		}
 	}
 
 	if err := s.upsertArtifactTx(ctx, tx, p.Artifact, ts); err != nil {
@@ -911,8 +961,7 @@ func (s *PostgresStore) InsertEvent(ctx context.Context, p *core.CTDPayload) err
 	if err := s.insertTraceTx(ctx, tx, p.Trace, ts); err != nil {
 		return err
 	}
-
-	return tx.Commit(ctx)
+	return nil
 }
 
 // BatchInsertEvents streams wide events into `telemetric_ledger` using PostgreSQL's binary
@@ -929,6 +978,19 @@ func (s *PostgresStore) BatchInsertEvents(ctx context.Context, payloads []*core.
 		return 0, nil
 	}
 	return s.batchInsertDivideAndConquer(ctx, valid)
+}
+
+func (s *PostgresStore) runCopyBatch(
+	ctx context.Context,
+	copyRows [][]any,
+	nodeLastSeen map[string]time.Time,
+	artifacts []*core.Artifact,
+	traces []*core.TraceEdge,
+) (int64, error) {
+	if s.copyBatchFn != nil {
+		return s.copyBatchFn(ctx, copyRows, nodeLastSeen, artifacts, traces)
+	}
+	return s.execCopyBatch(ctx, copyRows, nodeLastSeen, artifacts, traces)
 }
 
 func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payloads []*core.CTDPayload) (int64, error) {
@@ -951,6 +1013,7 @@ func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payload
 	nodeLastSeen := make(map[string]time.Time, 16)
 	var artifacts []*core.Artifact
 	var traces []*core.TraceEdge
+	var marshalErrs []error
 
 	for _, p := range payloads {
 		pillar := p.Pillar
@@ -961,12 +1024,9 @@ func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payload
 		if ts.IsZero() {
 			ts = now
 		}
-		metricsJSON, err := payloadMetricsJSON(p)
+		metricsJSON, paramsJSON, err := prepareEventJSON(p)
 		if err != nil {
-			continue
-		}
-		paramsJSON, err := payloadParamsJSON(p)
-		if err != nil {
+			marshalErrs = append(marshalErrs, err)
 			continue
 		}
 
@@ -1001,31 +1061,28 @@ func (s *PostgresStore) batchInsertDivideAndConquer(ctx context.Context, payload
 	}
 
 	if len(copyRows) == 0 {
-		return 0, nil
+		return 0, errors.Join(marshalErrs...)
 	}
 
-	copied, err := s.execCopyBatch(ctx, copyRows, nodeLastSeen, artifacts, traces)
+	copied, err := s.runCopyBatch(ctx, copyRows, nodeLastSeen, artifacts, traces)
 	if err == nil {
-		return copied, nil
+		return copied, errors.Join(marshalErrs...)
 	}
 	if ctx.Err() != nil {
-		return 0, ctx.Err()
+		return 0, errors.Join(append(marshalErrs, ctx.Err())...)
 	}
 	if !isBisectablePGError(err) {
-		return 0, err
+		return 0, errors.Join(append(marshalErrs, err)...)
 	}
 	if len(alignedPayloads) == 1 {
-		return 0, err
+		return 0, errors.Join(append(marshalErrs, err)...)
 	}
 
 	// Binary-bisect poison-row isolation (O(log B) roundtrips instead of O(B) sequential transactions).
 	mid := len(alignedPayloads) / 2
 	leftCount, leftErr := s.batchInsertDivideAndConquer(ctx, alignedPayloads[:mid])
 	rightCount, rightErr := s.batchInsertDivideAndConquer(ctx, alignedPayloads[mid:])
-	if rightErr != nil {
-		return leftCount + rightCount, rightErr
-	}
-	return leftCount + rightCount, leftErr
+	return leftCount + rightCount, errors.Join(append(marshalErrs, leftErr, rightErr)...)
 }
 
 const upsertBatchNodeLastSeenSQL = `
@@ -1455,8 +1512,57 @@ func isAbnormalStatus(status string) bool {
 		s == "offline"
 }
 
+const getClusterStatusQuery = `
+	WITH known_nodes AS (
+		SELECT node_id FROM ctd_nodes
+		UNION
+		SELECT DISTINCT node_id
+		FROM telemetric_ledger
+		WHERE event_timestamp >= NOW() - INTERVAL '15 minutes'
+	)
+	SELECT
+		k.node_id,
+		COALESCE(n.arch, '') AS arch,
+		COALESCE(n.os, '') AS os,
+		COALESCE(n.tags, '{}') AS tags,
+		COALESCE(os_obs.component, l.component, 'registry') AS component,
+		GREATEST(COALESCE(l.event_timestamp, TIMESTAMPTZ 'epoch'), COALESCE(n.last_seen, TIMESTAMPTZ 'epoch')) AS last_seen,
+		CASE
+			WHEN n.status = 'OFFLINE' THEN 'OFFLINE'
+			WHEN pause_rnr.status = 'runner-start' THEN 'paused'
+			ELSE COALESCE(l.status, n.status, 'unknown')
+		END AS status,
+		COALESCE(os_obs.metrics, '{}'::jsonb) || COALESCE(l.metrics, '{}'::jsonb) AS metrics
+	FROM known_nodes k
+	LEFT JOIN ctd_nodes n ON n.node_id = k.node_id
+	LEFT JOIN LATERAL (
+		SELECT component, event_timestamp, status, metrics
+		FROM telemetric_ledger tl
+		WHERE tl.node_id = k.node_id
+		ORDER BY tl.event_timestamp DESC
+		LIMIT 1
+	) l ON true
+	LEFT JOIN LATERAL (
+		SELECT component, metrics
+		FROM telemetric_ledger h
+		WHERE h.node_id = k.node_id AND h.component = 'host-os'
+		ORDER BY h.event_timestamp DESC
+		LIMIT 1
+	) os_obs ON true
+	LEFT JOIN LATERAL (
+		SELECT status
+		FROM telemetric_ledger p
+		WHERE p.node_id = k.node_id
+		  AND p.pillar = 'runner'
+		  AND p.component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr')
+		ORDER BY p.event_timestamp DESC
+		LIMIT 1
+	) pause_rnr ON true
+	ORDER BY k.node_id ASC
+`
+
 // GetClusterStatus returns the latest state, hardware arch/OS, and tags per node using an O(N_nodes * log N_rows)
-// LATERAL index probe on `idx_ledger_node_ts` instead of scanning the entire historical ledger.
+// LATERAL index probe on `idx_ledger_node_ts` and `idx_ledger_pause_node_ts` instead of scanning the entire historical ledger.
 func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold time.Duration) ([]NodeSummary, error) {
 	if staleThreshold <= 0 {
 		staleThreshold = 3 * time.Minute
@@ -1468,53 +1574,7 @@ func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold tim
 	}
 	defer tx.Rollback(ctx)
 
-	rows, err := tx.Query(ctx, `
-		WITH known_nodes AS (
-			SELECT node_id FROM ctd_nodes
-			UNION
-			SELECT DISTINCT node_id
-			FROM telemetric_ledger
-			WHERE event_timestamp >= NOW() - INTERVAL '15 minutes'
-		)
-		SELECT
-			k.node_id,
-			COALESCE(n.arch, '') AS arch,
-			COALESCE(n.os, '') AS os,
-			COALESCE(n.tags, '{}') AS tags,
-			COALESCE(os_obs.component, l.component, 'registry') AS component,
-			GREATEST(COALESCE(l.event_timestamp, TIMESTAMPTZ 'epoch'), COALESCE(n.last_seen, TIMESTAMPTZ 'epoch')) AS last_seen,
-			CASE
-				WHEN n.status = 'OFFLINE' THEN 'OFFLINE'
-				WHEN pause_rnr.status = 'runner-start' THEN 'paused'
-				ELSE COALESCE(l.status, n.status, 'unknown')
-			END AS status,
-			COALESCE(os_obs.metrics, '{}'::jsonb) || COALESCE(l.metrics, '{}'::jsonb) AS metrics
-		FROM known_nodes k
-		LEFT JOIN ctd_nodes n ON n.node_id = k.node_id
-		LEFT JOIN LATERAL (
-			SELECT component, event_timestamp, status, metrics
-			FROM telemetric_ledger tl
-			WHERE tl.node_id = k.node_id
-			ORDER BY tl.event_timestamp DESC
-			LIMIT 1
-		) l ON true
-		LEFT JOIN LATERAL (
-			SELECT component, metrics
-			FROM telemetric_ledger h
-			WHERE h.node_id = k.node_id AND h.component = 'host-os'
-			ORDER BY h.event_timestamp DESC
-			LIMIT 1
-		) os_obs ON true
-		LEFT JOIN LATERAL (
-			SELECT status
-			FROM telemetric_ledger p
-			WHERE p.node_id = k.node_id
-			  AND p.component IN ('runner:PauseRnr', 'runner:pause', 'runner:pausernr')
-			ORDER BY p.event_timestamp DESC
-			LIMIT 1
-		) pause_rnr ON true
-		ORDER BY k.node_id ASC
-	`)
+	rows, err := tx.Query(ctx, getClusterStatusQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -1542,7 +1602,7 @@ func (s *PostgresStore) GetClusterStatus(ctx context.Context, staleThreshold tim
 }
 
 // GetLedgerActivity returns actor write/update attribution summaries over the recent 24-hour window,
-// leveraging `idx_ledger_ingested_ts` rather than scanning historical cold partitions.
+// leveraging `idx_ledger_ingested_brin` rather than scanning historical cold partitions.
 func (s *PostgresStore) GetLedgerActivity(ctx context.Context, limit int) ([]LedgerActivity, error) {
 	if limit <= 0 {
 		limit = 25
@@ -1625,6 +1685,14 @@ func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, ma
 	}
 	defer tx.Rollback(ctx)
 
+	return s.getLineageDAGWithTx(ctx, tx, artifactID, maxDepth)
+}
+
+func (s *PostgresStore) getLineageDAGWithTx(ctx context.Context, tx pgx.Tx, artifactID string, maxDepth int) (*DAG, error) {
+	if maxDepth <= 0 {
+		maxDepth = 10
+	}
+
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE lineage AS (
 			SELECT id, source_id, verb, target_id, COALESCE(node_id, '') AS node_id, COALESCE(run_id, '') AS run_id, meta, event_timestamp, 1 AS depth, ARRAY[id::text] AS visited_edges
@@ -1682,7 +1750,7 @@ func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, ma
 		WHERE id = ANY($1)
 	`, ids)
 	if err != nil {
-		return dag, nil
+		return nil, fmt.Errorf("query lineage artifacts: %w", err)
 	}
 	defer aRows.Close()
 
@@ -1690,15 +1758,18 @@ func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, ma
 		var a core.Artifact
 		var metaBytes []byte
 		if err := aRows.Scan(&a.ID, &a.Kind, &a.NodeID, &metaBytes, &a.CreatedAt); err != nil {
-			continue
+			return nil, fmt.Errorf("scan lineage artifact: %w", err)
 		}
 		if len(metaBytes) > 0 {
 			_ = json.Unmarshal(metaBytes, &a.Meta)
 		}
 		dag.Artifacts = append(dag.Artifacts, a)
 	}
+	if err := aRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate lineage artifacts: %w", err)
+	}
 
-	return dag, aRows.Err()
+	return dag, nil
 }
 
 // FetchForUnload pulls filtered ledger events ready to be shredded into Snappy Parquet.

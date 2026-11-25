@@ -104,6 +104,70 @@ func buildOpenAIMessages(systemPrompt string, history []Message) []map[string]an
 	return messages
 }
 
+type openAIWireToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type openAIChatResponse struct {
+	Choices []struct {
+		Message struct {
+			Role      string               `json:"role"`
+			Content   string               `json:"content"`
+			ToolCalls []openAIWireToolCall `json:"tool_calls"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+type openAIResolvedToolCall struct {
+	id   string
+	name string
+	args string
+}
+
+func (a *OpenAIAdapter) executeStreamToolTurn(
+	ctx context.Context,
+	tokenChan chan<- string,
+	messages []map[string]any,
+	assistantContent string,
+	calls []openAIResolvedToolCall,
+) ([]map[string]any, bool) {
+	assistantCalls := make([]map[string]any, 0, len(calls))
+	for _, tc := range calls {
+		assistantCalls = append(assistantCalls, map[string]any{
+			"id":   tc.id,
+			"type": "function",
+			"function": map[string]any{
+				"name":      tc.name,
+				"arguments": tc.args,
+			},
+		})
+	}
+
+	messages = append(messages, map[string]any{
+		"role":       "assistant",
+		"content":    assistantContent,
+		"tool_calls": assistantCalls,
+	})
+
+	for _, tc := range calls {
+		if !sendToken(ctx, tokenChan, fmt.Sprintf("\n*(Running tool: %s...)*\n", tc.name)) {
+			return nil, false
+		}
+		obs := executeToolCallRaw(ctx, a.tools, tc.name, tc.args)
+		messages = append(messages, map[string]any{
+			"role":         "tool",
+			"tool_call_id": tc.id,
+			"content":      obs,
+		})
+	}
+	return messages, true
+}
+
 func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history []Message) (string, error) {
 	messages := buildOpenAIMessages(systemPrompt, history)
 	var finalReply string
@@ -124,22 +188,7 @@ func (a *OpenAIAdapter) Chat(ctx context.Context, systemPrompt string, history [
 			return false, err
 		}
 
-		var result struct {
-			Choices []struct {
-				Message struct {
-					Role      string `json:"role"`
-					Content   string `json:"content"`
-					ToolCalls []struct {
-						ID       string `json:"id"`
-						Type     string `json:"type"`
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
+		var result openAIChatResponse
 
 		err = json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&result)
 		resp.Body.Close()
@@ -206,16 +255,35 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 			if !strings.Contains(ct, "event-stream") {
 				rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 				resp.Body.Close()
-				var nonStream struct {
-					Choices []struct {
-						Message struct {
-							Content string `json:"content"`
-						} `json:"message"`
-					} `json:"choices"`
-				}
+				var nonStream openAIChatResponse
 				if json.Unmarshal(rawBody, &nonStream) == nil && len(nonStream.Choices) > 0 {
-					sendToken(ctx, tokenChan, nonStream.Choices[0].Message.Content)
-					return true, nil
+					msg := nonStream.Choices[0].Message
+					if msg.Content != "" {
+						if !sendToken(ctx, tokenChan, msg.Content) {
+							return true, nil
+						}
+					}
+					if len(msg.ToolCalls) == 0 || a.tools == nil {
+						return true, nil
+					}
+					calls := make([]openAIResolvedToolCall, 0, len(msg.ToolCalls))
+					for idx, tc := range msg.ToolCalls {
+						callID := tc.ID
+						if callID == "" {
+							callID = fmt.Sprintf("call_%d", idx)
+						}
+						calls = append(calls, openAIResolvedToolCall{
+							id:   callID,
+							name: tc.Function.Name,
+							args: tc.Function.Arguments,
+						})
+					}
+					nextMessages, ok := a.executeStreamToolTurn(ctx, tokenChan, messages, msg.Content, calls)
+					if !ok {
+						return true, nil
+					}
+					messages = nextMessages
+					return false, nil
 				}
 				resp.Body = io.NopCloser(bytes.NewReader(rawBody))
 			}
@@ -299,45 +367,25 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 			}
 			sort.Ints(indices)
 
-			assistantCalls := make([]map[string]any, 0, len(indices))
+			calls := make([]openAIResolvedToolCall, 0, len(indices))
 			for _, idx := range indices {
 				p := partials[idx]
 				callID := p.id
 				if callID == "" {
 					callID = fmt.Sprintf("call_%d", idx)
 				}
-				assistantCalls = append(assistantCalls, map[string]any{
-					"id":   callID,
-					"type": "function",
-					"function": map[string]any{
-						"name":      p.name,
-						"arguments": p.args.String(),
-					},
+				calls = append(calls, openAIResolvedToolCall{
+					id:   callID,
+					name: p.name,
+					args: p.args.String(),
 				})
 			}
 
-			messages = append(messages, map[string]any{
-				"role":       "assistant",
-				"content":    fullContent.String(),
-				"tool_calls": assistantCalls,
-			})
-
-			for _, idx := range indices {
-				p := partials[idx]
-				callID := p.id
-				if callID == "" {
-					callID = fmt.Sprintf("call_%d", idx)
-				}
-				if !sendToken(ctx, tokenChan, fmt.Sprintf("\n*(Running tool: %s...)*\n", p.name)) {
-					return true, nil
-				}
-				obs := executeToolCallRaw(ctx, a.tools, p.name, p.args.String())
-				messages = append(messages, map[string]any{
-					"role":         "tool",
-					"tool_call_id": callID,
-					"content":      obs,
-				})
+			nextMessages, ok := a.executeStreamToolTurn(ctx, tokenChan, messages, fullContent.String(), calls)
+			if !ok {
+				return true, nil
 			}
+			messages = nextMessages
 			return false, nil
 		}); err != nil && ctx.Err() == nil {
 			sendToken(ctx, tokenChan, fmt.Sprintf("\n[OpenAI tool loop error: %v]", err))

@@ -20,6 +20,7 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/spf13/cobra"
 )
 
 type noopBrokerLedger struct {
@@ -664,5 +665,180 @@ broker_url = "tcp://127.0.0.1:1883"
 
 	if brand.Active() != initialActive {
 		t.Fatalf("global brand.Active() mutated: got %+v, want %+v", brand.Active(), initialActive)
+	}
+}
+
+func TestBrandScopedMNSStateIsolation(t *testing.T) {
+	initialActive := brand.Active()
+	dir := t.TempDir()
+
+	alphaMeshFile := filepath.Join(dir, "alpha", "current_mesh")
+	betaMeshFile := filepath.Join(dir, "beta", "current_mesh")
+	t.Setenv("ALPHA_CURRENT_MESH_FILE", alphaMeshFile)
+	t.Setenv("BETA_CURRENT_MESH_FILE", betaMeshFile)
+
+	alphaCfg := filepath.Join(dir, "alphacli.toml")
+	betaCfg := filepath.Join(dir, "betacli.toml")
+	if err := os.WriteFile(alphaCfg, []byte(`operator = "alpha-op"
+[meshes.alpha-one]
+broker_url = "tcp://127.0.0.1:1883"
+[meshes.alpha-two]
+broker_url = "tcp://127.0.0.1:1884"
+`), 0o600); err != nil {
+		t.Fatalf("write alpha config: %v", err)
+	}
+	if err := os.WriteFile(betaCfg, []byte(`operator = "beta-op"
+[meshes.beta-one]
+broker_url = "tcp://127.0.0.1:2883"
+[meshes.beta-two]
+broker_url = "tcp://127.0.0.1:2884"
+`), 0o600); err != nil {
+		t.Fatalf("write beta config: %v", err)
+	}
+
+	specA := brand.Spec{ProductName: "Alpha", CoopName: "AlphaCoop", CLIName: "alphacli", TopicRoot: "alpha", EnvPrefix: "ALPHA"}
+	specB := brand.Spec{ProductName: "Beta", CoopName: "BetaCoop", CLIName: "betacli", TopicRoot: "beta", EnvPrefix: "BETA"}
+
+	if _, err := executeCLIForTestWithBrand(specA, "--config", alphaCfg, "connect", "alpha-one", "--no-verify"); err != nil {
+		t.Fatalf("alpha connect alpha-one: %v", err)
+	}
+	if _, err := executeCLIForTestWithBrand(specA, "--config", alphaCfg, "connect", "alpha-two", "--no-verify"); err != nil {
+		t.Fatalf("alpha connect alpha-two: %v", err)
+	}
+	if _, err := executeCLIForTestWithBrand(specB, "--config", betaCfg, "connect", "beta-one", "--no-verify"); err != nil {
+		t.Fatalf("beta connect beta-one: %v", err)
+	}
+
+	// Verify CurrentMeshStatePathForBrand + ReadCurrentMeshForBrand isolation.
+	gotPathA, err := config.CurrentMeshStatePathForBrand(specA)
+	if err != nil || gotPathA != alphaMeshFile {
+		t.Fatalf("CurrentMeshStatePathForBrand(specA) = %q (err=%v), want %q", gotPathA, err, alphaMeshFile)
+	}
+	gotA, _ := config.ReadCurrentMeshForBrand(specA)
+	gotB, _ := config.ReadCurrentMeshForBrand(specB)
+	if gotA != "alpha-two" || gotB != "beta-one" {
+		t.Fatalf("brand current meshes = (%q, %q), want (alpha-two, beta-one)", gotA, gotB)
+	}
+
+	// `connect -` on brand A must toggle to alpha-one without affecting brand B.
+	if _, err := executeCLIForTestWithBrand(specA, "--config", alphaCfg, "connect", "-", "--no-verify"); err != nil {
+		t.Fatalf("alpha connect -: %v", err)
+	}
+	gotA, _ = config.ReadCurrentMeshForBrand(specA)
+	gotB, _ = config.ReadCurrentMeshForBrand(specB)
+	if gotA != "alpha-one" || gotB != "beta-one" {
+		t.Fatalf("after alpha toggle: brand meshes = (%q, %q), want (alpha-one, beta-one)", gotA, gotB)
+	}
+
+	// `disconnect` on brand A must clear only brand A.
+	if _, err := executeCLIForTestWithBrand(specA, "--config", alphaCfg, "disconnect"); err != nil {
+		t.Fatalf("alpha disconnect: %v", err)
+	}
+	gotA, _ = config.ReadCurrentMeshForBrand(specA)
+	gotB, _ = config.ReadCurrentMeshForBrand(specB)
+	if gotA != "" || gotB != "beta-one" {
+		t.Fatalf("after alpha disconnect: brand meshes = (%q, %q), want ('', beta-one)", gotA, gotB)
+	}
+
+	if brand.Active() != initialActive {
+		t.Fatalf("global brand.Active() mutated: got %+v, want %+v", brand.Active(), initialActive)
+	}
+}
+
+func TestContextAwareCommandsDoNotHoldTemplateMuAndUseLocalFlags(t *testing.T) {
+	if !isContextAwareCommand(rootCmd) {
+		t.Fatal("rootCmd is not registered in isContextAwareCommand")
+	}
+	for _, c := range rootCmd.Commands() {
+		if !isContextAwareCommand(c) {
+			t.Fatalf("top-level command %q is not registered in isContextAwareCommand", c.Name())
+		}
+		for _, sub := range c.Commands() {
+			if !isContextAwareCommand(sub) {
+				t.Fatalf("subcommand %q %q is not registered in isContextAwareCommand", c.Name(), sub.Name())
+			}
+		}
+	}
+
+	brokerURL := startTestMeshBroker(t, "ctx-mesh", "rv64-coop-ctx")
+	deadDBURL := fmt.Sprintf("postgres://operator:secret@%s/edge_ledger", closedLocalTCPAddr(t))
+
+	dir := t.TempDir()
+	t.Setenv("ALPHA_CURRENT_MESH_FILE", filepath.Join(dir, "alpha_current_mesh"))
+	wsPath := filepath.Join(dir, "alpha.toml")
+	tomlContent := fmt.Sprintf(`operator = "alpha-operator"
+mesh_name = "ctx-mesh"
+broker_url = %q
+database_url = %q
+`, brokerURL, deadDBURL)
+	if err := os.WriteFile(wsPath, []byte(tomlContent), 0o600); err != nil {
+		t.Fatalf("write alpha.toml: %v", err)
+	}
+
+	specA := brand.Spec{
+		ProductName: "AlphaTelemetry",
+		CoopName:    "AlphaCoop",
+		CLIName:     "alphacli",
+		TopicRoot:   "pigeons",
+		EnvPrefix:   "ALPHA",
+		MathSchema:  "alphamath",
+		MathName:    "AlphaMath",
+		AgentName:   "AlphaCare",
+	}
+
+	// Build isolated command trees first, then hold templateMu while executing context-aware commands
+	// to prove execution NEVER acquires templateMu.
+	runTree := NewRootCommand(specA)
+	abortTree := NewRootCommand(specA)
+	coopStatusTree := NewRootCommand(specA)
+	coopMigrateTree := NewRootCommand(specA)
+	listTree := NewRootCommand(specA)
+	nodeTree := NewRootCommand(specA)
+	psTree := NewRootCommand(specA)
+	tagTree := NewRootCommand(specA)
+	mathListTree := NewRootCommand(specA)
+
+	templateMu.Lock()
+	defer templateMu.Unlock()
+
+	execTree := func(c *cobra.Command, args ...string) (string, error) {
+		var buf bytes.Buffer
+		c.SetOut(&buf)
+		c.SetErr(&buf)
+		c.SetArgs(args)
+		err := c.Execute()
+		return buf.String(), err
+	}
+
+	if out, err := execTree(runTree, "--config", wsPath, "run", "PauseRnr", "--all", "--secs", "15", "--no-tui"); err != nil {
+		t.Fatalf("context-aware `run` failed: %v\n%s", err, out)
+	} else if !strings.Contains(out, "AlphaCoop") {
+		t.Fatalf("expected brand CoopName AlphaCoop in `run` output, got: %s", out)
+	}
+
+	if out, err := execTree(abortTree, "--config", wsPath, "runner", "abort", "PauseRnr", "--all"); err != nil {
+		t.Fatalf("context-aware `runner abort` failed: %v\n%s", err, out)
+	}
+
+	if out, err := execTree(coopStatusTree, "--config", wsPath, "coop", "status"); err == nil {
+		t.Fatalf("expected `coop status` with closed Postgres to return error, output:\n%s", out)
+	} else if !strings.Contains(out, "[MQTT Broker]  ONLINE") {
+		t.Fatalf("expected online MQTT line in `coop status`, got:\n%s", out)
+	}
+
+	for name, tc := range map[string]struct {
+		tree *cobra.Command
+		args []string
+	}{
+		"coop_migrate": {coopMigrateTree, []string{"--config", wsPath, "coop", "migrate"}},
+		"list":         {listTree, []string{"--config", wsPath, "list", "--tag", "compute-bench"}},
+		"node":         {nodeTree, []string{"--config", wsPath, "node", "rv64-node-01"}},
+		"ps":           {psTree, []string{"--config", wsPath, "ps", "-v"}},
+		"tag":          {tagTree, []string{"--config", wsPath, "tag", "compute-bench", "rv64-node-01", "--remove"}},
+		"math_list":    {mathListTree, []string{"--config", wsPath, "math", "list"}},
+	} {
+		if _, err := execTree(tc.tree, tc.args...); err == nil {
+			t.Fatalf("expected %s against closed Postgres to return error", name)
+		}
 	}
 }

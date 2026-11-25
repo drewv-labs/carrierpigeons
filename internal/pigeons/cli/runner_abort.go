@@ -9,12 +9,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	abortAll   bool
-	abortNodes []string
-	abortTags  []string
-)
-
 func buildAbortRunnerRequest(runnerName, operator string, all bool, flagNodes, positionalNodes, tags []string) (core.RunnerRequestCTD, error) {
 	combinedNodes := make([]string, 0, len(flagNodes)+len(positionalNodes))
 	combinedNodes = append(combinedNodes, flagNodes...)
@@ -42,18 +36,25 @@ var runnerAbortCmd = &cobra.Command{
   pigeons runner abort PauseRnr rv64-compute-01
   pigeons runner abort SyntheticComputeRnr --tag=compute-bench`,
 	Args: cobra.MinimumNArgs(1),
-	RunE: func(_ *cobra.Command, args []string) error {
-		req, err := buildAbortRunnerRequest(args[0], wsCfg.Operator, abortAll, abortNodes, args[1:], abortTags)
+	RunE: func(cmd *cobra.Command, args []string) error {
+		state := cliStateFromCommand(cmd)
+		cfg := state.wsCfg
+		f := cmd.Flags()
+		all, _ := f.GetBool("all")
+		nodes, _ := f.GetStringArray("node")
+		tags, _ := f.GetStringArray("tag")
+
+		req, err := buildAbortRunnerRequest(args[0], cfg.Operator, all, nodes, args[1:], tags)
 		if err != nil {
 			return err
 		}
 
-		brokerURL := resolveBrokerURL()
-		if err := publishRunnerRequest(brokerURL, req); err != nil {
+		brokerURL := resolveBrokerURLForConfig(cfg)
+		if err := publishRunnerRequestWithConfig(cfg, brokerURL, req); err != nil {
 			return err
 		}
 
-		fmt.Printf("[+] Submitted abort RunnerRequestCTD %s for %q -> (all=%v, nodes=%v, tags=%v)\n",
+		fmt.Fprintf(cmd.OutOrStdout(), "[+] Submitted abort RunnerRequestCTD %s for %q -> (all=%v, nodes=%v, tags=%v)\n",
 			req.RequestID, req.Runner, req.Selectors.All, req.Selectors.Nodes, req.Selectors.Tags)
 		return nil
 	},
@@ -61,7 +62,7 @@ var runnerAbortCmd = &cobra.Command{
 
 func init() {
 	runnerCmd.AddCommand(runnerAbortCmd)
-	runnerAbortCmd.Flags().BoolVar(&abortAll, "all", false, "Abort runner across all active nodes in the mesh")
-	runnerAbortCmd.Flags().StringArrayVar(&abortNodes, "node", nil, "Target node ID (repeatable, or pass node IDs positionally)")
-	runnerAbortCmd.Flags().StringArrayVar(&abortTags, "tag", nil, "Target node tag (repeatable)")
+	runnerAbortCmd.Flags().Bool("all", false, "Abort runner across all active nodes in the mesh")
+	runnerAbortCmd.Flags().StringArray("node", nil, "Target node ID (repeatable, or pass node IDs positionally)")
+	runnerAbortCmd.Flags().StringArray("tag", nil, "Target node tag (repeatable)")
 }

@@ -271,6 +271,88 @@ func TestSubmitAndCertifyPMVFailsClosedOnEmptyVerdict(t *testing.T) {
 	}
 }
 
+func TestSQLOptimizerSystemPromptIndexes(t *testing.T) {
+	if strings.Contains(sqlOptimizerSystemPrompt, "jsonb_path_ops") {
+		t.Fatal("sqlOptimizerSystemPrompt must not claim dropped GIN(metrics jsonb_path_ops) index")
+	}
+	requiredTokens := []string{
+		"idx_ledger_node_ts",
+		"idx_ledger_node_comp_ts",
+		"idx_ledger_runner_ts",
+		"idx_ledger_pause_node_ts",
+		"idx_ledger_ts_brin",
+		"idx_ledger_ingested_brin",
+		"BRIN on event_timestamp",
+		"BRIN on ingested_at",
+	}
+	for _, tok := range requiredTokens {
+		if !strings.Contains(sqlOptimizerSystemPrompt, tok) {
+			t.Fatalf("sqlOptimizerSystemPrompt missing expected index token %q", tok)
+		}
+	}
+}
+
+func TestSubmitAndCertifyPMVFailsClosedOnNonCertifiedVerdicts(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply string
+	}{
+		{name: "rejected_prefix", reply: "REJECTED: query alters grouping."},
+		{name: "ambiguous_conversational", reply: "Looks good to me! The candidate SQL preserves the intent."},
+		{name: "preamble_before_certified", reply: "Sure, here is my assessment: CERTIFIED: matches raw intent."},
+		{name: "markdown_backticks", reply: "`CERTIFIED: matches raw intent.`"},
+		{name: "empty", reply: ""},
+		{name: "whitespace", reply: "   \n\t  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAgentSafeStore()
+			eng := NewEngine(store)
+
+			rawSQL := "SELECT node_id FROM ctd_nodes"
+			verdictLLM := &stubOptimizerLLM{
+				optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes\n```",
+				verifyReply:   tc.reply,
+			}
+
+			rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "fail_closed_view", rawSQL, verdictLLM)
+			if err == nil {
+				t.Fatalf("expected fail-closed error for verdict %q", tc.reply)
+			}
+			if rec == nil || rec.Status != "failed" {
+				t.Fatalf("expected returned draft status=failed, got %+v", rec)
+			}
+			if persisted, ok := store.pmvs["pmv_fail_closed_view"]; !ok || persisted.Status != "failed" {
+				t.Fatalf("expected persisted draft status=failed, got %+v (exists=%v)", persisted, ok)
+			}
+			if _, exists := store.materialized["pmv_fail_closed_view"]; exists {
+				t.Fatalf("view MUST NOT be materialized for non-CERTIFIED verdict %q", tc.reply)
+			}
+		})
+	}
+
+	t.Run("certified_case_insensitive_accepted", func(t *testing.T) {
+		store := newFakeAgentSafeStore()
+		eng := NewEngine(store)
+
+		rawSQL := "SELECT node_id FROM ctd_nodes"
+		okLLM := &stubOptimizerLLM{
+			optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes\n```",
+			verifyReply:   "  certified: Preserves node_id projection.  ",
+		}
+
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "accepted_view", rawSQL, okLLM)
+		if err != nil {
+			t.Fatalf("expected CERTIFIED verdict to succeed, got error: %v", err)
+		}
+		if rec == nil || rec.Status != "certified" {
+			t.Fatalf("expected status=certified, got %+v", rec)
+		}
+		if _, exists := store.materialized["pmv_accepted_view"]; !exists {
+			t.Fatal("expected certified view to be materialized")
+		}
+	})
+}
+
 func TestSparklineAndMultiLineGraphRender(t *testing.T) {
 	series := []float64{0, 2, 5, 10, 8, 4, 12, 16}
 	spark := Sparkline(series, 8)
