@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net"
+	"net/url"
 	"os"
+	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,8 +37,9 @@ var (
 )
 
 type cliState struct {
-	brand brand.Spec
-	wsCfg config.WorkstationConfig
+	baseBrand brand.Spec
+	brand     brand.Spec
+	wsCfg     config.WorkstationConfig
 }
 
 type cliStateContextKey struct{}
@@ -53,8 +58,9 @@ func cliStateFromCommand(cmd *cobra.Command) *cliState {
 		}
 	}
 	return &cliState{
-		brand: wsCfg.Brand,
-		wsCfg: wsCfg,
+		baseBrand: wsCfg.Brand,
+		brand:     wsCfg.Brand,
+		wsCfg:     wsCfg,
 	}
 }
 
@@ -76,17 +82,12 @@ func persistentConfigFlags(cmd *cobra.Command) (string, string) {
 func loadWorkstationConfigForBrand(cfgPath, meshName string, instanceBrand brand.Spec, allowBrokenCurrentMesh bool) (config.WorkstationConfig, error) {
 	b := instanceBrand.MergeWithDefaults()
 	effectiveMesh := strings.TrimSpace(meshName)
-	if effectiveMesh == "" && b.EnvPrefix != "" && b.EnvPrefix != brand.Default().EnvPrefix {
-		if envMesh := config.PrefixedEnv(b.EnvPrefix, "MESH"); envMesh != "" {
-			effectiveMesh = envMesh
-		}
-	}
 
 	loaded, err := config.LoadWorkstationConfigForMeshAndBrand(cfgPath, effectiveMesh, b)
 	if err != nil {
 		// Allow mesh recovery/switching commands (`connect`, `disconnect`, `mesh`) to run even if
 		// `<cli>/current_mesh` points to a removed profile.
-		if allowBrokenCurrentMesh && strings.TrimSpace(meshName) == "" {
+		if allowBrokenCurrentMesh && effectiveMesh == "" {
 			base, baseErr := config.LoadBaseWorkstationConfigForBrand(cfgPath, b)
 			if baseErr != nil {
 				return config.WorkstationConfig{}, baseErr
@@ -124,8 +125,9 @@ var rootCmd = &cobra.Command{
 		}
 		wsCfg = loaded
 		cmd.SetContext(withCLIState(cmd.Context(), &cliState{
-			brand: loaded.Brand,
-			wsCfg: loaded,
+			baseBrand: brand.Default(),
+			brand:     loaded.Brand,
+			wsCfg:     loaded,
 		}))
 		return nil
 	},
@@ -139,7 +141,7 @@ var tuiCmd = &cobra.Command{
 	Short: "Launch the interactive 4-tab Control Plane TUI (Overview, RunnerManager, PigeonMath, PigeonCare)",
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		state := cliStateFromCommand(cmd)
-		return launchDashboardWithConfig(state.wsCfg, tui.TabOverview, "", "", "")
+		return launchDashboardWithConfig(cmd.Context(), state.wsCfg, tui.TabOverview, "", "", "")
 	},
 }
 
@@ -163,7 +165,50 @@ func resolveBrokerURL() string {
 	return resolveBrokerURLForConfig(wsCfg)
 }
 
-func dialMQTTClientWithConfig(cfg config.WorkstationConfig, brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
+func isTLSMQTTScheme(scheme string) bool {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "tls", "ssl", "tcps", "mqtts", "mqtt+ssl", "wss":
+		return true
+	default:
+		return false
+	}
+}
+
+func waitForContextDeadlineErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func dialMQTTClientWithConfig(ctx context.Context, cfg config.WorkstationConfig, brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	pahoTimeout := timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		// Give Paho slightly more slack than ctx.Deadline so <-ctx.Done() wins deterministically
+		// without racing a duplicate timer while still bounding socket teardown soon after ctx expiry.
+		if bounded := rem + 15*time.Millisecond; bounded < pahoTimeout {
+			pahoTimeout = bounded
+		}
+	}
+
 	mqttAuth := cfg.EffectiveMQTTAuth()
 	tlsCfg, err := config.BuildMQTTTLSConfig(
 		mqttAuth.TLSCAFile,
@@ -175,10 +220,24 @@ func dialMQTTClientWithConfig(cfg config.WorkstationConfig, brokerURL, clientID 
 		return nil, err
 	}
 
+	if tlsCfg != nil {
+		u, parseErr := url.Parse(strings.TrimSpace(brokerURL))
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid MQTT broker URL %s: %w", config.RedactURL(brokerURL), parseErr)
+		}
+		if !isTLSMQTTScheme(u.Scheme) {
+			return nil, fmt.Errorf("MQTT TLS configuration requires a TLS broker URL scheme (tls://, ssl://, or wss://), got %s", config.RedactURL(brokerURL))
+		}
+	}
+
 	opts := mqtt.NewClientOptions().
 		AddBroker(brokerURL).
 		SetClientID(clientID).
-		SetConnectTimeout(timeout)
+		SetConnectTimeout(pahoTimeout).
+		SetWriteTimeout(pahoTimeout).
+		SetAutoReconnect(false).
+		SetConnectRetry(false).
+		SetDialer(&net.Dialer{Timeout: pahoTimeout})
 	if mqttAuth.Username != "" {
 		opts.SetUsername(mqttAuth.Username)
 		opts.SetPassword(mqttAuth.Password)
@@ -188,16 +247,38 @@ func dialMQTTClientWithConfig(cfg config.WorkstationConfig, brokerURL, clientID 
 	}
 
 	client := mqtt.NewClient(opts)
-	if tok := client.Connect(); !tok.WaitTimeout(timeout) {
+	tok := client.Connect()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-tok.Done():
+		if tok.Error() != nil {
+			client.Disconnect(0)
+			if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, fmt.Errorf("connect MQTT broker %s: %w", config.RedactURL(brokerURL), tok.Error())
+		}
+		if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
+			client.Disconnect(0)
+			return nil, ctxErr
+		}
+		return client, nil
+	case <-timer.C:
+		client.Disconnect(0)
+		if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("timeout connecting MQTT broker %s", config.RedactURL(brokerURL))
-	} else if tok.Error() != nil {
-		return nil, fmt.Errorf("connect MQTT broker %s: %w", config.RedactURL(brokerURL), tok.Error())
+	case <-ctx.Done():
+		client.Disconnect(0)
+		return nil, ctx.Err()
 	}
-	return client, nil
 }
 
-func dialMQTTClient(brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
-	return dialMQTTClientWithConfig(wsCfg, brokerURL, clientID, timeout)
+func dialMQTTClient(ctx context.Context, brokerURL, clientID string, timeout time.Duration) (mqtt.Client, error) {
+	return dialMQTTClientWithConfig(ctx, wsCfg, brokerURL, clientID, timeout)
 }
 
 func openOperatorStoreForConfig(ctx context.Context, cfg config.WorkstationConfig) (*db.PostgresStore, error) {
@@ -222,11 +303,24 @@ func openReadOnlyStoreForConfig(ctx context.Context, cfg config.WorkstationConfi
 	})
 }
 
+func openReadStoreForConfig(ctx context.Context, cfg config.WorkstationConfig, actor string) (db.AgentSafeDB, error) {
+	if strings.TrimSpace(cfg.ReadOnlyDatabaseURL) != "" {
+		return openReadOnlyStoreForConfig(ctx, cfg, actor)
+	}
+	return openOperatorStoreForConfig(ctx, cfg)
+}
+
 func openReadOnlyStore(ctx context.Context, actor string) (*db.ReadOnlyAgentStore, error) {
 	return openReadOnlyStoreForConfig(ctx, wsCfg, actor)
 }
 
-func publishRunnerRequestWithConfig(cfg config.WorkstationConfig, brokerURL string, req core.RunnerRequestCTD) error {
+func publishRunnerRequestWithConfig(ctx context.Context, cfg config.WorkstationConfig, brokerURL string, req core.RunnerRequestCTD) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := req.Validate(); err != nil {
 		return err
 	}
@@ -236,7 +330,7 @@ func publishRunnerRequestWithConfig(cfg config.WorkstationConfig, brokerURL stri
 	}
 
 	clientID := fmt.Sprintf("%s-req-%d", cfg.Brand.CLIName, time.Now().UnixNano())
-	client, err := dialMQTTClientWithConfig(cfg, brokerURL, clientID, 4*time.Second)
+	client, err := dialMQTTClientWithConfig(ctx, cfg, brokerURL, clientID, 4*time.Second)
 	if err != nil {
 		return err
 	}
@@ -244,18 +338,42 @@ func publishRunnerRequestWithConfig(cfg config.WorkstationConfig, brokerURL stri
 
 	reqTopic := cfg.Brand.RunnerRequestTopic()
 	tok := client.Publish(reqTopic, 1, false, raw)
-	if !tok.WaitTimeout(4 * time.Second) {
-		return fmt.Errorf("timeout publishing RunnerRequestCTD to %s", reqTopic)
+	pubTimeout := 4 * time.Second
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 0 {
+		<-ctx.Done()
+		return ctx.Err()
 	}
-	return tok.Error()
+	timer := time.NewTimer(pubTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-tok.Done():
+		if tok.Error() != nil {
+			if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
+				return ctxErr
+			}
+			return tok.Error()
+		}
+		return waitForContextDeadlineErr(ctx)
+	case <-timer.C:
+		if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("timeout publishing RunnerRequestCTD to %s", reqTopic)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func publishRunnerRequest(brokerURL string, req core.RunnerRequestCTD) error {
-	return publishRunnerRequestWithConfig(wsCfg, brokerURL, req)
+func publishRunnerRequest(ctx context.Context, brokerURL string, req core.RunnerRequestCTD) error {
+	return publishRunnerRequestWithConfig(ctx, wsCfg, brokerURL, req)
 }
 
-func launchDashboardWithConfig(cfg config.WorkstationConfig, initialTab tui.TabID, focusReq, faultContext, modeOverride string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+func launchDashboardWithConfig(parentCtx context.Context, cfg config.WorkstationConfig, initialTab tui.TabID, focusReq, faultContext, modeOverride string) error {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, 6*time.Second)
 	roStore, err := openReadOnlyStoreForConfig(ctx, cfg, strings.ToLower(cfg.Brand.AgentName))
 	cancel()
 	if err != nil {
@@ -271,8 +389,8 @@ func launchDashboardWithConfig(cfg config.WorkstationConfig, initialTab tui.TabI
 	prompter, approvalInbox, closePrompter := tui.NewManagedChannelPrompter()
 	defer closePrompter()
 	brokerURL := resolveBrokerURLForConfig(cfg)
-	dispatcher := func(_ context.Context, req core.RunnerRequestCTD) error {
-		return publishRunnerRequestWithConfig(cfg, brokerURL, req)
+	dispatcher := func(dispCtx context.Context, req core.RunnerRequestCTD) error {
+		return publishRunnerRequestWithConfig(dispCtx, cfg, brokerURL, req)
 	}
 
 	careSvc := pigeoncare.NewService(pigeoncare.Options{
@@ -285,6 +403,7 @@ func launchDashboardWithConfig(cfg config.WorkstationConfig, initialTab tui.TabI
 	})
 
 	model := tui.NewDashboardModel(tui.DashboardOptions{
+		Context:       parentCtx,
 		Config:        cfg,
 		Store:         roStore,
 		Care:          careSvc,
@@ -295,13 +414,13 @@ func launchDashboardWithConfig(cfg config.WorkstationConfig, initialTab tui.TabI
 		ApprovalInbox: approvalInbox,
 	})
 
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(parentCtx))
 	_, runErr := p.Run()
 	return runErr
 }
 
-func launchDashboard(initialTab tui.TabID, focusReq, faultContext, modeOverride string) error {
-	return launchDashboardWithConfig(wsCfg, initialTab, focusReq, faultContext, modeOverride)
+func launchDashboard(ctx context.Context, initialTab tui.TabID, focusReq, faultContext, modeOverride string) error {
+	return launchDashboardWithConfig(ctx, wsCfg, initialTab, focusReq, faultContext, modeOverride)
 }
 
 func isContextAwareCommand(src *cobra.Command) bool {
@@ -479,10 +598,11 @@ func cloneCommandTree(src *cobra.Command, state *cliState, isRoot bool) *cobra.C
 		dst.Short = fmt.Sprintf("%s: The %s Control Plane CLI & TUI", state.brand.CLIName, state.brand.ProductName)
 		dst.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 			cfgPath, meshName := persistentConfigFlags(cmd)
-			loaded, err := loadWorkstationConfigForBrand(cfgPath, meshName, state.brand, isMeshManagementCommand(cmd))
+			loaded, err := loadWorkstationConfigForBrand(cfgPath, meshName, state.baseBrand, isMeshManagementCommand(cmd))
 			if err != nil {
 				return err
 			}
+			state.brand = loaded.Brand
 			state.wsCfg = loaded
 			cmd.SetContext(withCLIState(cmd.Context(), state))
 			return nil
@@ -519,8 +639,9 @@ func NewRootCommand(spec brand.Spec) *cobra.Command {
 	cfg := config.DefaultWorkstationConfig()
 	cfg.Brand = b
 	state := &cliState{
-		brand: b,
-		wsCfg: cfg,
+		baseBrand: b,
+		brand:     b,
+		wsCfg:     cfg,
 	}
 
 	templateMu.Lock()
@@ -535,8 +656,11 @@ func RootCommand() *cobra.Command {
 
 // ExecuteWithBrand runs an isolated CLI command tree customized with spec.
 func ExecuteWithBrand(spec brand.Spec) {
-	if err := NewRootCommand(spec).Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := NewRootCommand(spec).ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		stop()
 		os.Exit(1)
 	}
 }

@@ -11,10 +11,11 @@ import (
 
 var _ AgentSafeDB = (*ReadOnlyAgentStore)(nil)
 
-// ReadOnlyOptions customizes connection safety checks for ReadOnlyAgentStore.
+// ReadOnlyOptions customizes connection safety checks and scan limits for ReadOnlyAgentStore.
 type ReadOnlyOptions struct {
 	AllowSuperuser bool
 	MaxRows        int
+	MaxBytes       int
 	MathSchema     string
 	EnvPrefix      string
 }
@@ -25,6 +26,7 @@ type ReadOnlyAgentStore struct {
 	inner     *PostgresStore
 	ownsInner bool
 	maxRows   int
+	maxBytes  int
 }
 
 func resolveAllowSuperuserRO(opts ReadOnlyOptions) bool {
@@ -58,6 +60,10 @@ func NewReadOnlyAgentStore(ctx context.Context, connStr, appActor string, opts .
 	if maxRows <= 0 {
 		maxRows = DefaultReadOnlyMaxRows
 	}
+	maxBytes := roOpt.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultReadOnlyMaxBytes
+	}
 
 	store, err := NewPostgresStoreWithOptions(ctx, connStr, StoreOptions{
 		AppActor:            appActor,
@@ -66,17 +72,22 @@ func NewReadOnlyAgentStore(ctx context.Context, connStr, appActor string, opts .
 		StatementTimeoutMs:  5000,
 		EnforceNonSuperuser: !roOpt.AllowSuperuser,
 		MathSchema:          roOpt.MathSchema,
+		ReadOnlyMaxBytes:    maxBytes,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &ReadOnlyAgentStore{inner: store, ownsInner: true, maxRows: maxRows}, nil
+	return &ReadOnlyAgentStore{inner: store, ownsInner: true, maxRows: maxRows, maxBytes: maxBytes}, nil
 }
 
 // WrapAgentSafeDB wraps an existing PostgresStore without transferring Close() ownership,
 // useful when the operator TUI shares a pool across views while restricting PigeonCare's capability surface.
 func WrapAgentSafeDB(store *PostgresStore) *ReadOnlyAgentStore {
-	return &ReadOnlyAgentStore{inner: store, ownsInner: false, maxRows: DefaultReadOnlyMaxRows}
+	maxBytes := DefaultReadOnlyMaxBytes
+	if store != nil && store.readOnlyMaxBytes > 0 {
+		maxBytes = store.readOnlyMaxBytes
+	}
+	return &ReadOnlyAgentStore{inner: store, ownsInner: false, maxRows: DefaultReadOnlyMaxRows, maxBytes: maxBytes}
 }
 
 func (r *ReadOnlyAgentStore) Close() {
@@ -106,7 +117,7 @@ func (r *ReadOnlyAgentStore) GetLedgerActivity(ctx context.Context, limit int) (
 }
 
 func (r *ReadOnlyAgentStore) QueryReadOnlyMaps(ctx context.Context, sql string, args ...any) ([]map[string]any, error) {
-	return r.inner.QueryReadOnlyMapsBounded(ctx, r.maxRows, sql, args...)
+	return r.inner.QueryReadOnlyMapsBoundedBytes(ctx, r.maxRows, r.maxBytes, sql, args...)
 }
 
 func (r *ReadOnlyAgentStore) ExplainReadOnly(ctx context.Context, selectSQL string) (string, error) {

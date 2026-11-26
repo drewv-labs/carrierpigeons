@@ -29,6 +29,23 @@ type darwinNetCounters struct {
 	txPackets uint64
 }
 
+// wireIfMsghdr2 matches the exact Darwin <net/if.h> struct if_msghdr2 wire layout,
+// including the explicit 2-byte C alignment padding between ifm_index and ifm_snd_len.
+type wireIfMsghdr2 struct {
+	Msglen    uint16
+	Version   uint8
+	Type      uint8
+	Addrs     int32
+	Flags     int32
+	Index     uint16
+	_         uint16 // alignment padding between ifm_index and ifm_snd_len
+	SndLen    int32
+	SndMaxlen int32
+	SndDrops  int32
+	Timer     int32
+	Data      unix.IfData64
+}
+
 // collectDarwinNetCounters fetches 64-bit interface byte/packet counters directly from the kernel
 // routing information base (NET_RT_IFLIST2) without spawning `netstat`.
 func collectDarwinNetCounters() (map[string]darwinNetCounters, error) {
@@ -36,8 +53,16 @@ func collectDarwinNetCounters() (map[string]darwinNetCounters, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseDarwinRIB(rib, func(idx int) string {
+		if netIf, ifErr := net.InterfaceByIndex(idx); ifErr == nil {
+			return netIf.Name
+		}
+		return ""
+	}), nil
+}
 
-	hdrSize := int(unsafe.Sizeof(unix.IfMsghdr2{}))
+func parseDarwinRIB(rib []byte, lookupByIndex func(int) string) map[string]darwinNetCounters {
+	hdrSize := int(unsafe.Sizeof(wireIfMsghdr2{}))
 	seen := make(map[string]darwinNetCounters)
 
 	for offset := 0; offset+4 <= len(rib); {
@@ -47,15 +72,14 @@ func collectDarwinNetCounters() (map[string]darwinNetCounters, error) {
 		}
 		msgType := rib[offset+3]
 		if msgType == unix.RTM_IFINFO2 && msgLen >= hdrSize {
-			var hdr unix.IfMsghdr2
+			var hdr wireIfMsghdr2
 			if err := binary.Read(bytes.NewReader(rib[offset:offset+hdrSize]), binary.LittleEndian, &hdr); err == nil {
 				iface := parseDarwinSockaddrDLName(rib[offset+hdrSize : offset+msgLen])
-				if iface == "" && hdr.Index > 0 {
-					if netIf, ifErr := net.InterfaceByIndex(int(hdr.Index)); ifErr == nil {
-						iface = netIf.Name
-					}
+				if iface == "" && hdr.Index > 0 && lookupByIndex != nil {
+					iface = lookupByIndex(int(hdr.Index))
 				}
 				if (strings.HasPrefix(iface, "en") || strings.HasPrefix(iface, "utun")) &&
+					core.ValidateTopicToken("net-"+iface) == nil &&
 					(hdr.Data.Ibytes > 0 || hdr.Data.Obytes > 0) {
 					seen[iface] = darwinNetCounters{
 						rxBytes:   hdr.Data.Ibytes,
@@ -69,7 +93,7 @@ func collectDarwinNetCounters() (map[string]darwinNetCounters, error) {
 		offset += msgLen
 	}
 
-	return seen, nil
+	return seen
 }
 
 // parseDarwinSockaddrDLName extracts the interface name from the sockaddr_dl following IfMsghdr2.

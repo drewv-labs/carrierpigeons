@@ -122,7 +122,7 @@ var runCmd = &cobra.Command{
 		}
 
 		brokerURL := resolveBrokerURLForConfig(cfg)
-		if err := publishRunnerRequestWithConfig(cfg, brokerURL, req); err != nil {
+		if err := publishRunnerRequestWithConfig(cmd.Context(), cfg, brokerURL, req); err != nil {
 			return err
 		}
 
@@ -132,7 +132,7 @@ var runCmd = &cobra.Command{
 		if noTUI {
 			return nil
 		}
-		return launchDashboardWithConfig(cfg, tui.TabRunnerManager, req.RequestID, "", "")
+		return launchDashboardWithConfig(cmd.Context(), cfg, tui.TabRunnerManager, req.RequestID, "", "")
 	},
 }
 

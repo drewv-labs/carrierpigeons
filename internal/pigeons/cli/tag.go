@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/spf13/cobra"
 )
 
@@ -20,7 +21,20 @@ var tagCmd = &cobra.Command{
 		if len(tags) == 0 {
 			return fmt.Errorf("invalid empty tag %q", args[0])
 		}
+		for _, t := range tags {
+			if err := core.ValidateTopicToken(t); err != nil {
+				return fmt.Errorf("invalid tag %q: %w", t, err)
+			}
+		}
 		nodes := cleanSelectorTokens(args[1:], false)
+		if len(nodes) == 0 {
+			return fmt.Errorf("at least one valid node_id is required")
+		}
+		for _, nodeID := range nodes {
+			if err := core.ValidateTopicToken(nodeID); err != nil {
+				return fmt.Errorf("invalid node_id %q: %w", nodeID, err)
+			}
+		}
 
 		parentCtx := cmd.Context()
 		if parentCtx == nil {

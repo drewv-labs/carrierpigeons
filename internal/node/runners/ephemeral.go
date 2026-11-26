@@ -5,48 +5,95 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
-const maxCapturedStreamBytes = 16 * 1024
+const (
+	maxCapturedStreamBytes  = 16 * 1024
+	maxEphemeralScriptBytes = 256 * 1024
+	sandboxPATH             = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
 
 var safeEnvKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 var blockedEnvKeys = map[string]struct{}{
-	"PATH":           {},
-	"HOME":           {},
-	"TMPDIR":         {},
-	"TMP":            {},
-	"TEMP":           {},
-	"USER":           {},
-	"LOGNAME":        {},
-	"SHELL":          {},
-	"BASH_ENV":       {},
-	"ENV":            {},
-	"IFS":            {},
-	"CDPATH":         {},
-	"PROMPT_COMMAND": {},
-	"PYTHONPATH":     {},
-	"PYTHONHOME":     {},
-	"PYTHONSTARTUP":  {},
-	"PYTHONINSPECT":  {},
-	"NODE_OPTIONS":   {},
-	"PERL5OPT":       {},
-	"PERL5LIB":       {},
-	"RUBYOPT":        {},
-	"RUBYLIB":        {},
-	"GCONV_PATH":     {},
-	"HOSTALIASES":    {},
+	"PATH":               {},
+	"HOME":               {},
+	"TMPDIR":             {},
+	"TMP":                {},
+	"TEMP":               {},
+	"USER":               {},
+	"LOGNAME":            {},
+	"SHELL":              {},
+	"SHELLOPTS":          {},
+	"BASHOPTS":           {},
+	"BASH_ENV":           {},
+	"ENV":                {},
+	"SHINIT":             {},
+	"IFS":                {},
+	"CDPATH":             {},
+	"GLOBIGNORE":         {},
+	"FPATH":              {},
+	"ZDOTDIR":            {},
+	"PS1":                {},
+	"PS2":                {},
+	"PS3":                {},
+	"PS4":                {},
+	"PROMPT_COMMAND":     {},
+	"NODE_OPTIONS":       {},
+	"PERL5OPT":           {},
+	"PERL5LIB":           {},
+	"PERL5DB":            {},
+	"PERLLIB":            {},
+	"RUBYOPT":            {},
+	"RUBYLIB":            {},
+	"GCONV_PATH":         {},
+	"LOCPATH":            {},
+	"NLSPATH":            {},
+	"HOSTALIASES":        {},
+	"SSL_CERT_FILE":      {},
+	"SSL_CERT_DIR":       {},
+	"SSLKEYLOGFILE":      {},
+	"REQUESTS_CA_BUNDLE": {},
+	"JAVA_TOOL_OPTIONS":  {},
+	"JDK_JAVA_OPTIONS":   {},
+	"AWKPATH":            {},
+	"AWKLIBPATH":         {},
+	"GOFLAGS":            {},
+	"GOPATH":             {},
+	"GOBIN":              {},
+	"GOCACHE":            {},
+	"GOMODCACHE":         {},
+}
+
+var blockedEnvPrefixes = []string{
+	"LD_",
+	"DYLD_",
+	"BASH_",
+	"PYTHON",
+	"OPENSSL_",
+	"PIGEONS_",
+	"XDG_",
+	"GIT_",
+	"CURL_",
+	"PG",
+	"PERL",
+	"RUBY",
+	"NODE_",
+	"LUA_",
 }
 
 func validateSandboxEnvVar(key, val string) (string, error) {
@@ -54,16 +101,217 @@ func validateSandboxEnvVar(key, val string) (string, error) {
 	if !safeEnvKeyRe.MatchString(k) {
 		return "", fmt.Errorf("disallowed environment variable name %q (must match ^[A-Z][A-Z0-9_]{0,63}$)", key)
 	}
-	if _, blocked := blockedEnvKeys[k]; blocked ||
-		strings.HasPrefix(k, "LD_") ||
-		strings.HasPrefix(k, "DYLD_") ||
-		strings.HasPrefix(k, "BASH_FUNC_") {
+	if _, blocked := blockedEnvKeys[k]; blocked {
 		return "", fmt.Errorf("environment variable %q is blocked by sandbox policy", k)
+	}
+	for _, prefix := range blockedEnvPrefixes {
+		if strings.HasPrefix(k, prefix) {
+			return "", fmt.Errorf("environment variable %q (prefix %s*) is blocked by sandbox policy", k, prefix)
+		}
 	}
 	if strings.ContainsRune(val, 0) {
 		return "", fmt.Errorf("environment variable %q contains NUL byte", k)
 	}
 	return k + "=" + val, nil
+}
+
+func normalizeAllowedInterpreters(raw []string) []string {
+	if len(raw) == 0 {
+		return []string{"sh", "bash", "python3"}
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		norm := runner.NormalizeInterpreter(item)
+		if norm == "" {
+			continue
+		}
+		if _, exists := seen[norm]; !exists {
+			seen[norm] = struct{}{}
+			out = append(out, norm)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"sh", "bash", "python3"}
+	}
+	return out
+}
+
+func resolveSandboxInterpreter(interp string) (string, error) {
+	if interp == "" || interp == "." || interp == ".." || strings.ContainsAny(interp, `/\`) {
+		return "", fmt.Errorf("invalid interpreter name %q", interp)
+	}
+	for _, dir := range strings.Split(sandboxPATH, ":") {
+		candidate := filepath.Join(dir, interp)
+		if runtime.GOOS == "windows" {
+			for _, winPath := range []string{candidate, candidate + ".exe"} {
+				if info, err := os.Stat(winPath); err == nil && !info.IsDir() {
+					return winPath, nil
+				}
+			}
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("executable file not found in fixed sandbox PATH (%s)", sandboxPATH)
+}
+
+func interpreterArgs(interp, scriptPath string) []string {
+	switch {
+	case interp == "bash":
+		return []string{"--norc", "--noprofile", scriptPath}
+	case interp == "python3" || strings.HasPrefix(interp, "python"):
+		return []string{"-I", scriptPath}
+	default:
+		return []string{scriptPath}
+	}
+}
+
+// isScriptHashAllowed verifies script execution against policy.AllowedScriptHashes.
+// Supported entry formats:
+//   - "<interpreter>:<sha256>" where <sha256> matches sha256(scriptBody) (or bound sha256(interpreter + "\x00" + scriptBody))
+//   - "<sha256>" matching bound sha256(interpreter + "\x00" + scriptBody)
+//   - legacy raw "<sha256(scriptBody)>" ONLY when allowedInterpreters unambiguously pins a single interpreter matching interp.
+func isScriptHashAllowed(interp, bodyHash, boundHash string, allowedInterpreters, allowedHashes []string) bool {
+	var singleAllowed string
+	if len(allowedInterpreters) == 1 {
+		singleAllowed = allowedInterpreters[0]
+	}
+
+	for _, h := range allowedHashes {
+		norm, ok := runner.NormalizeAllowedScriptHashEntry(h)
+		if !ok {
+			continue
+		}
+		if entryInterp, entryHash, hasInterp := strings.Cut(norm, ":"); hasInterp {
+			if entryInterp == interp && (entryHash == bodyHash || entryHash == boundHash) {
+				return true
+			}
+			continue
+		}
+		if norm == boundHash {
+			return true
+		}
+		if singleAllowed != "" && singleAllowed == interp && norm == bodyHash {
+			return true
+		}
+	}
+	return false
+}
+
+func runCommandWithPipes(
+	ctx context.Context,
+	cmd *exec.Cmd,
+	stdoutDst io.Writer,
+	stderrDst io.Writer,
+	startAndWait func(ctx context.Context, cmd *exec.Cmd, onStarted func()) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create stdout pipe: %w", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return fmt.Errorf("create stderr pipe: %w", err)
+	}
+
+	closeFile := func(f **os.File) {
+		if *f != nil {
+			_ = (*f).Close()
+			*f = nil
+		}
+	}
+	defer func() {
+		closeFile(&stdoutW)
+		closeFile(&stderrW)
+		closeFile(&stdoutR)
+		closeFile(&stderrR)
+	}()
+
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+
+	var pipeWG sync.WaitGroup
+	pipeErrCh := make(chan error, 2)
+
+	onStarted := func() {
+		// Close parent write ends immediately so EOF is observed once all process-group writers exit.
+		closeFile(&stdoutW)
+		closeFile(&stderrW)
+
+		copyStream := func(dst io.Writer, src *os.File) {
+			defer pipeWG.Done()
+			if dst == nil {
+				dst = io.Discard
+			}
+			if _, copyErr := io.Copy(dst, src); copyErr != nil && !errors.Is(copyErr, os.ErrClosed) {
+				pipeErrCh <- copyErr
+			}
+		}
+		pipeWG.Add(2)
+		go copyStream(stdoutDst, stdoutR)
+		go copyStream(stderrDst, stderrR)
+	}
+
+	runErr := startAndWait(ctx, cmd, onStarted)
+
+	pipesDone := make(chan struct{})
+	go func() {
+		pipeWG.Wait()
+		close(pipesDone)
+	}()
+
+	const waitDelay = 2 * time.Second
+	timer := time.NewTimer(waitDelay)
+	select {
+	case <-pipesDone:
+		timer.Stop()
+	case <-timer.C:
+		closeFile(&stdoutR)
+		closeFile(&stderrR)
+		<-pipesDone
+	}
+
+	if runErr != nil {
+		return runErr
+	}
+	select {
+	case pErr := <-pipeErrCh:
+		return pErr
+	default:
+		return nil
+	}
+}
+
+func evalProcessWaitResult(ctx context.Context, state *os.ProcessState, waitErr error) error {
+	if waitErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return waitErr
+	}
+	if state != nil && !state.Success() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &exec.ExitError{ProcessState: state}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
 }
 
 type boundedBuffer struct {
@@ -133,43 +381,36 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 	if strings.TrimSpace(scriptBody) == "" {
 		return emitErr("missing script_body parameter")
 	}
+	if len(scriptBody) > maxEphemeralScriptBytes {
+		return emitErr(fmt.Sprintf("ephemeral script_body exceeds %d byte limit (%d bytes)", maxEphemeralScriptBytes, len(scriptBody)))
+	}
 
 	rawInterp, _ := params["interpreter"].(string)
-	rawInterp = strings.TrimSpace(rawInterp)
-	interp := "sh"
-	if rawInterp != "" {
-		interp = strings.ToLower(strings.TrimSpace(filepath.Base(rawInterp)))
-		if interp == "" || interp == "." || interp == string(filepath.Separator) {
-			interp = "sh"
-		}
+	interp := runner.NormalizeInterpreter(rawInterp)
+	if interp == "" {
+		return emitErr(fmt.Sprintf("invalid interpreter %q", rawInterp))
 	}
 
-	allowed := policy.AllowedInterpreters
-	if len(allowed) == 0 {
-		allowed = []string{"sh", "bash", "python3"}
-	}
-	if !slices.ContainsFunc(allowed, func(item string) bool {
-		return strings.EqualFold(strings.TrimSpace(item), interp)
-	}) {
+	allowed := normalizeAllowedInterpreters(policy.AllowedInterpreters)
+	if !slices.Contains(allowed, interp) {
 		return emitErr(fmt.Sprintf("interpreter %q is not in node allowlist (%v)", interp, allowed))
 	}
 
-	interpBin, err := exec.LookPath(interp)
+	interpBin, err := resolveSandboxInterpreter(interp)
 	if err != nil {
 		return emitErr(fmt.Sprintf("interpreter %q not installed on node: %v", interp, err))
 	}
 
 	actualHash := runner.ComputeScriptSHA256(scriptBody)
+	boundHash := runner.ComputeBoundScriptSHA256(interp, scriptBody)
 	if expectedHash, _ := params["sha256"].(string); strings.TrimSpace(expectedHash) != "" {
-		if !strings.EqualFold(strings.TrimSpace(expectedHash), actualHash) {
+		exp := strings.ToLower(strings.TrimSpace(expectedHash))
+		if exp != actualHash && exp != boundHash {
 			return emitErr("ephemeral script SHA-256 digest mismatch")
 		}
 	}
 	if len(policy.AllowedScriptHashes) > 0 {
-		matched := slices.ContainsFunc(policy.AllowedScriptHashes, func(h string) bool {
-			return strings.EqualFold(strings.TrimSpace(h), actualHash)
-		})
-		if !matched {
+		if !isScriptHashAllowed(interp, actualHash, boundHash, allowed, policy.AllowedScriptHashes) {
 			return emitErr("ephemeral script SHA-256 is not in node allowed_script_hashes policy")
 		}
 	}
@@ -192,6 +433,7 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 			customEnv = append(customEnv, kv)
 		}
 	}
+	slices.Sort(customEnv)
 
 	timeoutSec := parseIntParam(params["timeout_sec"], 30)
 	maxTimeout := policy.MaxTimeoutSec
@@ -250,22 +492,22 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(execCtx, interpBin, scriptPath)
-	configureProcessGroup(cmd)
+	cmd := exec.Command(interpBin, interpreterArgs(interp, scriptPath)...)
 	cmd.Dir = workDir
-	cmd.Env = append([]string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME=" + workDir,
-		"TMPDIR=" + workDir,
-		"PIGEONS_NODE_ID=" + nodeID,
-	}, customEnv...)
+	cmdEnv := make([]string, 0, 4+len(customEnv))
+	cmdEnv = append(cmdEnv,
+		"PATH="+sandboxPATH,
+		"HOME="+workDir,
+		"TMPDIR="+workDir,
+	)
+	cmdEnv = append(cmdEnv, customEnv...)
+	cmdEnv = append(cmdEnv, "PIGEONS_NODE_ID="+nodeID)
+	cmd.Env = cmdEnv
 
 	stdoutBuf := &boundedBuffer{limit: maxCapturedStreamBytes}
 	stderrBuf := &boundedBuffer{limit: maxCapturedStreamBytes}
-	cmd.Stdout = stdoutBuf
-	cmd.Stderr = stderrBuf
 
-	runErr := cmd.Run()
+	runErr := runProcessGroupCmd(execCtx, cmd, stdoutBuf, stderrBuf)
 	exitCode := 0
 	endStatus := "runner-end"
 

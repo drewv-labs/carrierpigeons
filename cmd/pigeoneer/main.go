@@ -43,7 +43,7 @@ func main() {
 		cfg.SpoolCapacity = *spoolCap
 	}
 
-	log.Printf("Starting %s: CTD Edge Agent (%s -> %s)...", cfg.Brand.EdgeName, cfg.NodeID, cfg.BrokerURL)
+	log.Printf("Starting %s: CTD Edge Agent (%s -> %s)...", cfg.Brand.EdgeName, cfg.NodeID, config.RedactURL(cfg.BrokerURL))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

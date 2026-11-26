@@ -99,11 +99,16 @@ func (s *Subscriber) processRegistryUpdate(topic string, payload []byte) {
 	if changed && s.ntfyEnabled && s.ntfyURL != "" {
 		select {
 		case s.ntfySem <- struct{}{}:
-			if s.ntfyCtx != nil && s.ntfyCtx.Err() != nil {
+			s.ntfyMu.Lock()
+			closed := s.ntfyClosed || (s.ntfyCtx != nil && s.ntfyCtx.Err() != nil)
+			if !closed {
+				s.ntfyWG.Add(1)
+			}
+			s.ntfyMu.Unlock()
+			if closed {
 				<-s.ntfySem
 				return
 			}
-			s.ntfyWG.Add(1)
 			go func() {
 				defer s.ntfyWG.Done()
 				defer func() { <-s.ntfySem }()
@@ -112,6 +117,112 @@ func (s *Subscriber) processRegistryUpdate(topic string, payload []byte) {
 		default:
 			log.Printf("[Ntfy] Alert concurrency limit reached; skipping duplicate notification for %s (%s)", nodeID, status)
 		}
+	}
+}
+
+func (s *Subscriber) reaperContext() context.Context {
+	if s.reaperCtx != nil {
+		return s.reaperCtx
+	}
+	return s.workContext()
+}
+
+func (s *Subscriber) reaperLoop() {
+	defer s.reaperWG.Done()
+
+	if _, ok := s.ledger.(ClusterStatusLedger); !ok {
+		return
+	}
+
+	interval := s.staleNodeInterval
+	if interval <= 0 {
+		interval = defaultStaleNodeInterval
+	}
+
+	initialDelay := min(interval, 5*time.Second)
+	initialTimer := time.NewTimer(initialDelay)
+	select {
+	case <-s.reaperStop:
+		initialTimer.Stop()
+		return
+	case <-s.reaperContext().Done():
+		initialTimer.Stop()
+		return
+	case <-initialTimer.C:
+	}
+
+	s.reapStaleNodes()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.reaperStop:
+			return
+		case <-s.reaperContext().Done():
+			return
+		case <-ticker.C:
+			s.reapStaleNodes()
+		}
+	}
+}
+
+func (s *Subscriber) reapStaleNodes() {
+	csl, ok := s.ledger.(ClusterStatusLedger)
+	if !ok {
+		return
+	}
+	threshold := s.staleNodeThreshold
+	if threshold <= 0 {
+		threshold = defaultStaleNodeThreshold
+	}
+
+	ctx, cancel := context.WithTimeout(s.reaperContext(), 5*time.Second)
+	defer cancel()
+
+	summaries, err := csl.GetClusterStatus(ctx, threshold)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("[Registry Reaper] Failed checking stale nodes: %v", err)
+		}
+		return
+	}
+
+	cutoff := time.Now().UTC().Add(-threshold)
+	for _, ns := range summaries {
+		if ctx.Err() != nil {
+			return
+		}
+		if ns.NodeID == "" || strings.EqualFold(ns.Status, "OFFLINE") || strings.EqualFold(ns.Status, "paused") {
+			continue
+		}
+		if ns.LastSeen.After(cutoff) {
+			continue
+		}
+
+		if tl, ok := s.ledger.(TransitionLedger); ok {
+			prev, didChange, err := tl.UpdateNodePresenceTransition(ctx, ns.NodeID, "OFFLINE")
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[Registry Reaper] Failed marking stale node %s OFFLINE: %v", ns.NodeID, err)
+				}
+				continue
+			}
+			if didChange {
+				log.Printf("[Registry Reaper] Reconciled stale node %s -> OFFLINE (prev=%s, last_seen=%s)",
+					ns.NodeID, prev, ns.LastSeen.UTC().Format(time.RFC3339))
+			}
+			continue
+		}
+
+		if err := s.ledger.UpdateNodePresence(ctx, ns.NodeID, "OFFLINE"); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("[Registry Reaper] Failed marking stale node %s OFFLINE: %v", ns.NodeID, err)
+			}
+			continue
+		}
+		log.Printf("[Registry Reaper] Reconciled stale node %s -> OFFLINE (last_seen=%s)",
+			ns.NodeID, ns.LastSeen.UTC().Format(time.RFC3339))
 	}
 }
 

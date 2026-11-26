@@ -3,15 +3,32 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/spf13/cobra"
 )
+
+func readSupportPromptResponse(in io.Reader) string {
+	reader := bufio.NewReader(in)
+	response, err := reader.ReadString('\n')
+	trimmed := strings.TrimSpace(strings.ToLower(response))
+	if err != nil && trimmed == "" {
+		if errors.Is(err, io.EOF) {
+			return "n"
+		}
+		return "n"
+	}
+	return trimmed
+}
 
 var psCmd = &cobra.Command{
 	Use:   "ps",
@@ -31,89 +48,112 @@ var psCmd = &cobra.Command{
 		verydetailed, _ := f.GetBool("verydetailed")
 		addSupport, _ := f.GetBool("add-support")
 
-		store, err := openOperatorStoreForConfig(ctx, cfg)
+		store, err := openReadStoreForConfig(ctx, cfg, strings.ToLower(cfg.Brand.CLIName)+"-ps")
 		if err != nil {
 			return fmt.Errorf("connect CTD Ledger: %w", err)
 		}
-		defer store.Close()
-
-		summaries, err := store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
-		if err != nil {
-			return err
-		}
-
-		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-		if verydetailed {
-			fmt.Fprintln(w, "node\t| arch\t| tags\t| last component\t| state\t| detail")
-		} else {
-			fmt.Fprintln(w, "node\t| tags\t| last component\t| state")
-		}
-		fmt.Fprintln(w, "______________________________________________________________________________\t")
-
-		var degradedNodes []string
-		needsSupport := false
-
-		for _, n := range summaries {
-			state := "running"
-			detail := "clean"
-
-			timeSince := time.Since(n.LastSeen)
-			if strings.EqualFold(n.Status, "paused") {
-				state = "paused"
-				detail = "observers paused (PauseRnr)"
-			} else if timeSince > config.DefaultHealthyWindow {
-				state = "offline"
-				detail = fmt.Sprintf("unreachable (%.0fm ago)", timeSince.Minutes())
-				needsSupport = true
-				degradedNodes = append(degradedNodes, fmt.Sprintf("%s (%s)", n.NodeID, detail))
-			} else if !n.IsHealthy {
-				state = "degraded"
-				detail = n.Status
-				needsSupport = true
-				degradedNodes = append(degradedNodes, fmt.Sprintf("%s (%s)", n.NodeID, detail))
-			}
-
-			tagStr := strings.Join(n.Tags, ",")
-			if tagStr == "" {
-				tagStr = "-"
-			}
-			arch := n.Arch
-			if arch == "" {
-				arch = "-"
-			}
-
-			if verydetailed {
-				fmt.Fprintf(w, "%s\t| %s\t| %s\t| %s\t| %s\t| %s\n",
-					n.NodeID, arch, tagStr, n.Component, state, detail)
-			} else {
-				fmt.Fprintf(w, "%s\t| %s\t| %s\t| %s\n",
-					n.NodeID, tagStr, n.Component, state)
-			}
-		}
-		_ = w.Flush()
-
-		if addSupport && needsSupport {
-			fmt.Fprintln(out, "\nAbnormal node states detected in the cluster.")
-			fmt.Fprintf(out, "Contact %s Agent support? [Y/n] ", cfg.Brand.AgentName)
-
-			reader := bufio.NewReader(cmd.InOrStdin())
-			response, _ := reader.ReadString('\n')
-			response = strings.TrimSpace(strings.ToLower(response))
-
-			if response == "" || response == "y" || response == "yes" {
-				fmt.Fprintf(out, "\n[+] Handoff approved. Booting %s...\n", cfg.Brand.AgentName)
-
-				var contextBuilder strings.Builder
-				contextBuilder.WriteString("The following nodes are currently degraded or unreachable:\n")
-				for _, issue := range degradedNodes {
-					fmt.Fprintf(&contextBuilder, "- %s\n", issue)
-				}
-
-				return launchDashboardWithConfig(cfg, tui.TabPigeonCare, "", contextBuilder.String(), "")
-			}
-		}
-		return nil
+		return runPSWithStore(parentCtx, ctx, cfg, cmd.InOrStdin(), out, verydetailed, addSupport, store, launchDashboardWithConfig)
 	},
+}
+
+type dashboardLauncher func(context.Context, config.WorkstationConfig, tui.TabID, string, string, string) error
+
+func runPSWithStore(
+	parentCtx context.Context,
+	queryCtx context.Context,
+	cfg config.WorkstationConfig,
+	in io.Reader,
+	out io.Writer,
+	verydetailed bool,
+	addSupport bool,
+	store db.AgentSafeDB,
+	launch dashboardLauncher,
+) error {
+	var closeOnce sync.Once
+	closeStore := func() {
+		if store != nil {
+			closeOnce.Do(store.Close)
+		}
+	}
+	defer closeStore()
+
+	summaries, err := store.GetClusterStatus(queryCtx, config.DefaultHealthyWindow)
+	if err != nil {
+		return err
+	}
+	// Release the query pool immediately before interactive confirmation or launching the TUI.
+	closeStore()
+
+	w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
+	if verydetailed {
+		fmt.Fprintln(w, "node\t| arch\t| tags\t| last component\t| state\t| detail")
+	} else {
+		fmt.Fprintln(w, "node\t| tags\t| last component\t| state")
+	}
+	fmt.Fprintln(w, "______________________________________________________________________________\t")
+
+	var degradedNodes []string
+	needsSupport := false
+
+	for _, n := range summaries {
+		state := "running"
+		detail := "clean"
+
+		timeSince := time.Since(n.LastSeen)
+		if strings.EqualFold(n.Status, "paused") {
+			state = "paused"
+			detail = "observers paused (PauseRnr)"
+		} else if timeSince > config.DefaultHealthyWindow {
+			state = "offline"
+			detail = fmt.Sprintf("unreachable (%.0fm ago)", timeSince.Minutes())
+			needsSupport = true
+			degradedNodes = append(degradedNodes, fmt.Sprintf("%s (%s)", n.NodeID, detail))
+		} else if !n.IsHealthy {
+			state = "degraded"
+			detail = n.Status
+			needsSupport = true
+			degradedNodes = append(degradedNodes, fmt.Sprintf("%s (%s)", n.NodeID, detail))
+		}
+
+		tagStr := strings.Join(n.Tags, ",")
+		if tagStr == "" {
+			tagStr = "-"
+		}
+		arch := n.Arch
+		if arch == "" {
+			arch = "-"
+		}
+
+		if verydetailed {
+			fmt.Fprintf(w, "%s\t| %s\t| %s\t| %s\t| %s\t| %s\n",
+				n.NodeID, arch, tagStr, n.Component, state, detail)
+		} else {
+			fmt.Fprintf(w, "%s\t| %s\t| %s\t| %s\n",
+				n.NodeID, tagStr, n.Component, state)
+		}
+	}
+	_ = w.Flush()
+
+	if addSupport && needsSupport {
+		fmt.Fprintln(out, "\nAbnormal node states detected in the cluster.")
+		fmt.Fprintf(out, "Contact %s Agent support? [Y/n] ", cfg.Brand.AgentName)
+
+		response := readSupportPromptResponse(in)
+
+		if response == "" || response == "y" || response == "yes" {
+			fmt.Fprintf(out, "\n[+] Handoff approved. Booting %s...\n", cfg.Brand.AgentName)
+
+			var contextBuilder strings.Builder
+			contextBuilder.WriteString("The following nodes are currently degraded or unreachable:\n")
+			for _, issue := range degradedNodes {
+				fmt.Fprintf(&contextBuilder, "- %s\n", issue)
+			}
+
+			closeStore()
+			return launch(parentCtx, cfg, tui.TabPigeonCare, "", contextBuilder.String(), "")
+		}
+	}
+	return nil
 }
 
 func init() {

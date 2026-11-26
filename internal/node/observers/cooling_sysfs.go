@@ -7,12 +7,20 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
-// nonHostCoolingDrivers lists hwmon chip names belonging to discrete GPUs, NVMe drives,
-// or PSUs so their fans/thermals are never misclassified as the host CPU / SoC package.
+const (
+	sysfsDiscoveryTTL = 5 * time.Minute
+	minValidTempC     = -40.0
+	maxValidTempC     = 150.0
+)
+
+// nonHostCoolingDrivers lists hwmon chip names and thermal_zone types belonging to discrete GPUs,
+// NVMe drives, Wi-Fi PHYs, or PSUs so their fans/thermals are never misclassified as the host CPU / SoC package.
 var nonHostCoolingDrivers = map[string]bool{
 	"amdgpu":      true,
 	"radeon":      true,
@@ -36,45 +44,118 @@ type fanCandidate struct {
 	priority int
 }
 
-// observeSysfsThermals inspects /sys/class/thermal/thermal_zone* and /sys/class/hwmon/hwmon*/temp*_input
-// in-process with zero subprocess forks, emitting CPU/SoC temperatures across RISC-V (StarFive sfctemp, ESWIN),
-// ARM64, and x86 (Intel coretemp, AMD k10temp/zenpower).
-func observeSysfsThermals(sysRoot string, event *core.CTDPayload) {
-	if event == nil || sysRoot == "" {
-		return
-	}
+type cachedThermalSensor struct {
+	tempPath  string
+	faultPath string
+	prio      int
+}
 
-	bestTemp := -1.0
-	bestPrio := 0
+type cachedThermalTopology struct {
+	discoveredAt time.Time
+	dirty        bool
+	sensors      []cachedThermalSensor
+}
 
-	consider := func(tempC float64, prio int) {
-		if tempC <= 0 || tempC > 150 || math.IsNaN(tempC) {
-			return
-		}
-		rounded := math.Round(tempC*10) / 10
-		if prio > bestPrio || (prio == bestPrio && rounded > bestTemp) {
-			bestPrio = prio
-			bestTemp = rounded
-		}
+type cachedFanSensor struct {
+	key           string
+	index         int
+	rawLabel      string
+	dedicatedChip bool
+	inputPath     string
+	pwmPath       string
+	hasPWMFile    bool
+}
+
+type cachedCoolingDevice struct {
+	curStatePath string
+	maxStatePath string
+}
+
+type cachedCoolingTopology struct {
+	discoveredAt   time.Time
+	dirty          bool
+	fans           []cachedFanSensor
+	pwmOnlyPaths   []string
+	coolingDevices []cachedCoolingDevice
+}
+
+type sysfsDiscoveryCache struct {
+	mu       sync.Mutex
+	now      func() time.Time
+	thermals map[string]*cachedThermalTopology
+	coolings map[string]*cachedCoolingTopology
+}
+
+func newSysfsDiscoveryCache() *sysfsDiscoveryCache {
+	return &sysfsDiscoveryCache{
+		now:      time.Now,
+		thermals: make(map[string]*cachedThermalTopology),
+		coolings: make(map[string]*cachedCoolingTopology),
 	}
+}
+
+var defaultSysfsCache = newSysfsDiscoveryCache()
+
+func parseFiniteFloat(s string) (float64, bool) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return v, true
+}
+
+func parseSysfsMillidegreeTemp(raw []byte) (float64, bool) {
+	milliC, ok := parseFiniteFloat(string(raw))
+	if !ok {
+		return 0, false
+	}
+	tempC := milliC / 1000.0
+	if tempC < minValidTempC || tempC > maxValidTempC {
+		return 0, false
+	}
+	rounded := math.Round(tempC*10) / 10
+	if rounded == 0 {
+		rounded = 0
+	}
+	return rounded, true
+}
+
+func hwmonFaultPathForInput(inputPath string) string {
+	base := filepath.Base(inputPath)
+	if !strings.HasSuffix(base, "_input") {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(inputPath), strings.TrimSuffix(base, "_input")+"_fault")
+}
+
+func isHwmonTempFault(faultPath string) bool {
+	if faultPath == "" {
+		return false
+	}
+	raw, err := os.ReadFile(faultPath)
+	if err != nil {
+		return false
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	return err == nil && v == 1
+}
+
+func discoverThermalTopology(sysRoot string, now time.Time) *cachedThermalTopology {
+	topo := &cachedThermalTopology{discoveredAt: now}
 
 	// 1. Scan /sys/class/thermal/thermal_zone*
 	tzDirs, _ := filepath.Glob(filepath.Join(sysRoot, "class", "thermal", "thermal_zone*"))
 	slices.Sort(tzDirs)
 	for i, tzDir := range tzDirs {
-		rawTemp, err := os.ReadFile(filepath.Join(tzDir, "temp"))
-		if err != nil {
-			continue
-		}
-		val, err := strconv.ParseFloat(strings.TrimSpace(string(rawTemp)), 64)
-		if err != nil {
-			continue
-		}
-		tempC := val
-		if tempC > 200 {
-			tempC = val / 1000.0
-		}
 		typeRaw, _ := os.ReadFile(filepath.Join(tzDir, "type"))
+		tzToken := sanitizeSensorToken(string(typeRaw))
+		if nonHostCoolingDrivers[tzToken] {
+			continue
+		}
+		tempPath := filepath.Join(tzDir, "temp")
+		if !pathExists(tempPath) {
+			continue
+		}
 		tzType := strings.ToLower(strings.TrimSpace(string(typeRaw)))
 		prio := 2
 		if strings.Contains(tzType, "cpu") || strings.Contains(tzType, "soc") || strings.Contains(tzType, "x86_pkg") || strings.Contains(tzType, "tctl") {
@@ -82,7 +163,10 @@ func observeSysfsThermals(sysRoot string, event *core.CTDPayload) {
 		} else if i == 0 {
 			prio = 3
 		}
-		consider(tempC, prio)
+		topo.sensors = append(topo.sensors, cachedThermalSensor{
+			tempPath: tempPath,
+			prio:     prio,
+		})
 	}
 
 	// 2. Scan /sys/class/hwmon/hwmon*/temp*_input (catches StarFive JH7110 sfctemp, Intel coretemp, AMD k10temp)
@@ -103,44 +187,44 @@ func observeSysfsThermals(sysRoot string, event *core.CTDPayload) {
 		tempInputs, _ := filepath.Glob(filepath.Join(hwDir, "temp*_input"))
 		slices.Sort(tempInputs)
 		for _, tPath := range tempInputs {
-			raw, err := os.ReadFile(tPath)
-			if err != nil {
-				continue
-			}
-			milliC, err := strconv.ParseFloat(strings.TrimSpace(string(raw)), 64)
-			if err != nil {
-				continue
-			}
-			tempC := milliC
-			if tempC > 200 {
-				tempC = milliC / 1000.0
-			}
-			consider(tempC, chipPrio)
+			topo.sensors = append(topo.sensors, cachedThermalSensor{
+				tempPath:  tPath,
+				faultPath: hwmonFaultPathForInput(tPath),
+				prio:      chipPrio,
+			})
 		}
 	}
 
-	if bestTemp > 0 {
-		event.AddMetric("soc_temp_c", bestTemp)
-		event.AddMetric("cpu_temp_c", bestTemp)
+	return topo
+}
+
+func (c *sysfsDiscoveryCache) getThermals(sysRoot string, forceRefresh bool) *cachedThermalTopology {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.now()
+	if !forceRefresh {
+		if entry, ok := c.thermals[sysRoot]; ok && !entry.dirty && now.Sub(entry.discoveredAt) < sysfsDiscoveryTTL {
+			return entry
+		}
+	}
+	entry := discoverThermalTopology(sysRoot, now)
+	c.thermals[sysRoot] = entry
+	return entry
+}
+
+func (c *sysfsDiscoveryCache) markThermalsDirty(sysRoot string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.thermals[sysRoot]; ok {
+		entry.dirty = true
 	}
 }
 
-// observeSysfsCooling inspects Linux sysfs (/sys/class/hwmon and /sys/class/thermal)
-// in-process with zero subprocess forks, attaching CPU cooler fan speed (cpu_fan_rpm),
-// optional PWM duty cycle (cpu_fan_pwm_pct), and active host fan tachometers (fans_rpm).
-func observeSysfsCooling(sysRoot string, event *core.CTDPayload) {
-	if event == nil || sysRoot == "" {
-		return
-	}
+func discoverCoolingTopology(sysRoot string, now time.Time) *cachedCoolingTopology {
+	topo := &cachedCoolingTopology{discoveredAt: now}
 
-	var (
-		bestCPU     *fanCandidate
-		bestPWMOnly *float64
-		fansRPM     = make(map[string]int)
-	)
-
-	hwmonGlob := filepath.Join(sysRoot, "class", "hwmon", "hwmon*")
-	hwmonDirs, _ := filepath.Glob(hwmonGlob)
+	hwmonDirs, _ := filepath.Glob(filepath.Join(sysRoot, "class", "hwmon", "hwmon*"))
 	slices.Sort(hwmonDirs)
 
 	for _, hwDir := range hwmonDirs {
@@ -166,15 +250,6 @@ func observeSysfsCooling(sysRoot string, event *core.CTDPayload) {
 				continue
 			}
 
-			rpmBytes, err := os.ReadFile(inputPath)
-			if err != nil {
-				continue
-			}
-			rpm, err := strconv.Atoi(strings.TrimSpace(string(rpmBytes)))
-			if err != nil || rpm < 0 {
-				continue
-			}
-
 			labelBytes, _ := os.ReadFile(filepath.Join(hwDir, "fan"+idxStr+"_label"))
 			rawLabel := strings.TrimSpace(string(labelBytes))
 			normLabel := sanitizeSensorToken(rawLabel)
@@ -184,12 +259,166 @@ func observeSysfsCooling(sysRoot string, event *core.CTDPayload) {
 				sensorKey = chip + ":" + normLabel
 			}
 
-			pwmPct, hasPWM := readHwmonPWMPct(filepath.Join(hwDir, "pwm"+idxStr))
+			pwmPath := filepath.Join(hwDir, "pwm"+idxStr)
+			topo.fans = append(topo.fans, cachedFanSensor{
+				key:           sensorKey,
+				index:         idx,
+				rawLabel:      rawLabel,
+				dedicatedChip: dedicatedCoolerChip,
+				inputPath:     inputPath,
+				pwmPath:       pwmPath,
+				hasPWMFile:    pathExists(pwmPath),
+			})
+		}
 
-			prio := classifyCPUCoolerPriority(chip, rawLabel, idx, rpm, dedicatedCoolerChip)
+		// Handle 2-wire / 3-wire SoC PWM coolers that expose pwm1 without a fan1_input tach wire.
+		if len(fanInputs) == 0 && dedicatedCoolerChip {
+			pwm1Path := filepath.Join(hwDir, "pwm1")
+			if pathExists(pwm1Path) {
+				topo.pwmOnlyPaths = append(topo.pwmOnlyPaths, pwm1Path)
+			}
+		}
+	}
+
+	cdevs, _ := filepath.Glob(filepath.Join(sysRoot, "class", "thermal", "cooling_device*"))
+	slices.Sort(cdevs)
+	for _, dir := range cdevs {
+		typeBytes, err := os.ReadFile(filepath.Join(dir, "type"))
+		if err != nil {
+			continue
+		}
+		devType := strings.ToLower(strings.TrimSpace(string(typeBytes)))
+		if !strings.Contains(devType, "fan") {
+			continue
+		}
+		curPath := filepath.Join(dir, "cur_state")
+		maxPath := filepath.Join(dir, "max_state")
+		if pathExists(curPath) && pathExists(maxPath) {
+			topo.coolingDevices = append(topo.coolingDevices, cachedCoolingDevice{
+				curStatePath: curPath,
+				maxStatePath: maxPath,
+			})
+		}
+	}
+
+	return topo
+}
+
+func (c *sysfsDiscoveryCache) getCoolings(sysRoot string, forceRefresh bool) *cachedCoolingTopology {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.now()
+	if !forceRefresh {
+		if entry, ok := c.coolings[sysRoot]; ok && !entry.dirty && now.Sub(entry.discoveredAt) < sysfsDiscoveryTTL {
+			return entry
+		}
+	}
+	entry := discoverCoolingTopology(sysRoot, now)
+	c.coolings[sysRoot] = entry
+	return entry
+}
+
+func (c *sysfsDiscoveryCache) markCoolingsDirty(sysRoot string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.coolings[sysRoot]; ok {
+		entry.dirty = true
+	}
+}
+
+// observeSysfsThermals inspects /sys/class/thermal/thermal_zone* and /sys/class/hwmon/hwmon*/temp*_input
+// in-process with zero subprocess forks, emitting CPU/SoC temperatures across RISC-V (StarFive sfctemp, ESWIN),
+// ARM64, and x86 (Intel coretemp, AMD k10temp/zenpower).
+func observeSysfsThermals(sysRoot string, event *core.CTDPayload) {
+	defaultSysfsCache.observeThermals(sysRoot, event)
+}
+
+func (c *sysfsDiscoveryCache) observeThermals(sysRoot string, event *core.CTDPayload) {
+	if event == nil || sysRoot == "" {
+		return
+	}
+
+	readPass := func(topo *cachedThermalTopology) (bestTemp float64, bestPrio int, readErr bool) {
+		for _, s := range topo.sensors {
+			if isHwmonTempFault(s.faultPath) {
+				continue
+			}
+			raw, err := os.ReadFile(s.tempPath)
+			if err != nil {
+				readErr = true
+				continue
+			}
+			tempC, ok := parseSysfsMillidegreeTemp(raw)
+			if !ok {
+				continue
+			}
+			if s.prio > bestPrio || (s.prio == bestPrio && tempC > bestTemp) {
+				bestPrio = s.prio
+				bestTemp = tempC
+			}
+		}
+		return bestTemp, bestPrio, readErr
+	}
+
+	topo := c.getThermals(sysRoot, false)
+	bestTemp, bestPrio, readErr := readPass(topo)
+	if readErr {
+		topo = c.getThermals(sysRoot, true)
+		bestTemp, bestPrio, readErr = readPass(topo)
+		if readErr {
+			c.markThermalsDirty(sysRoot)
+		}
+	}
+
+	if bestPrio > 0 {
+		event.AddMetric("soc_temp_c", bestTemp)
+		event.AddMetric("cpu_temp_c", bestTemp)
+	}
+}
+
+// observeSysfsCooling inspects Linux sysfs (/sys/class/hwmon and /sys/class/thermal)
+// in-process with zero subprocess forks, attaching CPU cooler fan speed (cpu_fan_rpm),
+// optional PWM duty cycle (cpu_fan_pwm_pct), and active host fan tachometers (fans_rpm).
+func observeSysfsCooling(sysRoot string, event *core.CTDPayload) {
+	defaultSysfsCache.observeCooling(sysRoot, event)
+}
+
+func (c *sysfsDiscoveryCache) observeCooling(sysRoot string, event *core.CTDPayload) {
+	if event == nil || sysRoot == "" {
+		return
+	}
+
+	readPass := func(topo *cachedCoolingTopology) (bestCPU *fanCandidate, bestPWMOnly *float64, fansRPM map[string]int, coolingFallback *float64, readErr bool) {
+		fansRPM = make(map[string]int)
+
+		for _, f := range topo.fans {
+			rpmBytes, err := os.ReadFile(f.inputPath)
+			if err != nil {
+				readErr = true
+				continue
+			}
+			rpm, err := strconv.Atoi(strings.TrimSpace(string(rpmBytes)))
+			if err != nil || rpm < 0 {
+				continue
+			}
+
+			var (
+				pwmPct float64
+				hasPWM bool
+			)
+			if f.hasPWMFile {
+				var pwmReadErr bool
+				pwmPct, hasPWM, pwmReadErr = readHwmonPWMPctChecked(f.pwmPath)
+				if pwmReadErr {
+					readErr = true
+				}
+			}
+
+			prio := classifyCPUCoolerPriority(f.key, f.rawLabel, f.index, rpm, f.dedicatedChip)
 			cand := fanCandidate{
-				key:      sensorKey,
-				index:    idx,
+				key:      f.key,
+				index:    f.index,
 				rpm:      rpm,
 				hasPWM:   hasPWM,
 				pwmPct:   pwmPct,
@@ -203,16 +432,51 @@ func observeSysfsCooling(sysRoot string, event *core.CTDPayload) {
 
 			// Record active, labeled, or dedicated controller fans while skipping
 			// unconnected 0-RPM Super I/O headers.
-			if rpm > 0 || rawLabel != "" || dedicatedCoolerChip {
-				fansRPM[sensorKey] = rpm
+			if rpm > 0 || f.rawLabel != "" || f.dedicatedChip {
+				fansRPM[f.key] = rpm
 			}
 		}
 
-		// Handle 2-wire / 3-wire SoC PWM coolers that expose pwm1 without a fan1_input tach wire.
-		if len(fanInputs) == 0 && dedicatedCoolerChip && bestPWMOnly == nil {
-			if pwmPct, ok := readHwmonPWMPct(filepath.Join(hwDir, "pwm1")); ok {
-				bestPWMOnly = &pwmPct
+		for _, pwmPath := range topo.pwmOnlyPaths {
+			pct, ok, pwmReadErr := readHwmonPWMPctChecked(pwmPath)
+			if pwmReadErr {
+				readErr = true
+				continue
 			}
+			if ok && bestPWMOnly == nil {
+				val := pct
+				bestPWMOnly = &val
+				break
+			}
+		}
+
+		if bestCPU == nil || !bestCPU.hasPWM {
+			if bestPWMOnly == nil {
+				for _, cdev := range topo.coolingDevices {
+					pct, ok, devReadErr := readCoolingDevicePct(cdev)
+					if devReadErr {
+						readErr = true
+						continue
+					}
+					if ok {
+						val := pct
+						coolingFallback = &val
+						break
+					}
+				}
+			}
+		}
+
+		return bestCPU, bestPWMOnly, fansRPM, coolingFallback, readErr
+	}
+
+	topo := c.getCoolings(sysRoot, false)
+	bestCPU, bestPWMOnly, fansRPM, coolingFallback, readErr := readPass(topo)
+	if readErr {
+		topo = c.getCoolings(sysRoot, true)
+		bestCPU, bestPWMOnly, fansRPM, coolingFallback, readErr = readPass(topo)
+		if readErr {
+			c.markCoolingsDirty(sysRoot)
 		}
 	}
 
@@ -235,10 +499,8 @@ func observeSysfsCooling(sysRoot string, event *core.CTDPayload) {
 
 	// Fallback to /sys/class/thermal/cooling_device* for kernel-governed PWM/GPIO fans
 	// when no hwmon PWM channel reported duty cycle.
-	if !hasPWMMetric {
-		if pct, ok := readThermalCoolingFanPct(sysRoot); ok {
-			event.AddMetric("cpu_fan_pwm_pct", pct)
-		}
+	if !hasPWMMetric && coolingFallback != nil {
+		event.AddMetric("cpu_fan_pwm_pct", *coolingFallback)
 	}
 }
 
@@ -304,56 +566,40 @@ func isBetterCPUCandidate(cand, cur *fanCandidate) bool {
 	return cand.index < cur.index
 }
 
-func readHwmonPWMPct(pwmPath string) (float64, bool) {
+func readHwmonPWMPctChecked(pwmPath string) (float64, bool, bool) {
 	raw, err := os.ReadFile(pwmPath)
 	if err != nil {
-		return 0, false
+		return 0, false, true
 	}
-	val, err := strconv.ParseFloat(strings.TrimSpace(string(raw)), 64)
-	if err != nil || val < 0 {
-		return 0, false
+	val, ok := parseFiniteFloat(string(raw))
+	if !ok || val < 0 {
+		return 0, false, false
 	}
 	pct := (val / 255.0) * 100.0
 	if pct > 100.0 {
 		pct = 100.0
 	}
-	return math.Round(pct*10) / 10, true
+	return math.Round(pct*10) / 10, true, false
 }
 
-func readThermalCoolingFanPct(sysRoot string) (float64, bool) {
-	cdevs, _ := filepath.Glob(filepath.Join(sysRoot, "class", "thermal", "cooling_device*"))
-	slices.Sort(cdevs)
-
-	for _, dir := range cdevs {
-		typeBytes, err := os.ReadFile(filepath.Join(dir, "type"))
-		if err != nil {
-			continue
-		}
-		devType := strings.ToLower(strings.TrimSpace(string(typeBytes)))
-		if !strings.Contains(devType, "fan") {
-			continue
-		}
-
-		curBytes, errCur := os.ReadFile(filepath.Join(dir, "cur_state"))
-		maxBytes, errMax := os.ReadFile(filepath.Join(dir, "max_state"))
-		if errCur != nil || errMax != nil {
-			continue
-		}
-
-		cur, errCur := strconv.ParseFloat(strings.TrimSpace(string(curBytes)), 64)
-		max, errMax := strconv.ParseFloat(strings.TrimSpace(string(maxBytes)), 64)
-		if errCur != nil || errMax != nil || max <= 0 || cur < 0 {
-			continue
-		}
-
-		pct := (cur / max) * 100.0
-		if pct > 100.0 {
-			pct = 100.0
-		}
-		return math.Round(pct*10) / 10, true
+func readCoolingDevicePct(cdev cachedCoolingDevice) (float64, bool, bool) {
+	curBytes, errCur := os.ReadFile(cdev.curStatePath)
+	maxBytes, errMax := os.ReadFile(cdev.maxStatePath)
+	if errCur != nil || errMax != nil {
+		return 0, false, true
 	}
 
-	return 0, false
+	cur, okCur := parseFiniteFloat(string(curBytes))
+	maxVal, okMax := parseFiniteFloat(string(maxBytes))
+	if !okCur || !okMax || maxVal <= 0 || cur < 0 {
+		return 0, false, false
+	}
+
+	pct := (cur / maxVal) * 100.0
+	if pct > 100.0 {
+		pct = 100.0
+	}
+	return math.Round(pct*10) / 10, true, false
 }
 
 func sanitizeSensorToken(s string) string {

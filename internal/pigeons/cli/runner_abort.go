@@ -50,7 +50,7 @@ var runnerAbortCmd = &cobra.Command{
 		}
 
 		brokerURL := resolveBrokerURLForConfig(cfg)
-		if err := publishRunnerRequestWithConfig(cfg, brokerURL, req); err != nil {
+		if err := publishRunnerRequestWithConfig(cmd.Context(), cfg, brokerURL, req); err != nil {
 			return err
 		}
 

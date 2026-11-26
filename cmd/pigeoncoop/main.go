@@ -23,6 +23,13 @@ func main() {
 	)
 	flag.Parse()
 
+	mqttModeFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "mqtt-mode" {
+			mqttModeFlagSet = true
+		}
+	})
+
 	cfg, err := config.LoadCoopConfig(*cfgPath)
 	if err != nil {
 		log.Fatalf("Failed loading PigeonCoop config: %v", err)
@@ -33,8 +40,21 @@ func main() {
 			log.Fatalf("Invalid --mesh-name: %v", err)
 		}
 	}
-	if strings.TrimSpace(*brokerMode) != "" {
-		cfg.MQTT.Mode = strings.ToLower(strings.TrimSpace(*brokerMode))
+	if mqttModeFlagSet {
+		mode := strings.ToLower(strings.TrimSpace(*brokerMode))
+		if mode != "embedded" && mode != "external" {
+			log.Fatalf("Invalid --mqtt-mode %q: must be 'embedded' or 'external'", *brokerMode)
+		}
+		cfg.MQTT.Mode = mode
+	} else {
+		mode := strings.ToLower(strings.TrimSpace(cfg.MQTT.Mode))
+		if mode == "" {
+			mode = "embedded"
+		}
+		if mode != "embedded" && mode != "external" {
+			log.Fatalf("Invalid mqtt.mode %q: must be 'embedded' or 'external'", cfg.MQTT.Mode)
+		}
+		cfg.MQTT.Mode = mode
 	}
 	if strings.TrimSpace(*dbURL) != "" {
 		cfg.Database.URL = strings.TrimSpace(*dbURL)
@@ -54,7 +74,7 @@ func main() {
 	}
 	defer srv.Stop()
 
-	log.Printf("%s active on %s [mesh=%s]. Press Ctrl+C to stop.", cfg.Brand.CoopName, srv.BrokerURL(), srv.MeshName())
+	log.Printf("%s active on %s [mesh=%s]. Press Ctrl+C to stop.", cfg.Brand.CoopName, config.RedactURL(srv.BrokerURL()), srv.MeshName())
 	<-ctx.Done()
 
 	log.Printf("Shutting down %s gracefully...", cfg.Brand.CoopName)

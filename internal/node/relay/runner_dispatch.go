@@ -17,8 +17,10 @@ import (
 )
 
 type activeRun struct {
-	id     uint64
-	cancel context.CancelFunc
+	id        uint64
+	requestID string
+	cancel    context.CancelFunc
+	aborting  bool
 }
 
 func (c *MQTTClient) lookupRunner(name string) (runner.Runner, string, bool) {
@@ -28,6 +30,24 @@ func (c *MQTTClient) lookupRunner(name string) (runner.Runner, string, bool) {
 	}
 	task, ok := runner.Get(name)
 	return task, runner.CanonicalKey(name), ok
+}
+
+func publishRunnerError(pub core.TelemetryPublisher, nodeID, runnerName, requestID, errMsg string) {
+	if pub == nil {
+		return
+	}
+	comp := "runner:" + runnerName
+	if err := core.ValidateTopicToken(comp); err != nil {
+		log.Printf("[Runner Dispatch] Dropped runner-error event due to invalid component token %q: %v", comp, err)
+		return
+	}
+	errEv := core.NewCTDPayload(nodeID, comp, "runner-error").
+		WithPillar(core.PillarRunner).
+		AddParam("error", errMsg)
+	if requestID != "" {
+		errEv.AddParam("request_id", requestID)
+	}
+	_ = pub.Publish(errEv)
 }
 
 // WaitRunners stops accepting new runner dispatches and waits up to timeout for active runner
@@ -80,9 +100,9 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		for key, entry := range activeRunners {
+		for _, entry := range activeRunners {
+			entry.aborting = true
 			entry.cancel()
-			delete(activeRunners, key)
 		}
 	}()
 
@@ -97,6 +117,10 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 			log.Printf("[Runner Dispatch] Envelope validation failed: %v", err)
 			return
 		}
+		if err := core.ValidateTopicToken(env.Runner); err != nil {
+			log.Printf("[Runner Dispatch] Invalid runner topic token %q dropped: %v", env.Runner, err)
+			return
+		}
 
 		action := env.Action
 		if action == "" {
@@ -108,31 +132,32 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		if action == "abort" {
 			mu.Lock()
 			entry, active := activeRunners[runnerKey]
-			if active {
-				delete(activeRunners, runnerKey)
+			if !active {
+				mu.Unlock()
+				log.Printf("[Runner Dispatch] Abort ignored: %q (%s) is not currently running.", env.Runner, runnerKey)
+				return
 			}
+			if env.RequestID != "" && entry.requestID != env.RequestID {
+				activeReqID := entry.requestID
+				mu.Unlock()
+				log.Printf("[Runner Dispatch] Abort ignored: %q (%s) request_id mismatch (abort=%q, active=%q).", env.Runner, runnerKey, env.RequestID, activeReqID)
+				return
+			}
+			alreadyAborting := entry.aborting
+			entry.aborting = true
+			cancelFn := entry.cancel
 			mu.Unlock()
 
-			if active {
+			if !alreadyAborting {
 				log.Printf("[Runner Dispatch] ABORT SIGNAL RECEIVED: Killing %q (%s) on %s", env.Runner, runnerKey, nodeID)
-				entry.cancel()
-			} else {
-				log.Printf("[Runner Dispatch] Abort ignored: %q (%s) is not currently running.", env.Runner, runnerKey)
 			}
+			cancelFn()
 			return
 		}
 
 		if !exists {
 			log.Printf("[Runner Dispatch] Unknown runner requested: %q", env.Runner)
-			if pub != nil {
-				errEv := core.NewCTDPayload(nodeID, "runner:"+env.Runner, "runner-error").
-					WithPillar(core.PillarRunner).
-					AddParam("error", "unknown runner")
-				if env.RequestID != "" {
-					errEv.AddParam("request_id", env.RequestID)
-				}
-				_ = pub.Publish(errEv)
-			}
+			publishRunnerError(pub, nodeID, env.Runner, env.RequestID, "unknown runner")
 			return
 		}
 
@@ -144,10 +169,15 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		}
 
 		mu.Lock()
-		if _, active := activeRunners[runnerKey]; active {
+		if cur, active := activeRunners[runnerKey]; active {
+			aborting := cur.aborting
 			mu.Unlock()
 			c.runnerMu.Unlock()
-			log.Printf("[Runner Dispatch] Runner %q (%s) is already active. Ignoring duplicate start.", env.Runner, runnerKey)
+			if aborting {
+				log.Printf("[Runner Dispatch] Runner %q (%s) is currently aborting teardown. Ignoring concurrent start.", env.Runner, runnerKey)
+			} else {
+				log.Printf("[Runner Dispatch] Runner %q (%s) is already active. Ignoring duplicate start.", env.Runner, runnerKey)
+			}
 			return
 		}
 
@@ -157,7 +187,11 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		}
 		runCtx, cancel := context.WithCancel(baseCtx)
 		runID := seq.Add(1)
-		activeRunners[runnerKey] = &activeRun{id: runID, cancel: cancel}
+		activeRunners[runnerKey] = &activeRun{
+			id:        runID,
+			requestID: env.RequestID,
+			cancel:    cancel,
+		}
 		mu.Unlock()
 
 		c.runnerWG.Add(1)
@@ -181,15 +215,7 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 				mu.Unlock()
 				if r := recover(); r != nil {
 					log.Printf("[Runner Dispatch] Runner %q panicked: %v", env.Runner, r)
-					if pub != nil {
-						errEv := core.NewCTDPayload(nodeID, "runner:"+env.Runner, "runner-error").
-							WithPillar(core.PillarRunner).
-							AddParam("error", fmt.Sprintf("panic: %v", r))
-						if env.RequestID != "" {
-							errEv.AddParam("request_id", env.RequestID)
-						}
-						_ = pub.Publish(errEv)
-					}
+					publishRunnerError(pub, nodeID, env.Runner, env.RequestID, fmt.Sprintf("panic: %v", r))
 				}
 			}()
 
@@ -201,29 +227,109 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 	}
 
 	subTimeout := c.effectiveSubscribeTimeout()
-	subscribeFn := func(client mqtt.Client) {
+
+	subscribeOnce := func(client mqtt.Client, nextConnCh <-chan struct{}) error {
 		tok := client.Subscribe(topic, 1, handler)
-		if !tok.WaitTimeout(subTimeout) {
-			log.Printf("[Runner Dispatch] Timed out subscribing to %s after %s", topic, subTimeout)
-			return
+		timer := time.NewTimer(subTimeout)
+		defer timer.Stop()
+		select {
+		case <-parentCtx.Done():
+			return parentCtx.Err()
+		case <-c.stopCh:
+			return errRelayClosed
+		case <-nextConnCh:
+			return fmt.Errorf("superseded by new connection generation")
+		case <-timer.C:
+			return fmt.Errorf("subscribe %s timed out after %s", topic, subTimeout)
+		case <-tok.Done():
+			if err := tok.Error(); err != nil {
+				return err
+			}
+			return nil
 		}
-		if err := tok.Error(); err != nil {
-			log.Printf("[Runner Dispatch] Failed subscribing to %s: %v", topic, err)
-			return
+	}
+
+	retrySubscribe := func(client mqtt.Client, gen uint64, nextConnCh <-chan struct{}, startAttempt int) {
+		attempt := startAttempt
+		for {
+			if parentCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-c.stopCh:
+				return
+			case <-nextConnCh:
+				return
+			default:
+			}
+			if gen != 0 && c.connGen.Load() != gen {
+				return
+			}
+
+			if attempt > startAttempt || startAttempt > 0 {
+				backoff := c.nextBackoff(attempt - 1)
+				sleepTimer := time.NewTimer(backoff)
+				select {
+				case <-parentCtx.Done():
+					sleepTimer.Stop()
+					return
+				case <-c.stopCh:
+					sleepTimer.Stop()
+					return
+				case <-nextConnCh:
+					sleepTimer.Stop()
+					return
+				case <-sleepTimer.C:
+				}
+			}
+
+			if gen != 0 && c.connGen.Load() != gen {
+				return
+			}
+
+			err := subscribeOnce(client, nextConnCh)
+			if err == nil {
+				log.Printf("[Runner Dispatch] Listening on control topic: %s", topic)
+				return
+			}
+			if parentCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-c.stopCh:
+				return
+			case <-nextConnCh:
+				return
+			default:
+			}
+			log.Printf("[Runner Dispatch] Subscribe to %s failed (gen=%d, attempt=%d): %v", topic, gen, attempt+1, err)
+			attempt++
 		}
-		log.Printf("[Runner Dispatch] Listening on control topic: %s", topic)
 	}
 
 	c.subMu.Lock()
-	c.onConnectSub = subscribeFn
+	c.onConnectSub = func(client mqtt.Client, gen uint64, nextConnCh <-chan struct{}) {
+		retrySubscribe(client, gen, nextConnCh, 0)
+	}
 	c.subMu.Unlock()
 
 	if c.client != nil && c.client.IsConnected() {
-		tok := c.client.Subscribe(topic, 1, handler)
-		if !tok.WaitTimeout(subTimeout) {
-			return fmt.Errorf("subscribe %s timed out after %s", topic, subTimeout)
-		}
-		if err := tok.Error(); err != nil {
+		gen, nextConnCh := c.connectionState()
+		if err := subscribeOnce(c.client, nextConnCh); err != nil {
+			c.onConnectMu.Lock()
+			select {
+			case <-c.stopCh:
+				c.onConnectMu.Unlock()
+				return err
+			default:
+			}
+			c.subWG.Add(1)
+			c.onConnectMu.Unlock()
+
+			go func() {
+				defer c.subWG.Done()
+				retrySubscribe(c.client, gen, nextConnCh, 1)
+			}()
 			return err
 		}
 		log.Printf("[Runner Dispatch] Listening on control topic: %s", topic)

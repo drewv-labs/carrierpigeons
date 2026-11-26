@@ -287,7 +287,7 @@ func TestEmbeddedBrokerAuthAndEdgeTopicACLs(t *testing.T) {
 	//    but CANNOT publish a RunnerRequestCTD to `pigeons/requests/runner`.
 	edgeCli := mqtt.NewClient(mqtt.NewClientOptions().
 		AddBroker(emb.LocalClientURL()).
-		SetClientID("edge-01").
+		SetClientID("pigeoneer-edge-01").
 		SetUsername("edge_node").
 		SetPassword("edge_secret"))
 	if tok := edgeCli.Connect(); tok.WaitTimeout(2*time.Second) && tok.Error() != nil {
@@ -572,13 +572,13 @@ func TestSubscriberQueueCapsAndDropCounters(t *testing.T) {
 	}
 	subLive.Disconnect()
 
-	// Saturate telemetryQueue, ctrlQueue, and runnerReqQueue deterministically without workers draining them.
+	// Saturate telemetryQueue, ctrlQueues, and runnerReqQueue deterministically without workers draining them.
 	sub := &Subscriber{
 		brand:          brand.Default(),
 		topicRoot:      "pigeons",
 		telemetryQueue: make(chan rawTelemetryMsg, 2),
 		telemetryStop:  make(chan struct{}),
-		ctrlQueue:      make(chan func(), 2),
+		ctrlQueues:     []chan func(){make(chan func(), 2)},
 		ctrlStop:       make(chan struct{}),
 		runnerReqQueue: make(chan rawRunnerReqMsg, 2),
 		runnerReqStop:  make(chan struct{}),
@@ -633,19 +633,19 @@ func TestRunnerRequestIsolationUnderControlFlood(t *testing.T) {
 		brand:            brand.Default(),
 		topicRoot:        "pigeons",
 		telemetryStop:    make(chan struct{}),
-		ctrlQueue:        make(chan func(), 2),
+		ctrlQueues:       []chan func(){make(chan func(), 2)},
 		ctrlStop:         make(chan struct{}),
 		runnerReqQueue:   make(chan rawRunnerReqMsg, 8),
 		runnerReqStop:    make(chan struct{}),
 		runnerPubTimeout: 500 * time.Millisecond,
 	}
 	sub.ctrlWG.Add(1)
-	go sub.controlWorker()
+	go sub.controlWorker(sub.ctrlQueues[0])
 	sub.runnerReqWG.Add(1)
 	go sub.runnerReqWorker()
 
 	// Block the single control worker and saturate ctrlQueue with hello/status flood.
-	sub.ctrlQueue <- func() { <-gate }
+	sub.ctrlQueues[0] <- func() { <-gate }
 	ctrlHandler := sub.enqueueControl(func(string, []byte) {})
 	for range 10 {
 		ctrlHandler(nil, &fakeMQTTMessage{topic: "pigeons/registry/flood/status", payload: []byte("ONLINE")})

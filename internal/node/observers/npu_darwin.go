@@ -24,12 +24,16 @@ func observeNPUPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID
 		return
 	}
 	log.Println("[NPU Observer] Apple Neural Engine detected. Booting shared ANE observer.")
-	go observeNPUDarwin(ctx, pub, nodeID)
+	observeNPUDarwin(ctx, pub, nodeID)
 }
 
 func observeNPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	observeNPUDarwinWithSample(ctx, pub, nodeID, sampleDarwinPowermetrics)
+}
+
+func observeNPUDarwinWithSample(ctx context.Context, pub core.TelemetryPublisher, nodeID string, sampleFn func(context.Context) (string, error)) {
 	runPeriodicObserver(ctx, true, func() {
-		out, err := sampleDarwinPowermetrics(ctx)
+		out, err := sampleFn(ctx)
 		if err != nil {
 			return
 		}

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
@@ -13,9 +14,15 @@ import (
 )
 
 type fakeAgentSafeStore struct {
-	pmvs         map[string]db.PMVRecord
-	materialized map[string]string
-	failExplain  string
+	pmvs            map[string]db.PMVRecord
+	materialized    map[string]string
+	failExplain     string
+	failProbe       bool
+	failMaterialize bool
+	probeQueries    []string
+	sampleRows      []map[string]any
+	saveCalls       int
+	updateCalls     int
 }
 
 func newFakeAgentSafeStore() *fakeAgentSafeStore {
@@ -41,8 +48,15 @@ func (f *fakeAgentSafeStore) GetLedgerActivity(context.Context, int) ([]db.Ledge
 	return nil, nil
 }
 func (f *fakeAgentSafeStore) QueryReadOnlyMaps(_ context.Context, sql string, _ ...any) ([]map[string]any, error) {
+	f.probeQueries = append(f.probeQueries, sql)
 	if _, err := db.ValidateSelectOnlySQL(sql); err != nil {
 		return nil, err
+	}
+	if f.failProbe {
+		return nil, errors.New("probe execution failed")
+	}
+	if f.sampleRows != nil {
+		return f.sampleRows, nil
 	}
 	return []map[string]any{{"node_id": "rv64-coop-01", "avg_temp_c": 46.2}}, nil
 }
@@ -57,21 +71,29 @@ func (f *fakeAgentSafeStore) ExplainReadOnly(_ context.Context, selectSQL string
 }
 func (f *fakeAgentSafeStore) EnsureMathSchema(context.Context) error { return nil }
 func (f *fakeAgentSafeStore) SavePMVDraft(_ context.Context, rec db.PMVRecord) (*db.PMVRecord, error) {
+	f.saveCalls++
 	norm, err := db.NormalizePMVName(rec.ViewName)
 	if err != nil {
 		return nil, err
 	}
 	rec.ViewName = norm
-	rec.Version = 1
-	rec.CreatedAt = time.Now().UTC()
-	rec.UpdatedAt = rec.CreatedAt
+	if existing, ok := f.pmvs[norm]; ok {
+		rec.Version = existing.Version + 1
+		rec.CreatedAt = existing.CreatedAt
+	} else {
+		rec.Version = 1
+		rec.CreatedAt = time.Now().UTC()
+	}
+	rec.UpdatedAt = time.Now().UTC()
 	f.pmvs[norm] = rec
 	cp := rec
 	return &cp, nil
 }
 func (f *fakeAgentSafeStore) UpdatePMVState(_ context.Context, rec db.PMVRecord) error {
+	f.updateCalls++
 	existing := f.pmvs[rec.ViewName]
 	rec.RawIntentSQL = existing.RawIntentSQL // Raw intent is immutable once cached in draft!
+	rec.Version = existing.Version
 	f.pmvs[rec.ViewName] = rec
 	return nil
 }
@@ -92,6 +114,9 @@ func (f *fakeAgentSafeStore) ListPMVs(context.Context) ([]db.PMVRecord, error) {
 	return out, nil
 }
 func (f *fakeAgentSafeStore) MaterializePMV(_ context.Context, viewName, selectSQL string) error {
+	if f.failMaterialize {
+		return errors.New("materialize DDL failed")
+	}
 	norm, err := db.NormalizePMVName(viewName)
 	if err != nil {
 		return err
@@ -363,4 +388,206 @@ func TestSparklineAndMultiLineGraphRender(t *testing.T) {
 	if strings.Count(graph, "\n") != 3 {
 		t.Fatalf("expected 4-line plot, got:\n%s", graph)
 	}
+}
+
+type capturingVerifierLLM struct {
+	optimizeReply string
+	verifyReply   string
+	verifyPrompts []string
+	calls         int
+}
+
+func (c *capturingVerifierLLM) Chat(_ context.Context, _ string, hist []llm.Message) (string, error) {
+	c.calls++
+	if c.calls == 1 {
+		return c.optimizeReply, nil
+	}
+	if len(hist) > 0 {
+		c.verifyPrompts = append(c.verifyPrompts, hist[len(hist)-1].Content)
+	}
+	return c.verifyReply, nil
+}
+
+func (c *capturingVerifierLLM) StreamChat(ctx context.Context, sys string, hist []llm.Message) (<-chan string, error) {
+	reply, err := c.Chat(ctx, sys, hist)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan string, 1)
+	ch <- reply
+	close(ch)
+	return ch, nil
+}
+
+func TestSubmitAndCertifyPMVTrailingCommentProbeAndUTF8Truncation(t *testing.T) {
+	t.Run("trailing SQL line comment wraps cleanly with newline before closing paren", func(t *testing.T) {
+		store := newFakeAgentSafeStore()
+		eng := NewEngine(store)
+
+		rawSQL := "SELECT node_id FROM ctd_nodes -- trailing comment"
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "trailing_comment_view", rawSQL, nil)
+		if err != nil {
+			t.Fatalf("expected trailing comment query to certify cleanly, got %v", err)
+		}
+		if rec.Status != "certified" {
+			t.Fatalf("expected certified status, got %q", rec.Status)
+		}
+		if len(store.probeQueries) != 1 {
+			t.Fatalf("expected 1 probe query, got %d", len(store.probeQueries))
+		}
+		wantProbe := "SELECT * FROM (SELECT node_id FROM ctd_nodes -- trailing comment\n) AS _pmv_cert_probe LIMIT 5"
+		if store.probeQueries[0] != wantProbe {
+			t.Fatalf("unexpected probeQuery:\n got: %q\nwant: %q", store.probeQueries[0], wantProbe)
+		}
+	})
+
+	t.Run("sampleJSON truncates cleanly on multi-byte UTF-8 rune boundaries", func(t *testing.T) {
+		for offset := range 4 {
+			store := newFakeAgentSafeStore()
+			store.sampleRows = []map[string]any{
+				{
+					"pad":  strings.Repeat("a", offset),
+					"note": strings.Repeat("🔭", 1100), // 4-byte UTF-8 runes crossing byte 4096
+				},
+			}
+			eng := NewEngine(store)
+			opt := &capturingVerifierLLM{
+				optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes\n```",
+				verifyReply:   "CERTIFIED: UTF-8 boundary check passed.",
+			}
+			rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "utf8_sample_view", "SELECT node_id FROM ctd_nodes", opt)
+			if err != nil {
+				t.Fatalf("offset=%d: SubmitAndCertifyPMV failed: %v", offset, err)
+			}
+			if rec.Status != "certified" || len(opt.verifyPrompts) != 1 {
+				t.Fatalf("offset=%d: expected 1 verify prompt, got %d", offset, len(opt.verifyPrompts))
+			}
+			prompt := opt.verifyPrompts[0]
+			startIdx := strings.Index(prompt, "<untrusted_sample_rows_")
+			if startIdx < 0 {
+				t.Fatalf("offset=%d: missing sample rows delimiter in prompt", offset)
+			}
+			openEnd := strings.Index(prompt[startIdx:], ">\n")
+			closeStart := strings.LastIndex(prompt, "\n</untrusted_sample_rows_")
+			if openEnd < 0 || closeStart <= startIdx+openEnd+2 {
+				t.Fatalf("offset=%d: malformed sample rows enclosure", offset)
+			}
+			samplePayload := prompt[startIdx+openEnd+2 : closeStart]
+			if len(samplePayload) > 4096 {
+				t.Fatalf("offset=%d: expected sample payload <= 4096 bytes, got %d", offset, len(samplePayload))
+			}
+			if !utf8.ValidString(samplePayload) {
+				t.Fatalf("offset=%d: sample payload split mid-rune (invalid UTF-8)", offset)
+			}
+		}
+
+		// Direct unit check on 2-byte, 3-byte, and 4-byte runes across exact boundary.
+		for _, glyph := range []string{"°", "▁", "🔭"} {
+			buf := []byte(strings.Repeat(glyph, 10))
+			for limit := 1; limit <= len(buf); limit++ {
+				trimmed := truncateUTF8Bytes(buf, limit)
+				if len(trimmed) > limit {
+					t.Fatalf("glyph=%s limit=%d: truncated len %d > limit", glyph, limit, len(trimmed))
+				}
+				if !utf8.Valid(trimmed) {
+					t.Fatalf("glyph=%s limit=%d: invalid UTF-8 result", glyph, limit)
+				}
+			}
+		}
+	})
+}
+
+func TestSubmitAndCertifyPMVPreservesExistingCertifiedRowBeforeValidationPasses(t *testing.T) {
+	setupCertified := func(t *testing.T) (*fakeAgentSafeStore, *Engine, string) {
+		t.Helper()
+		store := newFakeAgentSafeStore()
+		eng := NewEngine(store)
+		origSQL := "SELECT node_id FROM ctd_nodes"
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "live_health", origSQL, nil)
+		if err != nil || rec.Status != "certified" || rec.Version != 1 {
+			t.Fatalf("initial certification failed: rec=%+v err=%v", rec, err)
+		}
+		return store, eng, origSQL
+	}
+
+	assertCertifiedUntouched := func(t *testing.T, store *fakeAgentSafeStore, origSQL string, savesBefore, updatesBefore int) {
+		t.Helper()
+		if store.saveCalls != savesBefore || store.updateCalls != updatesBefore {
+			t.Fatalf("existing certified pmv_catalog row was mutated (saves %d->%d, updates %d->%d)",
+				savesBefore, store.saveCalls, updatesBefore, store.updateCalls)
+		}
+		persisted, ok := store.pmvs["pmv_live_health"]
+		if !ok || persisted.Status != "certified" || persisted.RawIntentSQL != origSQL || persisted.Version != 1 {
+			t.Fatalf("expected existing certified catalog row preserved, got %+v (ok=%v)", persisted, ok)
+		}
+		if store.materialized["pmv_live_health"] != origSQL {
+			t.Fatalf("expected live materialized SQL preserved, got %q", store.materialized["pmv_live_health"])
+		}
+	}
+
+	t.Run("ExplainReadOnly failure leaves certified catalog row untouched", func(t *testing.T) {
+		store, eng, origSQL := setupCertified(t)
+		store.failExplain = "broken_col"
+		savesBefore, updatesBefore := store.saveCalls, store.updateCalls
+
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "live_health", "SELECT broken_col FROM ctd_nodes", nil)
+		if err == nil || rec == nil || rec.Status != "failed" {
+			t.Fatalf("expected failed result, got rec=%+v err=%v", rec, err)
+		}
+		assertCertifiedUntouched(t, store, origSQL, savesBefore, updatesBefore)
+	})
+
+	t.Run("sample probe failure leaves certified catalog row untouched", func(t *testing.T) {
+		store, eng, origSQL := setupCertified(t)
+		store.failProbe = true
+		savesBefore, updatesBefore := store.saveCalls, store.updateCalls
+
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "live_health", "SELECT node_id, status FROM ctd_nodes", nil)
+		if err == nil || rec == nil || rec.Status != "failed" {
+			t.Fatalf("expected probe failure, got rec=%+v err=%v", rec, err)
+		}
+		assertCertifiedUntouched(t, store, origSQL, savesBefore, updatesBefore)
+	})
+
+	t.Run("LLM post-check rejection leaves certified catalog row untouched", func(t *testing.T) {
+		store, eng, origSQL := setupCertified(t)
+		savesBefore, updatesBefore := store.saveCalls, store.updateCalls
+		rejectLLM := &stubOptimizerLLM{
+			optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes LIMIT 1\n```",
+			verifyReply:   "REJECTED: drops rows.",
+		}
+
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "live_health", "SELECT node_id, status FROM ctd_nodes", rejectLLM)
+		if err == nil || rec == nil || rec.Status != "failed" {
+			t.Fatalf("expected rejection failure, got rec=%+v err=%v", rec, err)
+		}
+		assertCertifiedUntouched(t, store, origSQL, savesBefore, updatesBefore)
+	})
+
+	t.Run("MaterializePMV failure leaves certified catalog row untouched", func(t *testing.T) {
+		store, eng, origSQL := setupCertified(t)
+		store.failMaterialize = true
+		savesBefore, updatesBefore := store.saveCalls, store.updateCalls
+
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "live_health", "SELECT node_id, status FROM ctd_nodes", nil)
+		if err == nil || rec == nil || rec.Status != "failed" {
+			t.Fatalf("expected materialize failure, got rec=%+v err=%v", rec, err)
+		}
+		assertCertifiedUntouched(t, store, origSQL, savesBefore, updatesBefore)
+	})
+
+	t.Run("valid re-submission upgrades certified view and increments version", func(t *testing.T) {
+		store, eng, _ := setupCertified(t)
+		newSQL := "SELECT node_id, status FROM ctd_nodes"
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "live_health", newSQL, nil)
+		if err != nil {
+			t.Fatalf("valid re-submission failed: %v", err)
+		}
+		if rec.Status != "certified" || rec.Version != 2 || rec.RawIntentSQL != newSQL {
+			t.Fatalf("unexpected upgraded certified record: %+v", rec)
+		}
+		if store.materialized["pmv_live_health"] != newSQL {
+			t.Fatalf("expected updated materialized SQL, got %q", store.materialized["pmv_live_health"])
+		}
+	})
 }

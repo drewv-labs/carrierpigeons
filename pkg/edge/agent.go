@@ -20,6 +20,8 @@ import (
 	_ "github.com/drewv-labs/carrierpigeons/internal/node/runners"
 )
 
+const stopWaitTimeout = 2 * time.Second
+
 // Options customizes an embedded or standalone Edge Agent instance for SDK callers.
 type Options struct {
 	Brand            brand.Spec
@@ -27,6 +29,7 @@ type Options struct {
 	Username         string
 	Password         string
 	DisableObservers bool
+	MaxSpoolBytes    int64
 	Meta             map[string]string
 	ExtraObservers   []observer.Observer
 	ExtraRunners     []runner.Runner
@@ -43,10 +46,16 @@ type Agent struct {
 	obsReg    *observer.Registry
 	runnerReg *runner.Registry
 	pauseCtrl *observer.PauseController
-	relay     *relay.MQTTClient
 
-	stopOnce sync.Once
-	cancel   context.CancelFunc
+	mu        sync.Mutex
+	starting  bool
+	started   bool
+	stopped   bool
+	startDone chan struct{}
+	stopDone  chan struct{}
+	cancel    context.CancelFunc
+	relay     *relay.MQTTClient
+	obsWG     sync.WaitGroup
 }
 
 // New creates a configured Edge Agent ready to Start(ctx) using isolated per-instance Observer & Runner registries.
@@ -101,6 +110,10 @@ func (a *Agent) PauseController() *observer.PauseController {
 
 // Start connects (or spools offline) to the MQTT broker, binds Runner control topics, and launches Observers.
 func (a *Agent) Start(parentCtx context.Context) error {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
 	mqttAuth := a.cfg.EffectiveMQTTAuth()
 	username := strings.TrimSpace(a.opts.Username)
 	if username == "" {
@@ -111,6 +124,16 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		password = mqttAuth.Password
 	}
 
+	a.mu.Lock()
+	if a.started || a.starting {
+		a.mu.Unlock()
+		return fmt.Errorf("edge agent already started")
+	}
+	if a.stopped {
+		a.mu.Unlock()
+		return fmt.Errorf("edge agent already stopped")
+	}
+
 	tlsCfg, err := config.BuildMQTTTLSConfig(
 		mqttAuth.TLSCAFile,
 		mqttAuth.TLSCertFile,
@@ -118,12 +141,17 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		mqttAuth.TLSInsecureSkipVerify,
 	)
 	if err != nil {
+		a.mu.Unlock()
 		return fmt.Errorf("configure edge MQTT TLS: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(parentCtx)
-	a.cancel = cancel
 	ctx = observer.WithPauseController(ctx, a.pauseCtrl)
+	startDone := make(chan struct{})
+	a.starting = true
+	a.cancel = cancel
+	a.startDone = startDone
+	a.mu.Unlock()
 
 	execPolicy := runner.ExecutionPolicy{
 		AllowEphemeral:      a.cfg.Runners.AllowEphemeral,
@@ -132,13 +160,14 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		MaxTimeoutSec:       a.cfg.Runners.MaxTimeoutSec,
 	}
 
-	a.relay = relay.NewMQTTClientWithOptions(relay.Options{
+	r := relay.NewMQTTClientWithOptions(relay.Options{
 		BrokerURL:       a.cfg.BrokerURL,
 		NodeID:          a.cfg.NodeID,
 		ClientPrefix:    a.opts.ClientPrefix,
 		TopicPrefix:     a.cfg.TopicPrefix,
 		Brand:           a.cfg.Brand,
 		SpoolCapacity:   a.cfg.SpoolCapacity,
+		MaxSpoolBytes:   a.opts.MaxSpoolBytes,
 		BootTags:        a.cfg.Tags,
 		Username:        username,
 		Password:        password,
@@ -149,40 +178,153 @@ func (a *Agent) Start(parentCtx context.Context) error {
 		PauseController: a.pauseCtrl,
 	})
 
+	a.mu.Lock()
+	if a.stopped {
+		a.starting = false
+		close(startDone)
+		a.mu.Unlock()
+		cancel()
+		r.Disconnect()
+		return fmt.Errorf("edge agent stopped during startup")
+	}
+
+	a.relay = r
 	if a.cfg.Runners.Enabled {
-		if err := a.relay.ListenForRunners(ctx, a.cfg.NodeID, a.relay); err != nil {
+		if err := r.ListenForRunners(ctx, a.cfg.NodeID, r); err != nil {
 			log.Printf("[%s] Runner control bind deferred until broker reconnect: %v", a.cfg.Brand.EdgeName, err)
 		}
 	}
 
 	if !a.opts.DisableObservers {
-		active := observers.StartConfiguredWithRegistry(ctx, a.cfg.NodeID, a.relay, a.cfg.Observers, a.cfg.ParsedPollInterval(), a.obsReg)
+		active := a.startObserversLocked(ctx, r)
 		log.Printf("[%s] Active observers on %q (tags=%v, spool=%d): %v",
 			a.cfg.Brand.EdgeName, a.cfg.NodeID, a.cfg.Tags, a.cfg.SpoolCapacity, active)
 	}
 
+	a.started = true
+	a.starting = false
+	close(startDone)
+	a.mu.Unlock()
+
 	return nil
+}
+
+func (a *Agent) startObserversLocked(ctx context.Context, r *relay.MQTTClient) []string {
+	gatedPub := observer.NewGatedPublisher(r, a.pauseCtrl)
+	obsCtx := observers.WithPollInterval(ctx, a.cfg.ParsedPollInterval())
+
+	var active []string
+	remCfg := a.cfg.Observers
+
+	if remCfg.OS {
+		if hostObs, ok := a.obsReg.Get("host-os"); ok {
+			remCfg.OS = false
+			active = append(active, "host-os")
+			a.obsWG.Add(1)
+			go func() {
+				defer a.obsWG.Done()
+				hostObs.Observe(obsCtx, a.cfg.NodeID, gatedPub)
+			}()
+		}
+	}
+
+	if remCfg.Net && remCfg.GPU && remCfg.NPU {
+		if adaptersObs, ok := a.obsReg.Get("adapters"); ok {
+			remCfg.Net = false
+			remCfg.GPU = false
+			remCfg.NPU = false
+			active = append(active, "gpu", "npu", "net")
+			a.obsWG.Add(1)
+			go func() {
+				defer a.obsWG.Done()
+				adaptersObs.Observe(obsCtx, a.cfg.NodeID, gatedPub)
+			}()
+		}
+	}
+
+	if remCfg != (config.ObserversConfig{}) {
+		subActive := observers.StartConfiguredWithRegistry(ctx, a.cfg.NodeID, r, remCfg, a.cfg.ParsedPollInterval(), observer.NewRegistry())
+		active = append(active, subActive...)
+	}
+
+	for _, name := range a.obsReg.Names() {
+		if name == "host-os" || name == "adapters" {
+			continue
+		}
+		if custom, ok := a.obsReg.Get(name); ok {
+			active = append(active, name)
+			a.obsWG.Add(1)
+			go func(obs observer.Observer) {
+				defer a.obsWG.Done()
+				obs.Observe(obsCtx, a.cfg.NodeID, gatedPub)
+			}(custom)
+		}
+	}
+
+	return active
 }
 
 // Publish emits a custom CTD payload through the agent's ring-buffered MQTT relay.
 func (a *Agent) Publish(p *core.CTDPayload) error {
-	if a.relay == nil {
+	a.mu.Lock()
+	r := a.relay
+	a.mu.Unlock()
+	if r == nil {
 		return nil
 	}
-	return a.relay.Publish(p)
+	return r.Publish(p)
 }
 
-// Stop cancels observers/runners, waits briefly for runner bookends, and gracefully disconnects the MQTT relay.
+// Stop cancels observers/runners, joins observer and runner goroutines within bounded timeouts,
+// and gracefully disconnects the MQTT relay.
 func (a *Agent) Stop() {
-	a.stopOnce.Do(func() {
-		if a.cancel != nil {
-			a.cancel()
+	a.mu.Lock()
+	if a.stopped {
+		sd := a.stopDone
+		a.mu.Unlock()
+		if sd != nil {
+			<-sd
 		}
-		if a.relay != nil {
-			if !a.relay.WaitRunners(2 * time.Second) {
-				log.Printf("[%s] Timed out waiting for active runners to flush bookends before disconnect", a.cfg.Brand.EdgeName)
-			}
-			a.relay.Disconnect()
+		return
+	}
+	a.stopped = true
+	sd := make(chan struct{})
+	a.stopDone = sd
+	cancel := a.cancel
+	starting := a.starting
+	startDone := a.startDone
+	a.mu.Unlock()
+
+	defer close(sd)
+
+	if cancel != nil {
+		cancel()
+	}
+	if starting && startDone != nil {
+		<-startDone
+	}
+
+	a.mu.Lock()
+	r := a.relay
+	a.mu.Unlock()
+
+	obsDone := make(chan struct{})
+	go func() {
+		a.obsWG.Wait()
+		close(obsDone)
+	}()
+	timer := time.NewTimer(stopWaitTimeout)
+	select {
+	case <-obsDone:
+		timer.Stop()
+	case <-timer.C:
+		log.Printf("[%s] Timed out waiting for active observers to exit before disconnect", a.cfg.Brand.EdgeName)
+	}
+
+	if r != nil {
+		if !r.WaitRunners(stopWaitTimeout) {
+			log.Printf("[%s] Timed out waiting for active runners to flush bookends before disconnect", a.cfg.Brand.EdgeName)
 		}
-	})
+		r.Disconnect()
+	}
 }

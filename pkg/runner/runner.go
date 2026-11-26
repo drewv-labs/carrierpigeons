@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -176,6 +177,9 @@ func (e Envelope) Validate() error {
 	if strings.TrimSpace(e.Runner) == "" {
 		return fmt.Errorf("missing runner execution name")
 	}
+	if err := core.ValidateTopicToken(e.Runner); err != nil {
+		return fmt.Errorf("invalid runner execution name: %w", err)
+	}
 	if e.Action != "" && e.Action != "start" && e.Action != "abort" {
 		return fmt.Errorf("invalid action: %s", e.Action)
 	}
@@ -191,10 +195,61 @@ type EphemeralSpec struct {
 	Env         map[string]string `json:"env,omitempty"`
 }
 
+// NormalizeInterpreter normalizes an ephemeral interpreter token (defaulting empty to "sh")
+// and returns "" if the token is syntactically invalid (e.g., "." or "..").
+func NormalizeInterpreter(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "sh"
+	}
+	base := strings.ToLower(strings.TrimSpace(filepath.Base(trimmed)))
+	if base == "" || base == "." || base == ".." || base == string(filepath.Separator) {
+		return ""
+	}
+	return base
+}
+
 // ComputeScriptSHA256 returns the lowercase hex SHA-256 digest of a script body.
 func ComputeScriptSHA256(scriptBody string) string {
 	sum := sha256.Sum256([]byte(scriptBody))
 	return hex.EncodeToString(sum[:])
+}
+
+// ComputeBoundScriptSHA256 returns the lowercase hex SHA-256 digest binding interpreter and script body
+// (`sha256(interpreter + "\x00" + scriptBody)`), preventing cross-interpreter hash reuse.
+func ComputeBoundScriptSHA256(interpreter, scriptBody string) string {
+	norm := NormalizeInterpreter(interpreter)
+	if norm == "" {
+		norm = strings.ToLower(strings.TrimSpace(interpreter))
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(norm))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(scriptBody))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// NormalizeAllowedScriptHashEntry canonicalizes an allowed_script_hashes policy entry.
+// Prefixed entries ("<interpreter>:<sha256>") trim whitespace around ":" and normalize non-empty
+// interpreters via NormalizeInterpreter (e.g. "/usr/bin/sh : <HASH>" -> "sh:<hash>").
+func NormalizeAllowedScriptHashEntry(raw string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return "", false
+	}
+	if rawInterp, rawHash, hasColon := strings.Cut(trimmed, ":"); hasColon {
+		rawInterp = strings.TrimSpace(rawInterp)
+		normInterp := NormalizeInterpreter(rawInterp)
+		if rawInterp == "" || normInterp == "" {
+			return "", false
+		}
+		hash := strings.TrimSpace(rawHash)
+		if hash == "" {
+			return "", false
+		}
+		return normInterp + ":" + hash, true
+	}
+	return trimmed, true
 }
 
 // ToParams converts an EphemeralSpec into a runner Envelope Params map.

@@ -3,7 +3,9 @@ package edge
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +31,27 @@ func (o *stubObserver) Observe(ctx context.Context, nodeID string, pub core.Tele
 	}
 	<-ctx.Done()
 	close(o.stopped)
+}
+
+type slowExitObserver struct {
+	name    string
+	started chan struct{}
+	exited  atomic.Bool
+	delay   time.Duration
+	release chan struct{}
+}
+
+func (o *slowExitObserver) Name() string { return o.name }
+
+func (o *slowExitObserver) Observe(ctx context.Context, _ string, _ core.TelemetryPublisher) {
+	close(o.started)
+	<-ctx.Done()
+	if o.release != nil {
+		<-o.release
+	} else if o.delay > 0 {
+		time.Sleep(o.delay)
+	}
+	o.exited.Store(true)
 }
 
 type stubRunner struct {
@@ -86,6 +109,12 @@ func TestAgentStartStopLifecycle(t *testing.T) {
 		t.Fatalf("Agent.Start failed: %v", err)
 	}
 
+	// Second Start must be rejected cleanly.
+	if err := agent.Start(context.Background()); err == nil {
+		agent.Stop()
+		t.Fatal("expected double Agent.Start to return error")
+	}
+
 	select {
 	case <-obs.started:
 	case <-time.After(2 * time.Second):
@@ -130,5 +159,153 @@ func TestAgentStopBeforeStartAndInvalidTLS(t *testing.T) {
 	if err := agent.Start(context.Background()); err == nil {
 		agent.Stop()
 		t.Fatal("expected Agent.Start to fail when TLSCAFile does not exist")
+	}
+}
+
+func TestAgentStopJoinsObserversAndBoundsHungObserver(t *testing.T) {
+	t.Run("joins_cleanly_exiting_observer", func(t *testing.T) {
+		cfg := config.DefaultEdgeConfig()
+		cfg.NodeID = "edge-join-obs"
+		cfg.BrokerURL = closedLocalBrokerURL(t)
+		cfg.Observers = config.ObserversConfig{}
+		cfg.Runners.Enabled = false
+
+		obs := &slowExitObserver{
+			name:    "slow-exit",
+			started: make(chan struct{}),
+			delay:   60 * time.Millisecond,
+		}
+		agent := New(cfg, Options{ExtraObservers: []observer.Observer{obs}})
+		if err := agent.Start(context.Background()); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		<-obs.started
+
+		agent.Stop()
+		if !obs.exited.Load() {
+			t.Fatal("expected Agent.Stop() to wait for observer WaitGroup before returning")
+		}
+	})
+
+	t.Run("bounded_wait_on_hung_observer", func(t *testing.T) {
+		cfg := config.DefaultEdgeConfig()
+		cfg.NodeID = "edge-hung-obs"
+		cfg.BrokerURL = closedLocalBrokerURL(t)
+		cfg.Observers = config.ObserversConfig{}
+		cfg.Runners.Enabled = false
+
+		release := make(chan struct{})
+		defer close(release)
+		obs := &slowExitObserver{
+			name:    "hung-obs",
+			started: make(chan struct{}),
+			release: release,
+		}
+		agent := New(cfg, Options{ExtraObservers: []observer.Observer{obs}})
+		if err := agent.Start(context.Background()); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		<-obs.started
+
+		start := time.Now()
+		agent.Stop()
+		elapsed := time.Since(start)
+		if elapsed > 3*time.Second {
+			t.Fatalf("expected Agent.Stop() bounded wait on hung observer (<3s), took %s", elapsed)
+		}
+	})
+}
+
+func TestAgentConcurrentStartPublishStopRace(t *testing.T) {
+	for iter := range 3 {
+		cfg := config.DefaultEdgeConfig()
+		cfg.NodeID = "edge-concurrent-race"
+		cfg.BrokerURL = closedLocalBrokerURL(t)
+		cfg.SpoolCapacity = 32
+		cfg.Observers = config.ObserversConfig{}
+		cfg.Runners.Enabled = false
+
+		obs := &stubObserver{
+			name:    "race-obs",
+			started: make(chan struct{}),
+			stopped: make(chan struct{}),
+		}
+		agent := New(cfg, Options{
+			MaxSpoolBytes:  4096,
+			ExtraObservers: []observer.Observer{obs},
+		})
+
+		var startOK atomic.Int32
+		var wg sync.WaitGroup
+
+		for range 3 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := agent.Start(context.Background()); err == nil {
+					startOK.Add(1)
+				}
+			}()
+		}
+
+		for i := range 8 {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				for j := range 5 {
+					_ = agent.Publish(core.NewCTDPayload(cfg.NodeID, "manual", "active").
+						AddMetric("iter", iter).
+						AddMetric("worker", idx).
+						AddMetric("seq", j))
+					time.Sleep(time.Millisecond)
+				}
+			}(i)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if iter%2 == 0 {
+				time.Sleep(5 * time.Millisecond)
+			}
+			agent.Stop()
+		}()
+
+		wg.Wait()
+		agent.Stop()
+
+		if got := startOK.Load(); got > 1 {
+			t.Fatalf("iter %d: expected at most 1 Start() to succeed, got %d", iter, got)
+		}
+	}
+}
+
+func TestAgentMaxSpoolBytesWiredToRelay(t *testing.T) {
+	cfg := config.DefaultEdgeConfig()
+	cfg.NodeID = "edge-spool-bytes"
+	cfg.BrokerURL = closedLocalBrokerURL(t)
+	cfg.SpoolCapacity = 100
+	cfg.Observers = config.ObserversConfig{}
+	cfg.Runners.Enabled = false
+
+	agent := New(cfg, Options{
+		DisableObservers: true,
+		MaxSpoolBytes:    1024,
+	})
+	if err := agent.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer agent.Stop()
+
+	blob := strings.Repeat("m", 240)
+	for i := range 10 {
+		_ = agent.Publish(core.NewCTDPayload(cfg.NodeID, "sensor", "active").AddMetric("seq", i).AddMetric("blob", blob))
+	}
+
+	if got := agent.relay.SpoolBytes(); got > 1024 {
+		t.Fatalf("expected relay spool bytes <= 1024, got %d", got)
+	}
+	if got := agent.relay.SpoolDropped(); got == 0 {
+		t.Fatal("expected byte-bounded spool eviction to increment SpoolDropped")
 	}
 }

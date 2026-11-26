@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 	"golang.org/x/sys/unix"
 )
 
@@ -22,41 +23,122 @@ var (
 	darwinSMCFanRe = regexp.MustCompile(`(?i)Fan(?:\s*(\d+))?\s*:\s*([\d\.]+)\s*rpm`)
 	darwinTempRe   = regexp.MustCompile(`(?i)(?:CPU die temperature|SMC.*temp).*?:\s*([\d\.]+)\s*C`)
 
-	darwinPMCacheMu sync.Mutex
-	darwinPMCacheAt time.Time
-	darwinPMCache   string
+	defaultDarwinPM = newDarwinPMSingleflight()
 )
 
-// sampleDarwinPowermetrics consolidates SMC, GPU, and ANE `powermetrics` queries into a single cached subprocess call per interval.
-func sampleDarwinPowermetrics(ctx context.Context) (string, error) {
+type darwinPMFlight struct {
+	mu      sync.Mutex
+	waiters int
+	cancel  context.CancelFunc
+	done    chan struct{}
+	out     string
+	err     error
+}
+
+type darwinPMSingleflight struct {
+	mu       sync.Mutex
+	now      func() time.Time
+	cacheAt  time.Time
+	cacheVal string
+	inFlight *darwinPMFlight
+}
+
+func newDarwinPMSingleflight() *darwinPMSingleflight {
+	return &darwinPMSingleflight{now: time.Now}
+}
+
+func (s *darwinPMSingleflight) sample(ctx context.Context, samplers string, execFn func(context.Context, string) (string, error)) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if observer.IsPaused(ctx) {
+		return "", context.Canceled
+	}
+
 	ttl := min(pollInterval(ctx)/2, 2*time.Second)
 	if ttl < 500*time.Millisecond {
 		ttl = 500 * time.Millisecond
 	}
 
-	darwinPMCacheMu.Lock()
-	if darwinPMCache != "" && time.Since(darwinPMCacheAt) < ttl {
-		cached := darwinPMCache
-		darwinPMCacheMu.Unlock()
+	s.mu.Lock()
+	if s.cacheVal != "" && s.now().Sub(s.cacheAt) < ttl {
+		cached := s.cacheVal
+		s.mu.Unlock()
 		return cached, nil
 	}
-	darwinPMCacheMu.Unlock()
 
-	samplers := "smc,gpu_power"
-	if runtime.GOARCH == "arm64" {
-		samplers = "smc,gpu_power,ane_power"
+	flight := s.inFlight
+	if flight != nil {
+		flight.mu.Lock()
+		flight.waiters++
+		flight.mu.Unlock()
+		s.mu.Unlock()
+	} else {
+		baseCtx, cancelWaiters := context.WithCancel(context.WithoutCancel(ctx))
+		cmdCtx, cancelPause := observer.ContextUntilPaused(baseCtx)
+		flight = &darwinPMFlight{
+			waiters: 1,
+			cancel:  cancelWaiters,
+			done:    make(chan struct{}),
+		}
+		s.inFlight = flight
+		s.mu.Unlock()
+
+		go func() {
+			out, err := execFn(cmdCtx, samplers)
+			cancelPause()
+			cancelWaiters()
+
+			s.mu.Lock()
+			if err == nil {
+				s.cacheVal = out
+				s.cacheAt = s.now()
+			}
+			if s.inFlight == flight {
+				s.inFlight = nil
+			}
+			s.mu.Unlock()
+
+			flight.out = out
+			flight.err = err
+			close(flight.done)
+		}()
 	}
+
+	select {
+	case <-ctx.Done():
+		flight.mu.Lock()
+		flight.waiters--
+		shouldCancel := flight.waiters == 0
+		cancelFn := flight.cancel
+		flight.mu.Unlock()
+		if shouldCancel && cancelFn != nil {
+			cancelFn()
+		}
+		return "", ctx.Err()
+	case <-flight.done:
+		return flight.out, flight.err
+	}
+}
+
+func runDarwinPowermetricsCmd(ctx context.Context, samplers string) (string, error) {
 	out, err := runCommand(ctx, defaultCmdTimeout, "powermetrics", "--samplers", samplers, "-n", "1", "-i", "100")
 	if err != nil {
 		return "", err
 	}
+	return string(out), nil
+}
 
-	s := string(out)
-	darwinPMCacheMu.Lock()
-	darwinPMCache = s
-	darwinPMCacheAt = time.Now()
-	darwinPMCacheMu.Unlock()
-	return s, nil
+// sampleDarwinPowermetrics consolidates SMC, GPU, and ANE `powermetrics` queries into a singleflight cached subprocess call per interval.
+func sampleDarwinPowermetrics(ctx context.Context) (string, error) {
+	samplers := "smc,gpu_power"
+	if runtime.GOARCH == "arm64" {
+		samplers = "smc,gpu_power,ane_power"
+	}
+	return defaultDarwinPM.sample(ctx, samplers, runDarwinPowermetricsCmd)
 }
 
 func readDarwinLoadAvg() (load1, load5, load15 float64, ok bool) {

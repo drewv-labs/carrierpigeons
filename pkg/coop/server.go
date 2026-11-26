@@ -3,14 +3,22 @@ package coop
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math/big"
 	"net"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -41,14 +49,24 @@ type Options struct {
 // Embedded pure-Go MQTT Broker (optional external) + PostgreSQL Ledger + Batched COPY Injector +
 // RunnerRequestCTD Router + Ntfy Watchdog + implicit self-observation & Runner runtime.
 type Server struct {
-	cfg        config.CoopConfig
-	opts       Options
-	store      db.BaseDB
-	ownsStore  bool
-	embedded   *broker.EmbeddedBroker
-	subscriber *broker.Subscriber
-	selfNode   *edge.Agent
-	brokerURL  string
+	cfg  config.CoopConfig
+	opts Options
+
+	mu             sync.Mutex
+	starting       bool
+	started        bool
+	stopped        bool
+	startDone      chan struct{}
+	bootCancel     context.CancelFunc
+	runCtx         context.Context
+	runCancel      context.CancelFunc
+	store          db.BaseDB
+	ownsStore      bool
+	embedded       *broker.EmbeddedBroker
+	loopbackBridge *loopbackTLSBridge
+	subscriber     *broker.Subscriber
+	selfNode       *edge.Agent
+	brokerURL      string
 
 	stopOnce sync.Once
 }
@@ -74,87 +92,143 @@ func New(cfg config.CoopConfig, opts ...Options) *Server {
 	}
 }
 
+func (s *Server) isStopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopped
+}
+
 // Start boots the PostgreSQL schema, MNS registration, MQTT broker, batched CTD ingestor, and implicit self-observation/runners.
+// Caller ctx bounds startup; long-lived children run under Server's internal runCtx until Stop().
 func (s *Server) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := s.cfg.ValidateSecurity(); err != nil {
 		return err
 	}
+	mode := strings.ToLower(strings.TrimSpace(s.cfg.MQTT.Mode))
+	if mode != "" && mode != "embedded" && mode != "external" {
+		return fmt.Errorf("invalid mqtt.mode %q: must be 'embedded' or 'external'", s.cfg.MQTT.Mode)
+	}
+	isExternal := mode == "external"
 
-	isExternal := strings.EqualFold(strings.TrimSpace(s.cfg.MQTT.Mode), "external")
-	clientCertFile := ""
-	clientKeyFile := ""
-	if isExternal {
-		clientCertFile = s.cfg.MQTT.TLSCertFile
-		clientKeyFile = s.cfg.MQTT.TLSKeyFile
+	clientCertFile := strings.TrimSpace(s.cfg.MQTT.TLSClientCertFile)
+	clientKeyFile := strings.TrimSpace(s.cfg.MQTT.TLSClientKeyFile)
+	if isExternal && clientCertFile == "" && clientKeyFile == "" {
+		clientCertFile = strings.TrimSpace(s.cfg.MQTT.TLSCertFile)
+		clientKeyFile = strings.TrimSpace(s.cfg.MQTT.TLSKeyFile)
+	}
+	if !isExternal && s.cfg.MQTT.RequireClientCert {
+		if clientCertFile == "" || clientKeyFile == "" {
+			return fmt.Errorf("configure PigeonCoop embedded mTLS: mqtt.require_client_cert=true requires mqtt.tls_client_cert_file and mqtt.tls_client_key_file")
+		}
+		if strings.TrimSpace(s.cfg.MQTT.Username) == "" || s.cfg.MQTT.Password == "" {
+			return fmt.Errorf("configure PigeonCoop embedded mTLS: mqtt.require_client_cert=true requires mqtt.username and mqtt.password for internal subscriber")
+		}
 	}
 
 	clientTLS, err := config.BuildMQTTTLSConfig(
 		s.cfg.MQTT.TLSCAFile,
 		clientCertFile,
 		clientKeyFile,
-		s.cfg.MQTT.TLSInsecureSkipVerify,
+		isExternal && s.cfg.MQTT.TLSInsecureSkipVerify,
 	)
 	if err != nil {
 		return fmt.Errorf("configure PigeonCoop MQTT TLS client: %w", err)
 	}
 
-	// In embedded TLS mode, trust the embedded broker's leaf cert when no explicit CA is provided,
-	// and align ServerName for loopback connections when the cert SANs only list a LAN hostname/IP.
-	selfCAFile := s.cfg.MQTT.TLSCAFile
+	// In embedded TLS mode, check whether the embedded leaf cert is a self-signed root anchor
+	// when no explicit CA file is provided; CA-signed leaf certs (Issuer != Subject) cannot act
+	// as Roots in x509.CertPool and instead use leaf pinning + verified loopback bridge.
+	selfCAFile := strings.TrimSpace(s.cfg.MQTT.TLSCAFile)
 	var embeddedLeaf *x509.Certificate
-	loopbackLacksLocalhost := false
+	var embeddedSelfSignedAnchor bool
 	if !isExternal && strings.TrimSpace(s.cfg.MQTT.TLSCertFile) != "" && strings.TrimSpace(s.cfg.MQTT.TLSKeyFile) != "" {
 		pemBytes, leaf, parseErr := parseEmbeddedLeafCert(s.cfg.MQTT.TLSCertFile)
 		if parseErr != nil {
 			return fmt.Errorf("read embedded MQTT TLS cert %s for loopback trust: %w", s.cfg.MQTT.TLSCertFile, parseErr)
 		}
 		embeddedLeaf = leaf
-		if strings.TrimSpace(s.cfg.MQTT.TLSCAFile) == "" {
+		if selfCAFile == "" {
 			if clientTLS == nil {
 				clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
 			}
-			pool := clientTLS.RootCAs
-			if pool == nil {
-				if sysPool, poolErr := x509.SystemCertPool(); poolErr == nil && sysPool != nil {
-					pool = sysPool
-				} else {
-					pool = x509.NewCertPool()
-				}
-			}
-			if !pool.AppendCertsFromPEM(pemBytes) {
-				return fmt.Errorf("no valid PEM certificates in embedded MQTT TLS cert %s", s.cfg.MQTT.TLSCertFile)
-			}
-			clientTLS.RootCAs = pool
-			selfCAFile = s.cfg.MQTT.TLSCertFile
-		}
-		if leaf.VerifyHostname("127.0.0.1") != nil {
-			loopbackLacksLocalhost = true
-			if clientTLS == nil {
-				clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
-			}
-			if serverName := extractLeafServerName(leaf); serverName != "" {
-				if clientTLS.ServerName == "" {
-					clientTLS.ServerName = serverName
-				}
-			} else {
-				// Leaf cert has neither DNSNames nor IPAddresses; pin the exact leaf certificate over loopback.
-				clientTLS.InsecureSkipVerify = true //nolint:gosec // verified explicitly via VerifyPeerCertificate byte match below
-				expectedRaw := leaf.Raw
-				clientTLS.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-					if len(rawCerts) == 0 || !bytes.Equal(rawCerts[0], expectedRaw) {
-						return errors.New("embedded loopback TLS certificate mismatch")
+			isSelfSigned := bytes.Equal(leaf.RawIssuer, leaf.RawSubject) && leaf.CheckSignatureFrom(leaf) == nil
+			if isSelfSigned && (!leaf.BasicConstraintsValid || leaf.IsCA) {
+				pool := clientTLS.RootCAs
+				if pool == nil {
+					if sysPool, poolErr := x509.SystemCertPool(); poolErr == nil && sysPool != nil {
+						pool = sysPool
+					} else {
+						pool = x509.NewCertPool()
 					}
-					return nil
 				}
+				if !pool.AppendCertsFromPEM(pemBytes) {
+					return fmt.Errorf("no valid PEM certificates in %s", s.cfg.MQTT.TLSCertFile)
+				}
+				clientTLS.RootCAs = pool
+				selfCAFile = s.cfg.MQTT.TLSCertFile
+				embeddedSelfSignedAnchor = true
 			}
 		}
 	}
 
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return errors.New("coop server already stopped")
+	}
+	if s.started || s.starting {
+		s.mu.Unlock()
+		return errors.New("coop server already started")
+	}
+	bootCtx, bootCancel := context.WithCancel(ctx)
+	runCtx, runCancel := context.WithCancel(context.Background())
+	startDone := make(chan struct{})
+	s.starting = true
+	s.startDone = startDone
+	s.bootCancel = bootCancel
+	s.runCtx = runCtx
+	s.runCancel = runCancel
+	s.mu.Unlock()
+
+	bootOK := false
+	defer func() {
+		bootCancel()
+		if !bootOK {
+			s.cleanupPartial()
+			s.mu.Lock()
+			s.starting = false
+			s.bootCancel = nil
+			close(startDone)
+			s.mu.Unlock()
+		}
+	}()
+
+	checkBoot := func() error {
+		if err := bootCtx.Err(); err != nil {
+			return err
+		}
+		if s.isStopped() {
+			return errors.New("coop server stopped during startup")
+		}
+		return nil
+	}
+
 	// 1. Initialize or attach PostgreSQL Ledger
+	if err := checkBoot(); err != nil {
+		return err
+	}
+	var activeStore db.BaseDB
 	if s.opts.Store != nil {
-		s.store = s.opts.Store
+		activeStore = s.opts.Store
+		s.mu.Lock()
+		s.store = activeStore
+		s.ownsStore = false
+		s.mu.Unlock()
 	} else {
-		pgStore, err := db.NewPostgresStoreWithOptions(ctx, s.cfg.Database.URL, db.StoreOptions{
+		pgStore, err := db.NewPostgresStoreWithOptions(bootCtx, s.cfg.Database.URL, db.StoreOptions{
 			AppActor:   strings.ToLower(s.cfg.Brand.CoopName) + "-ingestor",
 			MaxConns:   s.cfg.Database.MaxConns,
 			MinConns:   s.cfg.Database.MinConns,
@@ -163,27 +237,30 @@ func (s *Server) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("connect PostgreSQL ledger: %w", err)
 		}
-		s.store = pgStore
+		activeStore = pgStore
+		s.mu.Lock()
+		s.store = activeStore
 		s.ownsStore = true
+		s.mu.Unlock()
 	}
 
-	if err := s.store.EnsureSchema(ctx); err != nil {
-		s.Stop()
+	if err := activeStore.EnsureSchema(bootCtx); err != nil {
 		return fmt.Errorf("ensure CTD & %s schema: %w", s.cfg.Brand.MathName, err)
 	}
-
-	if err := s.store.UpsertMeshIdentity(ctx, core.MeshIdentity{
+	if err := checkBoot(); err != nil {
+		return err
+	}
+	if err := activeStore.UpsertMeshIdentity(bootCtx, core.MeshIdentity{
 		MeshName:   s.cfg.MeshName,
 		CoopNodeID: s.cfg.NodeID,
 		TopicRoot:  s.cfg.Brand.TopicRoot,
 		UpdatedAt:  time.Now().UTC(),
 	}); err != nil {
-		s.Stop()
 		return fmt.Errorf("register MNS mesh identity %q: %w", s.cfg.MeshName, err)
 	}
 
 	if s.opts.ProvisionRoles {
-		if err := s.store.ProvisionRoles(ctx, s.opts.IngestPassword, s.opts.ReadOnlyPassword); err != nil {
+		if err := activeStore.ProvisionRoles(bootCtx, s.opts.IngestPassword, s.opts.ReadOnlyPassword); err != nil {
 			log.Printf("[%s] Warning: ProvisionRoles skipped/failed (insufficient superuser privileges?): %v",
 				s.cfg.Brand.CoopName, err)
 		} else {
@@ -192,33 +269,86 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// 2. Start embedded pure-Go MQTT broker (unless external broker mode is selected)
+	if err := checkBoot(); err != nil {
+		return err
+	}
+	edgePrefix := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s.cfg.Brand.EdgeName)), "-")
+	if edgePrefix == "" {
+		edgePrefix = "pigeoneer"
+	}
+
+	var brokerURL string
 	if !isExternal {
 		emb, err := broker.StartEmbedded(broker.EmbeddedOptions{
-			ListenAddr:       s.cfg.MQTT.Listen,
-			Username:         s.cfg.MQTT.Username,
-			Password:         s.cfg.MQTT.Password,
-			EdgeUsername:     s.cfg.MQTT.EdgeUsername,
-			EdgePassword:     s.cfg.MQTT.EdgePassword,
-			EdgeClientPrefix: strings.ToLower(s.cfg.Brand.EdgeName),
-			TLSCertFile:      s.cfg.MQTT.TLSCertFile,
-			TLSKeyFile:       s.cfg.MQTT.TLSKeyFile,
-			TopicRoot:        s.cfg.Brand.TopicRoot,
+			ListenAddr:        s.cfg.MQTT.Listen,
+			Username:          s.cfg.MQTT.Username,
+			Password:          s.cfg.MQTT.Password,
+			EdgeUsername:      s.cfg.MQTT.EdgeUsername,
+			EdgePassword:      s.cfg.MQTT.EdgePassword,
+			EdgeClientPrefix:  edgePrefix,
+			TLSCertFile:       s.cfg.MQTT.TLSCertFile,
+			TLSKeyFile:        s.cfg.MQTT.TLSKeyFile,
+			TLSClientCAFile:   s.cfg.MQTT.TLSClientCAFile,
+			RequireClientCert: s.cfg.MQTT.RequireClientCert,
+			TopicRoot:         s.cfg.Brand.TopicRoot,
 		})
 		if err != nil {
-			s.Stop()
 			return fmt.Errorf("start embedded MQTT broker: %w", err)
 		}
+		brokerURL = emb.LocalClientURL()
+		s.mu.Lock()
 		s.embedded = emb
-		s.brokerURL = emb.LocalClientURL()
+		s.brokerURL = brokerURL
+		s.mu.Unlock()
 		log.Printf("[%s] Embedded MQTT broker listening on %s", s.cfg.Brand.CoopName, emb.BoundAddr())
 	} else {
-		s.brokerURL = s.cfg.LocalBrokerURL()
-		log.Printf("[%s] Using external MQTT broker %s", s.cfg.Brand.CoopName, s.brokerURL)
+		brokerURL = s.cfg.LocalBrokerURL()
+		s.mu.Lock()
+		s.brokerURL = brokerURL
+		s.mu.Unlock()
+		log.Printf("[%s] Using external MQTT broker %s", s.cfg.Brand.CoopName, config.RedactURL(brokerURL))
+	}
+
+	// Align SNI / certificate pinning when embedded leaf cert cannot be verified directly
+	// against the dialed loopback host (missing SANs, non-loopback SANs, or CA-signed leaf without TLSCAFile).
+	needLoopbackBridge := false
+	targetHost := ""
+	if !isExternal && embeddedLeaf != nil {
+		if parsedURL, parseErr := url.Parse(brokerURL); parseErr == nil {
+			targetHost = parsedURL.Hostname()
+		}
+		if targetHost == "" {
+			targetHost = "127.0.0.1"
+		}
+		hasExplicitCA := strings.TrimSpace(s.cfg.MQTT.TLSCAFile) != ""
+		if !hasExplicitCA && !embeddedSelfSignedAnchor {
+			needLoopbackBridge = true
+			if clientTLS == nil {
+				clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+			}
+			pinEmbeddedLeafTLS(clientTLS, embeddedLeaf, false)
+		} else if embeddedLeaf.VerifyHostname(targetHost) != nil {
+			needLoopbackBridge = true
+			if clientTLS == nil {
+				clientTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+			}
+			if serverName := extractLeafServerName(embeddedLeaf); serverName != "" {
+				if clientTLS.ServerName == "" {
+					clientTLS.ServerName = serverName
+				}
+			} else {
+				// Leaf cert has neither DNSNames nor IPAddresses; pin the exact leaf certificate over loopback.
+				pinEmbeddedLeafTLS(clientTLS, embeddedLeaf, hasExplicitCA)
+			}
+		}
 	}
 
 	// 3. Start high-throughput COPY Ingestion Subscriber & RunnerRequestCTD Router
+	if err := checkBoot(); err != nil {
+		return err
+	}
 	sub, err := broker.NewSubscriberWithOptions(broker.SubscriberOptions{
-		BrokerURL:  s.brokerURL,
+		BrokerURL:  brokerURL,
 		MeshName:   s.cfg.MeshName,
 		CoopNodeID: s.cfg.NodeID,
 		Username:   s.cfg.MQTT.Username,
@@ -232,31 +362,51 @@ func (s *Server) Start(ctx context.Context) error {
 		NtfyEnabled: s.cfg.Ntfy.Enabled,
 		NtfyURL:     s.cfg.Ntfy.URL,
 		Brand:       s.cfg.Brand,
-	}, s.store)
+	}, activeStore)
 	if err != nil {
-		s.Stop()
 		return fmt.Errorf("start %s MQTT subscriber: %w", s.cfg.Brand.CoopName, err)
 	}
+	s.mu.Lock()
 	s.subscriber = sub
+	s.mu.Unlock()
 
-	// 4. Implicitly start embedded Observer + Runner runtime on the Coop host using native CoopConfig settings
+	// 4. Implicitly start embedded Observer + Runner runtime on the Coop host using scoped edge credentials & verified TLS.
+	if err := checkBoot(); err != nil {
+		return err
+	}
 	if s.cfg.SelfObserve || s.cfg.Runners.Enabled {
-		selfBrokerURL := s.brokerURL
-		selfTLSInsecureSkipVerify := s.cfg.MQTT.TLSInsecureSkipVerify
-		if !isExternal && loopbackLacksLocalhost {
-			matchedBoundIP := false
-			if s.embedded != nil && embeddedLeaf != nil {
-				if host, port, splitErr := net.SplitHostPort(s.embedded.BoundAddr()); splitErr == nil {
-					if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() && embeddedLeaf.VerifyHostname(host) == nil {
-						selfBrokerURL = "tls://" + net.JoinHostPort(host, port)
-						matchedBoundIP = true
-					}
-				}
+		selfBrokerURL := brokerURL
+		selfClientCertFile := clientCertFile
+		selfClientKeyFile := clientKeyFile
+		selfTLSInsecureSkipVerify := isExternal && s.cfg.MQTT.TLSInsecureSkipVerify
+		if !isExternal && needLoopbackBridge {
+			bridge, bridgeErr := startLoopbackTLSBridge(
+				brokerURL,
+				clientTLS,
+				targetHost,
+			)
+			if bridgeErr != nil {
+				return fmt.Errorf("start %s loopback TLS bridge for self-node: %w", s.cfg.Brand.CoopName, bridgeErr)
 			}
-			if !matchedBoundIP {
-				// edge.Agent constructs TLS config from EdgeConfig (no ServerName field); skip hostname check
-				// strictly on the in-process 127.0.0.1 loopback connection to our own embedded broker.
-				selfTLSInsecureSkipVerify = true
+			s.mu.Lock()
+			s.loopbackBridge = bridge
+			s.mu.Unlock()
+			selfBrokerURL = bridge.BrokerURL()
+			selfCAFile = bridge.CAFile()
+			selfClientCertFile = bridge.ClientCertFile()
+			selfClientKeyFile = bridge.ClientKeyFile()
+		}
+
+		selfUser := strings.TrimSpace(s.cfg.MQTT.EdgeUsername)
+		selfPass := s.cfg.MQTT.EdgePassword
+		if selfUser == "" {
+			if !isExternal && s.cfg.MQTT.RequireClientCert {
+				// Embedded cert-only edge mTLS mode authenticates strictly via node-matched client certificate.
+				selfUser = ""
+				selfPass = ""
+			} else {
+				selfUser = strings.TrimSpace(s.cfg.MQTT.Username)
+				selfPass = s.cfg.MQTT.Password
 			}
 		}
 
@@ -267,21 +417,21 @@ func (s *Server) Start(ctx context.Context) error {
 			SpoolCapacity:         s.cfg.SpoolCapacity,
 			BrokerURL:             selfBrokerURL,
 			TopicPrefix:           s.cfg.Brand.CTDPrefix(),
-			MQTTUsername:          s.cfg.MQTT.Username,
-			MQTTPassword:          s.cfg.MQTT.Password,
+			MQTTUsername:          selfUser,
+			MQTTPassword:          selfPass,
 			TLSCAFile:             selfCAFile,
-			TLSCertFile:           clientCertFile,
-			TLSKeyFile:            clientKeyFile,
+			TLSCertFile:           selfClientCertFile,
+			TLSKeyFile:            selfClientKeyFile,
 			TLSInsecureSkipVerify: selfTLSInsecureSkipVerify,
 			Observers:             s.cfg.Observers,
 			Runners:               s.cfg.Runners,
 			Brand:                 s.cfg.Brand,
 		}
-		s.selfNode = edge.New(selfCfg, edge.Options{
+		selfNode := edge.New(selfCfg, edge.Options{
 			Brand:            s.cfg.Brand,
-			ClientPrefix:     strings.ToLower(s.cfg.Brand.CoopName) + "-node",
-			Username:         s.cfg.MQTT.Username,
-			Password:         s.cfg.MQTT.Password,
+			ClientPrefix:     edgePrefix,
+			Username:         selfUser,
+			Password:         selfPass,
 			DisableObservers: !s.cfg.SelfObserve,
 			Meta: map[string]string{
 				"role":      "coop",
@@ -290,21 +440,39 @@ func (s *Server) Start(ctx context.Context) error {
 			ExtraObservers: s.opts.ExtraObservers,
 			ExtraRunners:   s.opts.ExtraRunners,
 		})
-		if err := s.selfNode.Start(ctx); err != nil {
+		s.mu.Lock()
+		s.selfNode = selfNode
+		s.mu.Unlock()
+		if err := selfNode.Start(runCtx); err != nil {
 			log.Printf("[%s] Warning: self-observation startup degraded: %v", s.cfg.Brand.CoopName, err)
 		}
 	}
 
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return errors.New("coop server stopped during startup")
+	}
+	s.started = true
+	s.starting = false
+	s.bootCancel = nil
+	close(startDone)
+	s.mu.Unlock()
+	bootOK = true
 	return nil
 }
 
 // Store returns the active BaseDB backing PigeonCoop.
 func (s *Server) Store() db.BaseDB {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.store
 }
 
 // BrokerURL returns the active dialable MQTT URL for local clients.
 func (s *Server) BrokerURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.brokerURL
 }
 
@@ -352,20 +520,399 @@ func extractLeafServerName(leaf *x509.Certificate) string {
 	return ""
 }
 
+func pinEmbeddedLeafTLS(clientTLS *tls.Config, leaf *x509.Certificate, verifyAgainstRoots bool) {
+	expectedRaw := leaf.Raw
+	explicitRoots := clientTLS.RootCAs
+	clientTLS.InsecureSkipVerify = true //nolint:gosec // verified explicitly via VerifyPeerCertificate byte match + expiry/chain check below
+	clientTLS.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 || !bytes.Equal(rawCerts[0], expectedRaw) {
+			return errors.New("embedded loopback TLS certificate mismatch")
+		}
+		parsed, parseErr := x509.ParseCertificate(rawCerts[0])
+		if parseErr != nil {
+			return fmt.Errorf("parse embedded loopback certificate: %w", parseErr)
+		}
+		now := time.Now()
+		if now.Before(parsed.NotBefore) || now.After(parsed.NotAfter) {
+			return errors.New("embedded loopback TLS certificate expired or not yet valid")
+		}
+		if verifyAgainstRoots && explicitRoots != nil {
+			intermediates := x509.NewCertPool()
+			for _, raw := range rawCerts[1:] {
+				if ic, err := x509.ParseCertificate(raw); err == nil {
+					intermediates.AddCert(ic)
+				}
+			}
+			if _, err := parsed.Verify(x509.VerifyOptions{
+				Roots:         explicitRoots,
+				Intermediates: intermediates,
+				CurrentTime:   now,
+				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			}); err != nil {
+				return fmt.Errorf("verify embedded loopback certificate against CA: %w", err)
+			}
+		}
+		return nil
+	}
+}
+
+func randomCertSerial() (*big.Int, error) {
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	return rand.Int(rand.Reader, limit)
+}
+
+// loopbackTLSBridge exposes an ephemeral, per-instance pinned-mTLS loopback endpoint for edge.Agent
+// when the embedded broker's certificate cannot be directly verified against the dialed loopback host,
+// forwarding to the embedded broker using SNI/leaf-pinned upstream TLS verification.
+type loopbackTLSBridge struct {
+	ln           net.Listener
+	brokerURL    string
+	upstreamAddr string
+	upstreamTLS  *tls.Config
+	caFile       string
+	clientCert   string
+	clientKey    string
+	tmpDir       string
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	closeOnce    sync.Once
+
+	mu     sync.Mutex
+	closed bool
+	conns  map[net.Conn]struct{}
+}
+
+func startLoopbackTLSBridge(upstreamURL string, upstreamTLS *tls.Config, targetHost string) (*loopbackTLSBridge, error) {
+	if upstreamTLS == nil {
+		return nil, errors.New("upstream TLS configuration is required")
+	}
+	u, err := url.Parse(upstreamURL)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("parse embedded broker URL: %w", err)
+	}
+
+	bindIP := net.ParseIP("127.0.0.1")
+	if parsed := net.ParseIP(strings.TrimSpace(targetHost)); parsed != nil && parsed.IsLoopback() {
+		bindIP = parsed
+	}
+
+	now := time.Now().Add(-1 * time.Minute)
+	exp := now.Add(10 * 365 * 24 * time.Hour)
+
+	caPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate loopback bridge CA key: %w", err)
+	}
+	caSerial, err := randomCertSerial()
+	if err != nil {
+		return nil, fmt.Errorf("generate loopback bridge CA serial: %w", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          caSerial,
+		Subject:               pkix.Name{CommonName: "pigeoncoop-loopback-ca"},
+		NotBefore:             now,
+		NotAfter:              exp,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caPriv.PublicKey, caPriv)
+	if err != nil {
+		return nil, fmt.Errorf("create loopback bridge CA certificate: %w", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, fmt.Errorf("parse loopback bridge CA certificate: %w", err)
+	}
+
+	srvPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate loopback bridge server key: %w", err)
+	}
+	srvSerial, err := randomCertSerial()
+	if err != nil {
+		return nil, fmt.Errorf("generate loopback bridge server serial: %w", err)
+	}
+	srvTmpl := &x509.Certificate{
+		SerialNumber:          srvSerial,
+		Subject:               pkix.Name{CommonName: "pigeoncoop-loopback-bridge"},
+		NotBefore:             now,
+		NotAfter:              exp,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{bindIP},
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caCert, &srvPriv.PublicKey, caPriv)
+	if err != nil {
+		return nil, fmt.Errorf("create loopback bridge server certificate: %w", err)
+	}
+
+	cliPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate loopback bridge client key: %w", err)
+	}
+	cliSerial, err := randomCertSerial()
+	if err != nil {
+		return nil, fmt.Errorf("generate loopback bridge client serial: %w", err)
+	}
+	cliTmpl := &x509.Certificate{
+		SerialNumber:          cliSerial,
+		Subject:               pkix.Name{CommonName: "pigeoncoop-loopback-client"},
+		NotBefore:             now,
+		NotAfter:              exp,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+	cliDER, err := x509.CreateCertificate(rand.Reader, cliTmpl, caCert, &cliPriv.PublicKey, caPriv)
+	if err != nil {
+		return nil, fmt.Errorf("create loopback bridge client certificate: %w", err)
+	}
+	cliKeyDER, err := x509.MarshalECPrivateKey(cliPriv)
+	if err != nil {
+		return nil, fmt.Errorf("marshal loopback bridge client key: %w", err)
+	}
+
+	caPool := x509.NewCertPool()
+	caPool.AddCert(caCert)
+	expectedClientDER := cliDER
+	srvTLS := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{srvDER, caDER}, PrivateKey: srvPriv}},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 || !bytes.Equal(rawCerts[0], expectedClientDER) {
+				return errors.New("loopback bridge client certificate mismatch")
+			}
+			return nil
+		},
+	}
+
+	tmpDir, err := os.MkdirTemp("", "coop-loopback-tls-*")
+	if err != nil {
+		return nil, fmt.Errorf("create loopback bridge temp dir: %w", err)
+	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
+	caFile := filepath.Join(tmpDir, "loopback-ca.pem")
+	clientCertFile := filepath.Join(tmpDir, "loopback-client.crt")
+	clientKeyFile := filepath.Join(tmpDir, "loopback-client.key")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
+		return nil, fmt.Errorf("write loopback bridge CA file: %w", err)
+	}
+	if err := os.WriteFile(clientCertFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cliDER}), 0o600); err != nil {
+		return nil, fmt.Errorf("write loopback bridge client cert: %w", err)
+	}
+	if err := os.WriteFile(clientKeyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: cliKeyDER}), 0o600); err != nil {
+		return nil, fmt.Errorf("write loopback bridge client key: %w", err)
+	}
+
+	ln, err := tls.Listen("tcp", net.JoinHostPort(bindIP.String(), "0"), srvTLS)
+	if err != nil {
+		return nil, fmt.Errorf("listen loopback bridge: %w", err)
+	}
+
+	cleanupTmp = false
+	ctx, cancel := context.WithCancel(context.Background())
+	b := &loopbackTLSBridge{
+		ln:           ln,
+		brokerURL:    "tls://" + ln.Addr().String(),
+		upstreamAddr: u.Host,
+		upstreamTLS:  upstreamTLS.Clone(),
+		caFile:       caFile,
+		clientCert:   clientCertFile,
+		clientKey:    clientKeyFile,
+		tmpDir:       tmpDir,
+		ctx:          ctx,
+		cancel:       cancel,
+		conns:        make(map[net.Conn]struct{}),
+	}
+	b.wg.Add(1)
+	go b.serve()
+	return b, nil
+}
+
+func (b *loopbackTLSBridge) BrokerURL() string      { return b.brokerURL }
+func (b *loopbackTLSBridge) CAFile() string         { return b.caFile }
+func (b *loopbackTLSBridge) ClientCertFile() string { return b.clientCert }
+func (b *loopbackTLSBridge) ClientKeyFile() string  { return b.clientKey }
+
+func (b *loopbackTLSBridge) trackConn(c net.Conn) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return false
+	}
+	b.conns[c] = struct{}{}
+	return true
+}
+
+func (b *loopbackTLSBridge) untrackAndClose(c net.Conn) {
+	b.mu.Lock()
+	delete(b.conns, c)
+	b.mu.Unlock()
+	_ = c.Close()
+}
+
+func (b *loopbackTLSBridge) serve() {
+	defer b.wg.Done()
+	for {
+		conn, err := b.ln.Accept()
+		if err != nil {
+			return
+		}
+		if !b.trackConn(conn) {
+			_ = conn.Close()
+			return
+		}
+		b.wg.Add(1)
+		go b.handleConn(conn)
+	}
+}
+
+func (b *loopbackTLSBridge) handleConn(clientConn net.Conn) {
+	defer b.wg.Done()
+	defer b.untrackAndClose(clientConn)
+
+	if tlsConn, ok := clientConn.(*tls.Conn); ok {
+		hsCtx, hsCancel := context.WithTimeout(b.ctx, 5*time.Second)
+		err := tlsConn.HandshakeContext(hsCtx)
+		hsCancel()
+		if err != nil {
+			return
+		}
+	}
+
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+		Config:    b.upstreamTLS.Clone(),
+	}
+	upstreamConn, err := dialer.DialContext(b.ctx, "tcp", b.upstreamAddr)
+	if err != nil {
+		return
+	}
+	if !b.trackConn(upstreamConn) {
+		_ = upstreamConn.Close()
+		return
+	}
+	defer b.untrackAndClose(upstreamConn)
+
+	var copyWG sync.WaitGroup
+	copyWG.Add(2)
+	go func() {
+		defer copyWG.Done()
+		_, _ = io.Copy(upstreamConn, clientConn)
+		if cw, ok := upstreamConn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}()
+	go func() {
+		defer copyWG.Done()
+		_, _ = io.Copy(clientConn, upstreamConn)
+		if cw, ok := clientConn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}()
+	copyWG.Wait()
+}
+
+func (b *loopbackTLSBridge) Close() {
+	b.closeOnce.Do(func() {
+		b.cancel()
+		b.mu.Lock()
+		b.closed = true
+		conns := make([]net.Conn, 0, len(b.conns))
+		for c := range b.conns {
+			conns = append(conns, c)
+		}
+		b.mu.Unlock()
+
+		if b.ln != nil {
+			_ = b.ln.Close()
+		}
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		b.wg.Wait()
+		if b.tmpDir != "" {
+			_ = os.RemoveAll(b.tmpDir)
+		}
+	})
+}
+
+func (s *Server) teardownResources() {
+	s.mu.Lock()
+	runCancel := s.runCancel
+	selfNode := s.selfNode
+	subscriber := s.subscriber
+	bridge := s.loopbackBridge
+	embedded := s.embedded
+	store := s.store
+	ownsStore := s.ownsStore
+
+	s.runCtx = nil
+	s.runCancel = nil
+	s.selfNode = nil
+	s.subscriber = nil
+	s.loopbackBridge = nil
+	s.embedded = nil
+	s.store = nil
+	s.ownsStore = false
+	s.brokerURL = ""
+	s.mu.Unlock()
+
+	if runCancel != nil {
+		runCancel()
+	}
+	if selfNode != nil {
+		selfNode.Stop()
+	}
+	if subscriber != nil {
+		subscriber.Disconnect()
+	}
+	if bridge != nil {
+		bridge.Close()
+	}
+	if embedded != nil {
+		embedded.Close()
+	}
+	if ownsStore && store != nil {
+		store.Close()
+	}
+}
+
+func (s *Server) cleanupPartial() {
+	s.teardownResources()
+}
+
 // Stop gracefully shuts down self-observers, flushes pending COPY batches, stops the embedded broker, and closes DB pools.
 func (s *Server) Stop() {
+	s.mu.Lock()
+	s.stopped = true
+	bootCancel := s.bootCancel
+	runCancel := s.runCancel
+	starting := s.starting
+	startDone := s.startDone
+	s.mu.Unlock()
+
+	if bootCancel != nil {
+		bootCancel()
+	}
+	if runCancel != nil {
+		runCancel()
+	}
+	if starting && startDone != nil {
+		<-startDone
+	}
+
 	s.stopOnce.Do(func() {
-		if s.selfNode != nil {
-			s.selfNode.Stop()
-		}
-		if s.subscriber != nil {
-			s.subscriber.Disconnect()
-		}
-		if s.embedded != nil {
-			s.embedded.Close()
-		}
-		if s.ownsStore && s.store != nil {
-			s.store.Close()
-		}
+		s.teardownResources()
 	})
 }

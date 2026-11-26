@@ -11,7 +11,7 @@ var careCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		state := cliStateFromCommand(cmd)
 		mode, _ := cmd.Flags().GetString("mode")
-		return launchDashboardWithConfig(state.wsCfg, tui.TabPigeonCare, "", "", mode)
+		return launchDashboardWithConfig(cmd.Context(), state.wsCfg, tui.TabPigeonCare, "", "", mode)
 	},
 }
 

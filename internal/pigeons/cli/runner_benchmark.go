@@ -64,7 +64,7 @@ var runnerBenchmarkCmd = &cobra.Command{
 		}
 
 		brokerURL := resolveBrokerURLForConfig(state.wsCfg)
-		if err := publishRunnerRequestWithConfig(state.wsCfg, brokerURL, req); err != nil {
+		if err := publishRunnerRequestWithConfig(cmd.Context(), state.wsCfg, brokerURL, req); err != nil {
 			return err
 		}
 

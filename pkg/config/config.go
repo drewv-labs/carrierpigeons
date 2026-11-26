@@ -14,12 +14,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // DefaultPostgresURL is the local development fallback DSN matching deployments/compose.
@@ -57,6 +59,10 @@ type CoopMQTTConfig struct {
 	TLSCertFile            string `toml:"tls_cert_file"`
 	TLSKeyFile             string `toml:"tls_key_file"`
 	TLSCAFile              string `toml:"tls_ca_file"`
+	TLSClientCAFile        string `toml:"tls_client_ca_file"`
+	TLSClientCertFile      string `toml:"tls_client_cert_file"`
+	TLSClientKeyFile       string `toml:"tls_client_key_file"`
+	RequireClientCert      bool   `toml:"require_client_cert"`
 	TLSInsecureSkipVerify  bool   `toml:"tls_insecure_skip_verify"`
 	AllowInsecureAnonymous bool   `toml:"allow_insecure_anonymous"`
 }
@@ -194,16 +200,43 @@ func isKnownDefaultDBPassword(pw string) bool {
 	}
 }
 
+func isPostgresHostLocal(host string) bool {
+	h := strings.Trim(strings.TrimSpace(host), "[]")
+	if h == "" || strings.HasPrefix(h, "/") {
+		return true
+	}
+	return IsLoopbackListen(h)
+}
+
+func nonLoopbackPGHost(pgCfg *pgxpool.Config) (string, bool) {
+	if pgCfg == nil || pgCfg.ConnConfig == nil {
+		return "", false
+	}
+	if host := strings.TrimSpace(pgCfg.ConnConfig.Host); !isPostgresHostLocal(host) {
+		return host, true
+	}
+	for _, fb := range pgCfg.ConnConfig.Fallbacks {
+		if fb == nil {
+			continue
+		}
+		if host := strings.TrimSpace(fb.Host); !isPostgresHostLocal(host) {
+			return host, true
+		}
+	}
+	return "", false
+}
+
 func isURLHostLoopback(rawURL string) bool {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return false
+	}
+	pgCfg, err := pgxpool.ParseConfig(trimmed)
 	if err != nil {
 		return false
 	}
-	host := strings.TrimSpace(u.Hostname())
-	if host == "" {
-		return true
-	}
-	return IsLoopbackListen(host)
+	_, nonLoopback := nonLoopbackPGHost(pgCfg)
+	return !nonLoopback
 }
 
 // ValidateSecurity enforces fail-closed security invariants before starting network listeners.
@@ -214,6 +247,9 @@ func (c CoopConfig) ValidateSecurity() error {
 	}
 	if err := core.ValidateMeshName(meshName); err != nil {
 		return fmt.Errorf("invalid coop mesh_name: %w", err)
+	}
+	if err := db.ValidateSchemaIdentifier(c.Brand.MergeWithDefaults().MathSchema); err != nil {
+		return fmt.Errorf("invalid brand math_schema: %w", err)
 	}
 
 	isExternal := strings.EqualFold(strings.TrimSpace(c.MQTT.Mode), "external")
@@ -244,18 +280,31 @@ func (c CoopConfig) ValidateSecurity() error {
 	if c.MQTT.EdgePassword != "" && strings.TrimSpace(c.MQTT.EdgeUsername) == "" {
 		return fmt.Errorf("refusing insecure startup: mqtt.edge_password configured without mqtt.edge_username")
 	}
+	if (strings.TrimSpace(c.MQTT.TLSCertFile) != "") != (strings.TrimSpace(c.MQTT.TLSKeyFile) != "") {
+		return fmt.Errorf("refusing insecure startup: both mqtt.tls_cert_file and mqtt.tls_key_file must be provided together")
+	}
+	if (strings.TrimSpace(c.MQTT.TLSClientCertFile) != "") != (strings.TrimSpace(c.MQTT.TLSClientKeyFile) != "") {
+		return fmt.Errorf("refusing insecure startup: both mqtt.tls_client_cert_file and mqtt.tls_client_key_file must be provided together")
+	}
+	if !isExternal && c.MQTT.RequireClientCert {
+		if strings.TrimSpace(c.MQTT.TLSCertFile) == "" || strings.TrimSpace(c.MQTT.TLSKeyFile) == "" {
+			return fmt.Errorf("refusing insecure startup: mqtt.require_client_cert=true requires mqtt.tls_cert_file and mqtt.tls_key_file")
+		}
+		if strings.TrimSpace(c.MQTT.TLSClientCAFile) == "" {
+			return fmt.Errorf("refusing insecure startup: mqtt.require_client_cert=true requires mqtt.tls_client_ca_file")
+		}
+	}
 
 	if dbURL := strings.TrimSpace(c.Database.URL); dbURL != "" && !c.Database.AllowInsecureDefaults {
-		if u, err := url.Parse(dbURL); err == nil {
-			host := strings.TrimSpace(u.Hostname())
-			if host != "" && !IsLoopbackListen(host) && u.User != nil {
-				if pw, ok := u.User.Password(); ok && isKnownDefaultDBPassword(pw) {
-					return fmt.Errorf(
-						"refusing insecure startup: database.url targets non-loopback host %q with a default development password (rotate credentials or set database.allow_insecure_defaults=true explicitly)",
-						host,
-					)
-				}
-			}
+		pgCfg, err := pgxpool.ParseConfig(dbURL)
+		if err != nil {
+			return fmt.Errorf("refusing insecure startup: invalid database.url (%s)", RedactURL(dbURL))
+		}
+		if host, nonLoopback := nonLoopbackPGHost(pgCfg); nonLoopback && isKnownDefaultDBPassword(pgCfg.ConnConfig.Password) {
+			return fmt.Errorf(
+				"refusing insecure startup: database.url targets non-loopback host %q with a default development password (rotate credentials or set database.allow_insecure_defaults=true explicitly)",
+				host,
+			)
 		}
 	}
 	return nil
@@ -580,6 +629,20 @@ func ApplyMeshProfile(base WorkstationConfig, meshName string, p MeshProfileConf
 	out.ActiveMesh = meshName
 	out.MeshName = meshName
 
+	overridesEndpoint := strings.TrimSpace(p.BrokerURL) != "" ||
+		strings.TrimSpace(p.DatabaseURL) != "" ||
+		strings.TrimSpace(p.ReadOnlyDatabaseURL) != ""
+	if overridesEndpoint {
+		out.MQTTUsername = ""
+		out.MQTTPassword = ""
+		out.MQTT.Username = ""
+		out.MQTT.Password = ""
+		out.TLSInsecureSkipVerify = false
+		out.MQTT.TLSInsecureSkipVerify = false
+		out.DatabaseURL = ""
+		out.ReadOnlyDatabaseURL = ""
+	}
+
 	if v := strings.TrimSpace(p.BrokerURL); v != "" {
 		out.BrokerURL = v
 	}
@@ -900,6 +963,32 @@ func ReadPreviousMesh() (string, error) {
 	return ReadPreviousMeshForBrand(brand.Active())
 }
 
+var (
+	systemConfigRoot = "/etc"
+	syncFile         = func(f *os.File) error { return f.Sync() }
+	syncDir          = defaultSyncDir
+)
+
+func isIgnorableDirSyncErr(err error) bool {
+	return errors.Is(err, errors.ErrUnsupported) || errors.Is(err, syscall.EINVAL)
+}
+
+func defaultSyncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open config directory %s for sync: %w", dir, err)
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil && !isIgnorableDirSyncErr(syncErr) {
+		return fmt.Errorf("sync config directory %s: %w", dir, syncErr)
+	}
+	return closeErr
+}
+
 func writeAtomicFile0600(targetPath string, content []byte) error {
 	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -925,6 +1014,10 @@ func writeAtomicFile0600(targetPath string, content []byte) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := syncFile(tmp); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp file %s: %w", tmpName, err)
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -932,6 +1025,9 @@ func writeAtomicFile0600(targetPath string, content []byte) error {
 		return fmt.Errorf("commit %s: %w", targetPath, err)
 	}
 	cleanup = false
+	if err := syncDir(dir); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -996,16 +1092,16 @@ func resolveConfigFile(explicitPath, envKey, filename string) string {
 	}
 	dirSlug := activeCLIDirSlug()
 
-	candidates := []string{filename}
+	var candidates []string
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		candidates = append(candidates, filepath.Join(home, ".config", dirSlug, filename))
 		if dirSlug != "pigeons" {
 			candidates = append(candidates, filepath.Join(home, ".config", "pigeons", filename))
 		}
 	}
-	candidates = append(candidates, filepath.Join("/etc", dirSlug, filename))
+	candidates = append(candidates, filepath.Join(systemConfigRoot, dirSlug, filename))
 	if dirSlug != "pigeons" {
-		candidates = append(candidates, filepath.Join("/etc/pigeons", filename))
+		candidates = append(candidates, filepath.Join(systemConfigRoot, "pigeons", filename))
 	}
 	for _, c := range candidates {
 		if info, err := os.Stat(c); err == nil && !info.IsDir() {
@@ -1027,11 +1123,11 @@ func resolveWorkstationConfigFileForBrand(explicitPath string, b brand.Spec) str
 	dirSlug := brandCLIDirSlug(bSpec)
 	filename := dirSlug + ".toml"
 
-	candidates := []string{filename}
+	var candidates []string
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		candidates = append(candidates, filepath.Join(home, ".config", dirSlug, filename))
 	}
-	candidates = append(candidates, filepath.Join("/etc", dirSlug, filename))
+	candidates = append(candidates, filepath.Join(systemConfigRoot, dirSlug, filename))
 	for _, c := range candidates {
 		if info, err := os.Stat(c); err == nil && !info.IsDir() {
 			return c
@@ -1051,21 +1147,14 @@ func resolveWritableWorkstationConfigPathForBrand(explicitPath string, b brand.S
 	}
 	dirSlug := brandCLIDirSlug(bSpec)
 	filename := dirSlug + ".toml"
-	candidates := []string{filename}
-	var defaultUserPath string
-	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-		defaultUserPath = filepath.Join(home, ".config", dirSlug, filename)
-		candidates = append(candidates, defaultUserPath)
-	}
-	for _, c := range candidates {
-		if info, err := os.Stat(c); err == nil && !info.IsDir() {
-			return c, nil
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		if err != nil {
+			return "", fmt.Errorf("resolve user home directory for %s config: %w", filename, err)
 		}
+		return "", fmt.Errorf("resolve user home directory for %s config: empty home directory", filename)
 	}
-	if defaultUserPath != "" {
-		return defaultUserPath, nil
-	}
-	return filename, nil
+	return filepath.Join(home, ".config", dirSlug, filename), nil
 }
 
 func splitTOMLKeyPath(inner string) ([]string, bool) {
@@ -1245,6 +1334,19 @@ func UpsertWorkstationMeshProfileForBrand(explicitPath string, b brand.Spec, mes
 		}
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return "", fmt.Errorf("read %s: %w", targetPath, readErr)
+	} else if strings.TrimSpace(explicitPath) == "" && strings.TrimSpace(os.Getenv(bSpec.EnvPrefix+"_CONFIG")) == "" {
+		// When bootstrapping ~/.config/<cli>/<cli>.toml, preserve any active /etc/<cli>/<cli>.toml
+		// base settings and profiles instead of silently shadowing them.
+		if sysPath := resolveWorkstationConfigFileForBrand("", bSpec); sysPath != "" && sysPath != targetPath {
+			sysRaw, sysErr := os.ReadFile(sysPath)
+			if sysErr != nil {
+				return "", fmt.Errorf("read active base config %s: %w", sysPath, sysErr)
+			}
+			existingRaw = sysRaw
+			if _, decErr := toml.Decode(string(sysRaw), &existingCfg); decErr != nil {
+				return "", fmt.Errorf("decode active base config %s: %w", sysPath, decErr)
+			}
+		}
 	}
 
 	mergedProfile := patch.Apply(existingCfg.Meshes[meshName])
@@ -1435,33 +1537,137 @@ func prefixedEnv(brandPrefix, suffix string, fallbacks ...string) string {
 	return PrefixedEnv(brandPrefix, suffix, fallbacks...)
 }
 
-func effectivePostgresPort(u *url.URL) string {
-	if p := strings.TrimSpace(u.Port()); p != "" {
-		return p
+func pgTargetEndpoints(pgCfg *pgxpool.Config) []string {
+	if pgCfg == nil || pgCfg.ConnConfig == nil {
+		return nil
 	}
-	if strings.EqualFold(u.Scheme, "postgres") || strings.EqualFold(u.Scheme, "postgresql") {
-		return "5432"
+	seen := make(map[string]struct{}, 1+len(pgCfg.ConnConfig.Fallbacks))
+	var out []string
+	add := func(host string, port uint16) {
+		h := strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+		if h == "" {
+			return
+		}
+		if port == 0 {
+			port = 5432
+		}
+		key := fmt.Sprintf("%s:%d", h, port)
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			out = append(out, key)
+		}
 	}
-	return ""
+	add(pgCfg.ConnConfig.Host, pgCfg.ConnConfig.Port)
+	for _, fb := range pgCfg.ConnConfig.Fallbacks {
+		if fb != nil {
+			add(fb.Host, fb.Port)
+		}
+	}
+	return out
 }
 
 func urlTargetsEqual(a, b string) bool {
-	ua, errA := url.Parse(strings.TrimSpace(a))
-	ub, errB := url.Parse(strings.TrimSpace(b))
-	if errA != nil || errB != nil {
+	ta := strings.TrimSpace(a)
+	tb := strings.TrimSpace(b)
+	if ta == "" || tb == "" {
 		return false
 	}
-	ha := strings.TrimSpace(ua.Hostname())
-	hb := strings.TrimSpace(ub.Hostname())
-	if ha == "" || hb == "" || !strings.EqualFold(ha, hb) {
+	pgA, errA := pgxpool.ParseConfig(ta)
+	pgB, errB := pgxpool.ParseConfig(tb)
+	if errA != nil || errB != nil || pgA.ConnConfig == nil || pgB.ConnConfig == nil {
 		return false
 	}
-	if effectivePostgresPort(ua) != effectivePostgresPort(ub) {
+	if pgA.ConnConfig.Database != pgB.ConnConfig.Database {
 		return false
 	}
-	pa := strings.Trim(strings.TrimSpace(ua.Path), "/")
-	pb := strings.Trim(strings.TrimSpace(ub.Path), "/")
-	return pa == pb
+	return slices.Equal(pgTargetEndpoints(pgA), pgTargetEndpoints(pgB))
+}
+
+func parseLibpqKeywordValue(dsn string) map[string]string {
+	out := make(map[string]string)
+	n := len(dsn)
+	i := 0
+	isSpace := func(b byte) bool {
+		return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f' || b == '\v'
+	}
+	for i < n {
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		keyStart := i
+		for i < n && !isSpace(dsn[i]) && dsn[i] != '=' {
+			i++
+		}
+		key := strings.ToLower(dsn[keyStart:i])
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		if i >= n || dsn[i] != '=' {
+			break
+		}
+		i++
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		var val strings.Builder
+		if i < n && dsn[i] == '\'' {
+			i++
+			for i < n {
+				if dsn[i] == '\\' && i+1 < n {
+					i++
+					val.WriteByte(dsn[i])
+					i++
+					continue
+				}
+				if dsn[i] == '\'' {
+					i++
+					break
+				}
+				val.WriteByte(dsn[i])
+				i++
+			}
+		} else {
+			for i < n && !isSpace(dsn[i]) {
+				if dsn[i] == '\\' && i+1 < n {
+					i++
+					val.WriteByte(dsn[i])
+					i++
+					continue
+				}
+				val.WriteByte(dsn[i])
+				i++
+			}
+		}
+		if key != "" {
+			out[key] = val.String()
+		}
+	}
+	return out
+}
+
+func encodeURIQuery(q url.Values) string {
+	// pgconn URI parser percent-unescapes query values without treating '+' as a space.
+	return strings.ReplaceAll(q.Encode(), "+", "%20")
+}
+
+func stripCredentialQueryKeys(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return ""
+	}
+	for k := range q {
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "user", "password", "passfile":
+			q.Del(k)
+		}
+	}
+	return encodeURIQuery(q)
 }
 
 // deriveReadOnlyURL derives a least-privilege `pigeoncare_ro` DSN from baseDSN.
@@ -1472,10 +1678,60 @@ func deriveReadOnlyURL(baseDSN string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if !isURLHostLoopback(trimmed) && strings.TrimSpace(os.Getenv("PIGEONCARE_RO_PASSWORD")) == "" {
+	roPW := strings.TrimSpace(os.Getenv("PIGEONCARE_RO_PASSWORD"))
+	if !isURLHostLoopback(trimmed) && roPW == "" {
 		return ""
 	}
-	return db.DeriveReadOnlyURLFromAdmin(trimmed, "")
+	if u, err := url.Parse(trimmed); err == nil && u.Scheme != "" {
+		derived := db.DeriveReadOnlyURLFromAdmin(trimmed, "")
+		du, dErr := url.Parse(derived)
+		if dErr != nil {
+			return derived
+		}
+		du.RawQuery = stripCredentialQueryKeys(du.RawQuery)
+		return du.String()
+	}
+	kv := parseLibpqKeywordValue(trimmed)
+	host := ""
+	var port uint16 = 5432
+	dbname := ""
+	if pgCfg, err := pgxpool.ParseConfig(trimmed); err == nil && pgCfg.ConnConfig != nil {
+		host = strings.TrimSpace(pgCfg.ConnConfig.Host)
+		if pgCfg.ConnConfig.Port != 0 {
+			port = pgCfg.ConnConfig.Port
+		}
+		dbname = pgCfg.ConnConfig.Database
+	} else {
+		host = strings.TrimSpace(kv["host"])
+		if p, pErr := strconv.ParseUint(strings.TrimSpace(kv["port"]), 10, 16); pErr == nil && p > 0 {
+			port = uint16(p)
+		}
+		dbname = strings.TrimSpace(kv["dbname"])
+	}
+	if host == "" || strings.HasPrefix(host, "/") {
+		return ""
+	}
+	if roPW == "" {
+		roPW = "pigeoncare_readonly"
+	}
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword("pigeoncare_ro", roPW),
+		Host:   net.JoinHostPort(host, strconv.Itoa(int(port))),
+	}
+	if dbname != "" {
+		u.Path = "/" + dbname
+	}
+	q := url.Values{}
+	for _, key := range []string{"sslmode", "sslrootcert", "sslcert", "sslkey", "sslsni", "sslnegotiation", "channel_binding"} {
+		if val := strings.TrimSpace(kv[key]); val != "" {
+			q.Set(key, val)
+		}
+	}
+	if len(q) > 0 {
+		u.RawQuery = encodeURIQuery(q)
+	}
+	return u.String()
 }
 
 func splitCSVTags(raw string) []string {
@@ -1555,6 +1811,20 @@ func LoadCoopConfig(explicitPath string) (CoopConfig, error) {
 	if v := prefixedEnv(bp, "MQTT_TLS_CA", "PIGEONCOOP_MQTT_TLS_CA", "PIGEONS_MQTT_TLS_CA"); v != "" {
 		cfg.MQTT.TLSCAFile = v
 	}
+	if v := prefixedEnv(bp, "MQTT_TLS_CLIENT_CA", "PIGEONCOOP_MQTT_TLS_CLIENT_CA", "PIGEONS_MQTT_TLS_CLIENT_CA"); v != "" {
+		cfg.MQTT.TLSClientCAFile = v
+	}
+	if v := prefixedEnv(bp, "MQTT_TLS_CLIENT_CERT", "PIGEONCOOP_MQTT_TLS_CLIENT_CERT"); v != "" {
+		cfg.MQTT.TLSClientCertFile = v
+	}
+	if v := prefixedEnv(bp, "MQTT_TLS_CLIENT_KEY", "PIGEONCOOP_MQTT_TLS_CLIENT_KEY"); v != "" {
+		cfg.MQTT.TLSClientKeyFile = v
+	}
+	if v := prefixedEnv(bp, "MQTT_REQUIRE_CLIENT_CERT", "PIGEONCOOP_MQTT_REQUIRE_CLIENT_CERT", "PIGEONCOOP_REQUIRE_CLIENT_CERT"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.MQTT.RequireClientCert = b
+		}
+	}
 	if v := prefixedEnv(bp, "ALLOW_INSECURE_ANONYMOUS", "PIGEONCOOP_ALLOW_INSECURE_ANONYMOUS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.MQTT.AllowInsecureAnonymous = b
@@ -1589,6 +1859,9 @@ func LoadCoopConfig(explicitPath string) (CoopConfig, error) {
 	}
 	if err := core.ValidateTopicToken(cfg.Brand.TopicRoot); err != nil {
 		return cfg, fmt.Errorf("invalid brand topic_root: %w", err)
+	}
+	if err := db.ValidateSchemaIdentifier(cfg.Brand.MathSchema); err != nil {
+		return cfg, fmt.Errorf("invalid brand math_schema: %w", err)
 	}
 
 	cfg.Tags = core.NormalizeTags(cfg.Tags)
@@ -1664,6 +1937,9 @@ func LoadEdgeConfig(explicitPath string) (EdgeConfig, error) {
 	}
 	if err := core.ValidateTopicToken(cfg.Brand.TopicRoot); err != nil {
 		return cfg, fmt.Errorf("invalid brand topic_root: %w", err)
+	}
+	if err := db.ValidateSchemaIdentifier(cfg.Brand.MathSchema); err != nil {
+		return cfg, fmt.Errorf("invalid brand math_schema: %w", err)
 	}
 
 	cfg.Tags = core.NormalizeTags(cfg.Tags)
@@ -1758,6 +2034,9 @@ func applyWorkstationEnvAndReadOnlyDerivation(cfg WorkstationConfig) (Workstatio
 	if err := core.ValidateTopicToken(cfg.Brand.TopicRoot); err != nil {
 		return cfg, fmt.Errorf("invalid brand topic_root: %w", err)
 	}
+	if err := db.ValidateSchemaIdentifier(cfg.Brand.MathSchema); err != nil {
+		return cfg, fmt.Errorf("invalid brand math_schema: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -1778,6 +2057,9 @@ func LoadBaseWorkstationConfigForBrand(explicitPath string, b brand.Spec) (Works
 	}
 
 	cfg.Brand = mergeBrandOverlay(bSpec, cfg.Brand)
+	if err := db.ValidateSchemaIdentifier(cfg.Brand.MathSchema); err != nil {
+		return cfg, fmt.Errorf("invalid brand math_schema: %w", err)
+	}
 	cfg.MeshName = strings.TrimSpace(cfg.MeshName)
 	if cfg.MeshName != "" {
 		if err := core.ValidateMeshName(cfg.MeshName); err != nil {
@@ -1791,6 +2073,11 @@ func LoadBaseWorkstationConfigForBrand(explicitPath string, b brand.Spec) (Works
 		if root := strings.Trim(strings.TrimSpace(mp.Brand.TopicRoot), "/"); root != "" {
 			if err := core.ValidateTopicToken(root); err != nil {
 				return cfg, fmt.Errorf("invalid brand topic_root in [meshes.%s]: %w", meshKey, err)
+			}
+		}
+		if strings.TrimSpace(mp.Brand.MathSchema) != "" {
+			if err := db.ValidateSchemaIdentifier(mp.Brand.MathSchema); err != nil {
+				return cfg, fmt.Errorf("invalid brand math_schema in [meshes.%s]: %w", meshKey, err)
 			}
 		}
 	}

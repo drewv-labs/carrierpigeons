@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
@@ -77,12 +78,35 @@ func randomDelimiterTag() string {
 	return "untrusted_sample_rows_" + hex.EncodeToString(b[:])
 }
 
+// truncateUTF8Bytes trims b to at most maxBytes without splitting a multi-byte UTF-8 rune.
+func truncateUTF8Bytes(b []byte, maxBytes int) []byte {
+	if maxBytes <= 0 {
+		return nil
+	}
+	if len(b) <= maxBytes {
+		return b
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	for cut > 0 {
+		r, size := utf8.DecodeLastRune(b[:cut])
+		if r != utf8.RuneError || size != 1 {
+			break
+		}
+		cut--
+	}
+	return b[:cut]
+}
+
 // SubmitAndCertifyPMV executes the full PigeonMath View Propagation pipeline:
-//  1. Cache raw SQL intent in `pigeonmath.pmv_catalog` (survives LLM context flushes & supports backtesting).
-//  2. Optimize/tune SQL via PigeonCare (`optimizer`, optional if nil/offline).
-//  3. Validate read-only SELECT safety & PostgreSQL planner validity (`EXPLAIN (FORMAT JSON)`).
-//  4. Probe candidate SQL (`SELECT * FROM (<candidate>) AS _pmv_cert_probe LIMIT 5`) and run PigeonCare certification BEFORE materializing.
-//  5. Materialize `pigeonmath.pmv_<view_name>` only after certification succeeds, then mark `certified`.
+//  1. Optimize/tune SQL via PigeonCare (`optimizer`, optional if nil/offline).
+//  2. Validate read-only SELECT safety & PostgreSQL planner validity (`EXPLAIN (FORMAT JSON)`)
+//     and probe candidate SQL (`SELECT * FROM (<candidate>\n) AS _pmv_cert_probe LIMIT 5`) BEFORE mutating
+//     any existing certified row in `pigeonmath.pmv_catalog`.
+//  3. Run PigeonCare pre-materialization certification BEFORE replacing any existing certified catalog row or live view.
+//  4. Materialize `pigeonmath.pmv_<view_name>` and persist `certified` state in `pigeonmath.pmv_catalog`.
 func (e *Engine) SubmitAndCertifyPMV(
 	ctx context.Context,
 	actor string,
@@ -109,30 +133,26 @@ func (e *Engine) SubmitAndCertifyPMV(
 		actor = "operator"
 	}
 
-	// Step 1: Persist raw intent immediately in pmv_catalog before any LLM transformation.
-	draft, err := e.store.SavePMVDraft(ctx, db.PMVRecord{
+	existing, getErr := e.store.GetPMV(ctx, normName)
+	hasCertified := getErr == nil && existing != nil && existing.Status == "certified"
+
+	draft := &db.PMVRecord{
 		ViewName:     normName,
 		SubmittedBy:  actor,
 		RawIntentSQL: cleanedRaw,
-		Status:       "draft",
+		Status:       "validating",
 		ValidationReport: map[string]any{
-			"stage":     "cached_raw_intent",
+			"stage":     "pre_mutation_validation",
 			"cached_at": time.Now().UTC().Format(time.RFC3339),
 		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cache PMV raw intent: %w", err)
 	}
 
 	candidateSQL := cleanedRaw
 	var notes []string
 	usedOptimized := false
 
-	// Step 2: Optional PigeonCare SQL optimization pass.
+	// Step 1: Optional PigeonCare SQL optimization pass (in-memory before catalog mutation).
 	if optimizer != nil {
-		draft.Status = "optimizing"
-		_ = e.store.UpdatePMVState(ctx, *draft)
-
 		optCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		reply, optErr := optimizer.Chat(optCtx, sqlOptimizerSystemPrompt, []llm.Message{
 			{Role: "user", Content: fmt.Sprintf("View name: %s\nRaw SQL intent:\n%s", normName, cleanedRaw)},
@@ -157,12 +177,7 @@ func (e *Engine) SubmitAndCertifyPMV(
 		}
 	}
 
-	// Step 3: Structural & Read-Only Planner Verification via EXPLAIN.
-	draft.Status = "validating"
-	draft.OptimizedSQL = candidateSQL
-	draft.AgentNotes = strings.Join(notes, " | ")
-	_ = e.store.UpdatePMVState(ctx, *draft)
-
+	// Step 2: Structural & Read-Only Planner Verification via EXPLAIN before mutating pmv_catalog.
 	explainPlan, explainErr := e.store.ExplainReadOnly(ctx, candidateSQL)
 	if explainErr != nil && candidateSQL != cleanedRaw {
 		// Fallback to original raw intent SQL if LLM rewrite broke planner semantics!
@@ -179,19 +194,43 @@ func (e *Engine) SubmitAndCertifyPMV(
 			"explain_ok": false,
 			"error":      explainErr.Error(),
 		}
-		_ = e.store.UpdatePMVState(ctx, *draft)
 		return draft, fmt.Errorf("SQL validation failed for %s: %w", normName, explainErr)
 	}
 
-	// Step 4: Pre-materialization read-only sample probe & PigeonCare certification check.
-	// Probing as a subquery ensures uncertified or rejected SQL never overwrites an existing live view.
-	probeQuery := fmt.Sprintf("SELECT * FROM (%s) AS _pmv_cert_probe LIMIT 5", candidateSQL)
+	// Step 3: Pre-materialization read-only sample probe before mutating any existing certified pmv_catalog row.
+	// Newline before ')' guarantees trailing '--' SQL comments in candidateSQL cannot comment out the wrapper.
+	probeQuery := fmt.Sprintf("SELECT * FROM (%s\n) AS _pmv_cert_probe LIMIT 5", candidateSQL)
 	sampleRows, probeErr := e.store.QueryReadOnlyMaps(ctx, probeQuery)
 	if probeErr != nil {
 		draft.Status = "failed"
+		draft.OptimizedSQL = candidateSQL
 		draft.AgentNotes = strings.Join(append(notes, "sample probe failed: "+probeErr.Error()), " | ")
-		_ = e.store.UpdatePMVState(ctx, *draft)
+		draft.ValidationReport = map[string]any{
+			"explain_ok": true,
+			"probe_ok":   false,
+			"error":      probeErr.Error(),
+		}
 		return draft, fmt.Errorf("sample probe failed for %s.%s: %w", e.mathSchema, normName, probeErr)
+	}
+
+	// Persist raw intent draft once EXPLAIN + sample probe have succeeded when no certified view is live yet.
+	if !hasCertified {
+		persisted, saveErr := e.store.SavePMVDraft(ctx, db.PMVRecord{
+			ViewName:     normName,
+			SubmittedBy:  actor,
+			RawIntentSQL: cleanedRaw,
+			OptimizedSQL: candidateSQL,
+			Status:       "validating",
+			AgentNotes:   strings.Join(notes, " | "),
+			ValidationReport: map[string]any{
+				"stage":     "validated_probe",
+				"cached_at": time.Now().UTC().Format(time.RFC3339),
+			},
+		})
+		if saveErr != nil {
+			return nil, fmt.Errorf("cache PMV raw intent: %w", saveErr)
+		}
+		draft = persisted
 	}
 
 	failCertification := func(note string, report map[string]any, retErr error) (*db.PMVRecord, error) {
@@ -199,16 +238,16 @@ func (e *Engine) SubmitAndCertifyPMV(
 		draft.OptimizedSQL = candidateSQL
 		draft.AgentNotes = strings.Join(append(notes, note), " | ")
 		draft.ValidationReport = report
-		_ = e.store.UpdatePMVState(ctx, *draft)
+		if !hasCertified {
+			_ = e.store.UpdatePMVState(ctx, *draft)
+		}
 		return draft, retErr
 	}
 
 	postCheckVerdict := "structural & read-only probe passed"
 	if optimizer != nil {
 		sampleJSON, _ := json.Marshal(sampleRows)
-		if len(sampleJSON) > 4096 {
-			sampleJSON = sampleJSON[:4096]
-		}
+		sampleJSON = truncateUTF8Bytes(sampleJSON, 4096)
 		delim := randomDelimiterTag()
 		chkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		chkReply, chkErr := optimizer.Chat(chkCtx, sqlPostCheckSystemPrompt, []llm.Message{
@@ -256,27 +295,52 @@ func (e *Engine) SubmitAndCertifyPMV(
 		postCheckVerdict = trimmedVerdict
 	}
 
-	// Step 5: Materialize view strictly inside `pigeonmath` schema (`pigeonmath.pmv_*`) now that certification succeeded.
+	// Step 4: Materialize view strictly inside `pigeonmath` schema (`pigeonmath.pmv_*`) now that certification succeeded.
 	if err := e.store.MaterializePMV(ctx, normName, candidateSQL); err != nil {
-		draft.Status = "failed"
-		draft.AgentNotes = strings.Join(append(notes, "materialize failed: "+err.Error()), " | ")
-		_ = e.store.UpdatePMVState(ctx, *draft)
-		return draft, fmt.Errorf("materialize %s.%s: %w", e.mathSchema, normName, err)
+		return failCertification(
+			"materialize failed: "+err.Error(),
+			map[string]any{
+				"explain_ok":        true,
+				"post_check_passed": true,
+				"materialize_ok":    false,
+				"error":             err.Error(),
+			},
+			fmt.Errorf("materialize %s.%s: %w", e.mathSchema, normName, err),
+		)
 	}
 
 	notes = append(notes, postCheckVerdict)
-	draft.OptimizedSQL = candidateSQL
-	draft.Status = "certified"
-	draft.AgentNotes = strings.Join(notes, " | ")
-	draft.UpdatedAt = time.Now().UTC()
-	draft.ValidationReport = map[string]any{
+	now := time.Now().UTC()
+	report := map[string]any{
 		"explain_ok":         true,
 		"explain_plan_bytes": len(explainPlan),
 		"used_optimized_sql": usedOptimized,
 		"sample_row_count":   len(sampleRows),
 		"verdict":            postCheckVerdict,
-		"certified_at":       draft.UpdatedAt.Format(time.RFC3339),
+		"certified_at":       now.Format(time.RFC3339),
 	}
+
+	if hasCertified {
+		persisted, saveErr := e.store.SavePMVDraft(ctx, db.PMVRecord{
+			ViewName:         normName,
+			SubmittedBy:      actor,
+			RawIntentSQL:     cleanedRaw,
+			OptimizedSQL:     candidateSQL,
+			Status:           "certified",
+			AgentNotes:       strings.Join(notes, " | "),
+			ValidationReport: report,
+		})
+		if saveErr != nil {
+			return nil, fmt.Errorf("cache certified PMV intent: %w", saveErr)
+		}
+		draft = persisted
+	}
+
+	draft.OptimizedSQL = candidateSQL
+	draft.Status = "certified"
+	draft.AgentNotes = strings.Join(notes, " | ")
+	draft.UpdatedAt = now
+	draft.ValidationReport = report
 
 	if err := e.store.UpdatePMVState(ctx, *draft); err != nil {
 		return draft, fmt.Errorf("save certified PMV state: %w", err)

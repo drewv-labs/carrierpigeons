@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -58,6 +59,7 @@ func truncateRunes(s string, maxRunes int, ellipsis string) string {
 
 // DashboardOptions configures the multi-tab Pigeons TUI control plane.
 type DashboardOptions struct {
+	Context       context.Context
 	Config        config.WorkstationConfig
 	Store         db.AgentSafeDB
 	Care          *pigeoncare.Service
@@ -70,14 +72,38 @@ type DashboardOptions struct {
 
 // ApprovalPromptMsg bridges an async PigeonCare PolicyGate prompt into the Bubble Tea event loop.
 type ApprovalPromptMsg struct {
+	StreamID uint64
 	Proposal pigeoncare.ActionProposal
 	ReplyCh  chan<- pigeoncare.ConfirmationDecision
+}
+
+type approvalStreamIDKey struct{}
+
+func withApprovalStreamID(ctx context.Context, streamID uint64) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, approvalStreamIDKey{}, streamID)
+}
+
+func approvalStreamIDFromContext(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	id, _ := ctx.Value(approvalStreamIDKey{}).(uint64)
+	return id
+}
+
+type pollGuard struct {
+	inFlight atomic.Bool
+	nextSeq  atomic.Uint64
 }
 
 type overviewTickMsg time.Time
 type mathTickMsg time.Time
 
 type overviewDataMsg struct {
+	seq     uint64
 	mesh    *core.MeshIdentity
 	nodes   []db.NodeSummary
 	runners []RunnerRecord
@@ -85,6 +111,7 @@ type overviewDataMsg struct {
 }
 
 type mathDataMsg struct {
+	seq  uint64
 	snap *pigeonmath.DashboardSnapshot
 	err  error
 }
@@ -95,6 +122,8 @@ type abortResultMsg struct {
 
 // DashboardModel is the whitelabelable 4-tab Bubble Tea TUI for Pigeons.
 type DashboardModel struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
 	cfg           config.WorkstationConfig
 	brand         brand.Spec
 	store         db.AgentSafeDB
@@ -110,14 +139,18 @@ type DashboardModel struct {
 	statusBanner string
 	meshIdentity *core.MeshIdentity
 
-	// Tab 1 & 2 state
-	nodes        []db.NodeSummary
-	runners      []RunnerRecord
-	runnerCursor int
+	// Tab 1 & 2 state + polling guards
+	nodes           []db.NodeSummary
+	runners         []RunnerRecord
+	runnerCursor    int
+	overviewPoll    *pollGuard
+	lastOverviewSeq uint64
 
-	// Tab 3 (PigeonMath) state
-	mathSnap *pigeonmath.DashboardSnapshot
-	mathErr  error
+	// Tab 3 (PigeonMath) state + polling guards
+	mathSnap    *pigeonmath.DashboardSnapshot
+	mathErr     error
+	mathPoll    *pollGuard
+	lastMathSeq uint64
 
 	// Tab 4 (PigeonCare) state
 	chatHistory     []llm.Message
@@ -152,7 +185,15 @@ func NewManagedChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg,
 		})
 	}
 	prompter := func(ctx context.Context, proposal pigeoncare.ActionProposal) (pigeoncare.ConfirmationDecision, error) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		replyCh := make(chan pigeoncare.ConfirmationDecision, 1)
+		msg := ApprovalPromptMsg{
+			StreamID: approvalStreamIDFromContext(ctx),
+			Proposal: proposal,
+			ReplyCh:  replyCh,
+		}
 
 		mu.RLock()
 		if closed {
@@ -160,7 +201,7 @@ func NewManagedChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg,
 			return pigeoncare.DecisionDeny, context.Canceled
 		}
 		select {
-		case ch <- ApprovalPromptMsg{Proposal: proposal, ReplyCh: replyCh}:
+		case ch <- msg:
 			mu.RUnlock()
 		case <-done:
 			mu.RUnlock()
@@ -182,7 +223,22 @@ func NewManagedChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg,
 	return prompter, ch, closeFn
 }
 
+// NewChannelPrompterWithContext creates an async PolicyGate Prompter paired with an inbox channel
+// that automatically closes when ctx is cancelled.
+func NewChannelPrompterWithContext(ctx context.Context) (pigeoncare.Prompter, <-chan ApprovalPromptMsg) {
+	prompter, ch, closeFn := NewManagedChannelPrompter()
+	if ctx != nil && ctx.Done() != nil {
+		go func() {
+			<-ctx.Done()
+			closeFn()
+		}()
+	}
+	return prompter, ch
+}
+
 // NewChannelPrompter creates an async PolicyGate Prompter paired with a channel consumed by DashboardModel.
+//
+// Deprecated: Use NewManagedChannelPrompter or NewChannelPrompterWithContext so approval channels close deterministically on exit.
 func NewChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg) {
 	prompter, ch, _ := NewManagedChannelPrompter()
 	return prompter, ch
@@ -190,6 +246,12 @@ func NewChannelPrompter() (pigeoncare.Prompter, <-chan ApprovalPromptMsg) {
 
 // NewDashboardModel constructs the unified Pigeons multi-tab TUI.
 func NewDashboardModel(opts DashboardOptions) DashboardModel {
+	baseCtx := opts.Context
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	modelCtx, modelCancel := context.WithCancel(baseCtx)
+
 	bSpec := opts.Config.Brand.MergeWithDefaults()
 	var mathEng *pigeonmath.Engine
 	if opts.Care != nil {
@@ -220,6 +282,8 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 	}
 
 	return DashboardModel{
+		ctx:           modelCtx,
+		cancel:        modelCancel,
 		cfg:           opts.Config,
 		brand:         bSpec,
 		store:         opts.Store,
@@ -232,9 +296,22 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 		height:        32,
 		focusRequest:  opts.FocusRequest,
 		statusBanner:  banner,
+		overviewPoll:  &pollGuard{},
+		mathPoll:      &pollGuard{},
 		chatHistory:   chatHist,
 		uiHistory:     uiHist,
 	}
+}
+
+func (m DashboardModel) baseContext() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
+}
+
+func (m DashboardModel) waitForApprovalCmd() tea.Cmd {
+	return waitForApprovalCmdWithContext(m.baseContext(), m.approvalInbox)
 }
 
 func (m DashboardModel) Init() tea.Cmd {
@@ -245,19 +322,33 @@ func (m DashboardModel) Init() tea.Cmd {
 		m.scheduleMathTick(),
 	}
 	if m.approvalInbox != nil {
-		cmds = append(cmds, waitForApprovalCmd(m.approvalInbox))
+		cmds = append(cmds, m.waitForApprovalCmd())
 	}
 	return tea.Batch(cmds...)
 }
 
-func waitForApprovalCmd(inbox <-chan ApprovalPromptMsg) tea.Cmd {
+func waitForApprovalCmdWithContext(ctx context.Context, inbox <-chan ApprovalPromptMsg) tea.Cmd {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return func() tea.Msg {
-		req, ok := <-inbox
-		if !ok {
+		if inbox == nil {
 			return nil
 		}
-		return req
+		select {
+		case req, ok := <-inbox:
+			if !ok {
+				return nil
+			}
+			return req
+		case <-ctx.Done():
+			return nil
+		}
 	}
+}
+
+func waitForApprovalCmd(inbox <-chan ApprovalPromptMsg) tea.Cmd {
+	return waitForApprovalCmdWithContext(context.Background(), inbox)
 }
 
 func (m DashboardModel) scheduleOverviewTick() tea.Cmd {
@@ -295,18 +386,30 @@ func extractTargetNodes(raw any) []string {
 
 func (m DashboardModel) fetchOverviewCmd() tea.Cmd {
 	store := m.store
-	return func() tea.Msg {
-		if store == nil {
-			return overviewDataMsg{}
+	if store == nil || m.quitting {
+		return nil
+	}
+	poll := m.overviewPoll
+	var seq uint64
+	if poll != nil {
+		if !poll.inFlight.CompareAndSwap(false, true) {
+			return nil
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		seq = poll.nextSeq.Add(1)
+	}
+	baseCtx := m.baseContext()
+	return func() tea.Msg {
+		if poll != nil {
+			defer poll.inFlight.Store(false)
+		}
+		ctx, cancel := context.WithTimeout(baseCtx, 4*time.Second)
 		defer cancel()
 
 		meshID, _ := store.GetMeshIdentity(ctx)
 
 		nodes, err := store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 		if err != nil {
-			return overviewDataMsg{mesh: meshID, err: err}
+			return overviewDataMsg{seq: seq, mesh: meshID, err: err}
 		}
 
 		rows, rErr := store.QueryReadOnlyMaps(ctx, `
@@ -352,26 +455,39 @@ func (m DashboardModel) fetchOverviewCmd() tea.Cmd {
 				})
 			}
 		}
-		return overviewDataMsg{mesh: meshID, nodes: nodes, runners: recs}
+		return overviewDataMsg{seq: seq, mesh: meshID, nodes: nodes, runners: recs}
 	}
 }
 
 func (m DashboardModel) fetchMathCmd() tea.Cmd {
 	eng := m.math
-	return func() tea.Msg {
-		if eng == nil {
-			return mathDataMsg{}
+	if eng == nil || m.quitting {
+		return nil
+	}
+	poll := m.mathPoll
+	var seq uint64
+	if poll != nil {
+		if !poll.inFlight.CompareAndSwap(false, true) {
+			return nil
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		seq = poll.nextSeq.Add(1)
+	}
+	baseCtx := m.baseContext()
+	return func() tea.Msg {
+		if poll != nil {
+			defer poll.inFlight.Store(false)
+		}
+		ctx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
 		defer cancel()
 		snap, err := eng.FetchDashboardSnapshot(ctx, 30)
-		return mathDataMsg{snap: snap, err: err}
+		return mathDataMsg{seq: seq, snap: snap, err: err}
 	}
 }
 
 func (m DashboardModel) dispatchAbortCmd(rec RunnerRecord) tea.Cmd {
 	disp := m.dispatcher
 	operator := m.cfg.Operator
+	baseCtx := m.baseContext()
 	return func() tea.Msg {
 		if disp == nil {
 			return abortResultMsg{status: "MQTT dispatcher unavailable"}
@@ -393,13 +509,26 @@ func (m DashboardModel) dispatchAbortCmd(rec RunnerRecord) tea.Cmd {
 			RequestedBy: operator,
 			RequestedAt: time.Now().UTC(),
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		ctx, cancel := context.WithTimeout(baseCtx, 4*time.Second)
 		defer cancel()
 		if err := disp(ctx, req); err != nil {
 			return abortResultMsg{status: fmt.Sprintf("Abort failed: %v", err)}
 		}
 		return abortResultMsg{status: fmt.Sprintf("Sent abort for %s -> %v", rec.Runner, targetNodes)}
 	}
+}
+
+func (m *DashboardModel) clearPendingApproval() {
+	if m.pendingApproval == nil {
+		return
+	}
+	if m.pendingApproval.ReplyCh != nil {
+		select {
+		case m.pendingApproval.ReplyCh <- pigeoncare.DecisionDeny:
+		default:
+		}
+	}
+	m.pendingApproval = nil
 }
 
 func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -410,12 +539,27 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case overviewTickMsg:
+		if m.quitting {
+			return m, nil
+		}
 		return m, tea.Batch(m.fetchOverviewCmd(), m.scheduleOverviewTick())
 
 	case mathTickMsg:
+		if m.quitting {
+			return m, nil
+		}
 		return m, tea.Batch(m.fetchMathCmd(), m.scheduleMathTick())
 
 	case overviewDataMsg:
+		if m.quitting {
+			return m, nil
+		}
+		if m.lastOverviewSeq > 0 && msg.seq <= m.lastOverviewSeq {
+			return m, nil
+		}
+		if msg.seq > 0 {
+			m.lastOverviewSeq = msg.seq
+		}
 		if msg.mesh != nil {
 			m.meshIdentity = msg.mesh
 		}
@@ -434,6 +578,15 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case mathDataMsg:
+		if m.quitting {
+			return m, nil
+		}
+		if m.lastMathSeq > 0 && msg.seq <= m.lastMathSeq {
+			return m, nil
+		}
+		if msg.seq > 0 {
+			m.lastMathSeq = msg.seq
+		}
 		m.mathErr = msg.err
 		if msg.snap != nil {
 			m.mathSnap = msg.snap
@@ -441,16 +594,36 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case abortResultMsg:
+		if m.quitting {
+			return m, nil
+		}
 		m.statusBanner = msg.status
 		return m, m.fetchOverviewCmd()
 
 	case ApprovalPromptMsg:
-		m.pendingApproval = &msg
+		stale := m.quitting ||
+			(msg.StreamID != 0 && (msg.StreamID != m.activeStreamID || !m.waiting)) ||
+			(msg.StreamID == 0 && m.activeStreamID != 0 && !m.waiting)
+		if stale {
+			if msg.ReplyCh != nil {
+				select {
+				case msg.ReplyCh <- pigeoncare.DecisionDeny:
+				default:
+				}
+			}
+			if !m.quitting && m.approvalInbox != nil {
+				return m, m.waitForApprovalCmd()
+			}
+			return m, nil
+		}
+		m.clearPendingApproval()
+		msgCopy := msg
+		m.pendingApproval = &msgCopy
 		m.activeTab = TabPigeonCare
 		return m, nil
 
 	case streamErrMsg:
-		if msg.streamID != m.activeStreamID {
+		if m.quitting || msg.streamID != m.activeStreamID {
 			return m, nil
 		}
 		m.waiting = false
@@ -458,6 +631,8 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
+		hadPending := m.pendingApproval != nil
+		m.clearPendingApproval()
 		m.currentResponse = nil
 		errLine := agentStyle.Render(m.brand.AgentName + " Error: " + msg.err.Error())
 		if len(m.uiHistory) > 0 {
@@ -465,10 +640,13 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.uiHistory = append(m.uiHistory, errLine)
 		}
+		if hadPending && m.approvalInbox != nil {
+			return m, m.waitForApprovalCmd()
+		}
 		return m, nil
 
 	case streamTokenMsg:
-		if msg.streamID != m.activeStreamID {
+		if m.quitting || msg.streamID != m.activeStreamID {
 			return m, nil
 		}
 		if m.currentResponse == nil {
@@ -478,7 +656,7 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForToken(msg.streamID, msg.ch)
 
 	case streamDoneMsg:
-		if msg.streamID != m.activeStreamID {
+		if m.quitting || msg.streamID != m.activeStreamID {
 			return m, nil
 		}
 		m.waiting = false
@@ -486,6 +664,8 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancel()
 			m.streamCancel = nil
 		}
+		hadPending := m.pendingApproval != nil
+		m.clearPendingApproval()
 		reply := ""
 		if m.currentResponse != nil {
 			reply = m.currentResponse.String()
@@ -498,7 +678,11 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.uiHistory = append(m.uiHistory, doneLine)
 		}
 		m.chatHistory = append(m.chatHistory, llm.Message{Role: "assistant", Content: reply})
-		return m, tea.Batch(m.fetchOverviewCmd(), m.fetchMathCmd())
+		cmds := []tea.Cmd{m.fetchOverviewCmd(), m.fetchMathCmd()}
+		if hadPending && m.approvalInbox != nil {
+			cmds = append(cmds, m.waitForApprovalCmd())
+		}
+		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
 		// Global quit on Ctrl+C
@@ -520,11 +704,16 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			default:
 				return m, nil
 			}
-			m.pendingApproval.ReplyCh <- decision
+			if m.pendingApproval.ReplyCh != nil {
+				select {
+				case m.pendingApproval.ReplyCh <- decision:
+				default:
+				}
+			}
 			m.statusBanner = fmt.Sprintf("Confirmation decision: %s (%s)", decision, m.pendingApproval.Proposal.Title)
 			m.pendingApproval = nil
 			if m.approvalInbox != nil {
-				return m, waitForApprovalCmd(m.approvalInbox)
+				return m, m.waitForApprovalCmd()
 			}
 			return m, nil
 		}
@@ -598,6 +787,11 @@ func (m DashboardModel) quit() (tea.Model, tea.Cmd) {
 		m.streamCancel()
 		m.streamCancel = nil
 	}
+	m.clearPendingApproval()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
 	m.waiting = false
 	m.currentResponse = nil
 	m.activeStreamID++
@@ -612,10 +806,15 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.streamCancel()
 				m.streamCancel = nil
 			}
+			hadPending := m.pendingApproval != nil
+			m.clearPendingApproval()
 			m.waiting = false
 			m.currentResponse = nil
 			m.activeStreamID++
 			m.statusBanner = "Cancelled active stream."
+			if hadPending && m.approvalInbox != nil {
+				return m, m.waitForApprovalCmd()
+			}
 			return m, nil
 		}
 		return m.quit()
@@ -646,7 +845,7 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.activeStreamID++
 		streamID := m.activeStreamID
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(withApprovalStreamID(m.baseContext(), streamID))
 		m.streamCancel = cancel
 		historySnap := slices.Clone(m.chatHistory)
 		careSvc := m.care

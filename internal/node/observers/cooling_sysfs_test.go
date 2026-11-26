@@ -3,7 +3,9 @@ package observers
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -127,5 +129,167 @@ func TestObserveSysfsThermalsAndDiscoverSysfsAMDCards(t *testing.T) {
 	cards := discoverSysfsAMDCards(sysRoot)
 	if len(cards) != 1 || filepath.Base(cards[0]) != "card0" {
 		t.Fatalf("expected only AMD card0 to be discovered, got %v", cards)
+	}
+}
+
+func TestObserveSysfsThermalsMillidegreeScalingAndBounds(t *testing.T) {
+	cases := []struct {
+		name     string
+		rawTemp  string
+		wantOK   bool
+		wantTemp float64
+	}{
+		{name: "near_zero_millidegrees", rawTemp: "150\n", wantOK: true, wantTemp: 0.2},
+		{name: "exact_zero_c", rawTemp: "0\n", wantOK: true, wantTemp: 0.0},
+		{name: "subzero_cold_soak", rawTemp: "-15240\n", wantOK: true, wantTemp: -15.2},
+		{name: "min_bound_minus_40", rawTemp: "-40000\n", wantOK: true, wantTemp: -40.0},
+		{name: "max_bound_150", rawTemp: "150000\n", wantOK: true, wantTemp: 150.0},
+		{name: "below_min_bound", rawTemp: "-40100\n", wantOK: false},
+		{name: "above_max_bound", rawTemp: "150100\n", wantOK: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sysRoot := t.TempDir()
+			writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone0/type", "cpu-thermal\n")
+			writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone0/temp", tc.rawTemp)
+
+			ev := core.NewCTDPayload("rv64-cold", "host-os", "active")
+			observeSysfsThermals(sysRoot, ev)
+
+			gotCPU, hasCPU := ev.Metrics["cpu_temp_c"]
+			gotSoC, hasSoC := ev.Metrics["soc_temp_c"]
+			if tc.wantOK {
+				if !hasCPU || !hasSoC {
+					t.Fatalf("expected cpu_temp_c and soc_temp_c for %q, got metrics=%+v", tc.rawTemp, ev.Metrics)
+				}
+				if gotCPU != tc.wantTemp || gotSoC != tc.wantTemp {
+					t.Fatalf("expected %.1f C, got cpu=%v soc=%v", tc.wantTemp, gotCPU, gotSoC)
+				}
+			} else if hasCPU || hasSoC {
+				t.Fatalf("expected out-of-range temp %q to be rejected, got cpu=%v soc=%v", tc.rawTemp, gotCPU, gotSoC)
+			}
+		})
+	}
+}
+
+func TestObserveSysfsThermalsFiltersNonHostThermalZoneTypes(t *testing.T) {
+	sysRoot := t.TempDir()
+	writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone0/type", "iwlwifi_1\n")
+	writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone0/temp", "95000\n")
+	writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone1/type", "mt7915_phy0\n")
+	writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone1/temp", "92000\n")
+	writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone2/type", "acpitz\n")
+	writeSysfsFile(t, sysRoot, "class/thermal/thermal_zone2/temp", "42000\n")
+
+	ev := core.NewCTDPayload("edge-node", "host-os", "active")
+	observeSysfsThermals(sysRoot, ev)
+
+	if got := ev.Metrics["cpu_temp_c"]; got != 42.0 {
+		t.Fatalf("expected non-host thermal_zone types to be filtered leaving 42.0 C, got %v", got)
+	}
+}
+
+func TestObserveSysfsThermalsIgnoresFaultyHwmonSensors(t *testing.T) {
+	sysRoot := t.TempDir()
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/name", "coretemp\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp1_input", "110000\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp1_fault", "1\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp2_input", "48500\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp2_fault", "0\n")
+
+	ev := core.NewCTDPayload("edge-node", "host-os", "active")
+	observeSysfsThermals(sysRoot, ev)
+	if got := ev.Metrics["cpu_temp_c"]; got != 48.5 {
+		t.Fatalf("expected faulty temp1 to be ignored and temp2=48.5 selected, got %v", got)
+	}
+
+	// Flip temp2_fault to 1 dynamically; cached reader must immediately ignore temp2 as well.
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp2_fault", "1\n")
+	ev2 := core.NewCTDPayload("edge-node", "host-os", "active")
+	observeSysfsThermals(sysRoot, ev2)
+	if _, hasTemp := ev2.Metrics["cpu_temp_c"]; hasTemp {
+		t.Fatalf("expected all faulty hwmon sensors to be ignored, got %v", ev2.Metrics["cpu_temp_c"])
+	}
+}
+
+func TestSysfsDiscoveryCacheReuseReadErrorAndTTLExpiry(t *testing.T) {
+	sysRoot := t.TempDir()
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/name", "coretemp\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp1_input", "45000\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/fan1_label", "CPU Fan\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/fan1_input", "1500\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/pwm1", "128\n")
+
+	now := time.Unix(1_700_000_000, 0)
+	var nowMu sync.Mutex
+	cache := &sysfsDiscoveryCache{
+		now: func() time.Time {
+			nowMu.Lock()
+			defer nowMu.Unlock()
+			return now
+		},
+		thermals: make(map[string]*cachedThermalTopology),
+		coolings: make(map[string]*cachedCoolingTopology),
+	}
+
+	// Tick 1: initial discovery.
+	ev1 := core.NewCTDPayload("cache-node", "host-os", "active")
+	cache.observeThermals(sysRoot, ev1)
+	cache.observeCooling(sysRoot, ev1)
+	if ev1.Metrics["cpu_temp_c"] != 45.0 || ev1.Metrics["cpu_fan_rpm"] != 1500 {
+		t.Fatalf("unexpected initial cached sample: %+v", ev1.Metrics)
+	}
+
+	// Tick 2: update existing cached files AND add hwmon1; within 5m TTL, cached hwmon0 paths/labels must be reused.
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/temp1_input", "47000\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/fan1_input", "1800\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon0/fan1_label", "Changed Label Should Wait For Refresh\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon1/name", "coretemp\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon1/temp1_input", "80000\n")
+
+	ev2 := core.NewCTDPayload("cache-node", "host-os", "active")
+	cache.observeThermals(sysRoot, ev2)
+	cache.observeCooling(sysRoot, ev2)
+	if ev2.Metrics["cpu_temp_c"] != 47.0 {
+		t.Fatalf("expected cached hwmon0 temp 47.0 (ignoring uncached hwmon1 80.0 within TTL), got %v", ev2.Metrics["cpu_temp_c"])
+	}
+	fans2 := ev2.Metrics["fans_rpm"].(map[string]int)
+	if fans2["coretemp:cpu_fan"] != 1800 {
+		t.Fatalf("expected cached fan1_label key coretemp:cpu_fan=1800, got %+v", fans2)
+	}
+
+	// Tick 3: remove cached hwmon0 files to force read error -> cache must refresh immediately and discover hwmon1.
+	if err := os.Remove(filepath.Join(sysRoot, "class/hwmon/hwmon0/temp1_input")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(sysRoot, "class/hwmon/hwmon0/fan1_input")); err != nil {
+		t.Fatal(err)
+	}
+	ev3 := core.NewCTDPayload("cache-node", "host-os", "active")
+	cache.observeThermals(sysRoot, ev3)
+	cache.observeCooling(sysRoot, ev3)
+	if ev3.Metrics["cpu_temp_c"] != 80.0 {
+		t.Fatalf("expected read error to refresh thermal cache and read hwmon1=80.0, got %v", ev3.Metrics["cpu_temp_c"])
+	}
+	if _, hasFan := ev3.Metrics["cpu_fan_rpm"]; hasFan {
+		t.Fatalf("expected cooling cache refresh after fan1_input removal to omit stale fan, got %v", ev3.Metrics["cpu_fan_rpm"])
+	}
+
+	// Tick 4: add hwmon2 and advance clock >= 5m -> TTL expiry refreshes cache.
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon2/name", "coretemp\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon2/temp1_input", "91000\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon2/fan1_label", "CPU Cooler\n")
+	writeSysfsFile(t, sysRoot, "class/hwmon/hwmon2/fan1_input", "2400\n")
+
+	nowMu.Lock()
+	now = now.Add(5*time.Minute + time.Second)
+	nowMu.Unlock()
+
+	ev4 := core.NewCTDPayload("cache-node", "host-os", "active")
+	cache.observeThermals(sysRoot, ev4)
+	cache.observeCooling(sysRoot, ev4)
+	if ev4.Metrics["cpu_temp_c"] != 91.0 || ev4.Metrics["cpu_fan_rpm"] != 2400 {
+		t.Fatalf("expected 5m TTL expiry to refresh caches and pick up hwmon2, got %+v", ev4.Metrics)
 	}
 }

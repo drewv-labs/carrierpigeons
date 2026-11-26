@@ -38,25 +38,37 @@ services:
     command:
       - |
         set -e
-        touch /mosquitto/data/passwd
-        chmod 0600 /mosquitto/data/passwd
-        mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_USERNAME}" "$${MQTT_PASSWORD}"
+        passwd_tmp="$$(mktemp /mosquitto/data/.passwd.tmp.XXXXXX)"
+        trap 'rm -f "$${passwd_tmp}"' EXIT
+        chmod 0600 "$${passwd_tmp}"
+        mosquitto_passwd -b "$${passwd_tmp}" "$${MQTT_USERNAME}" "$${MQTT_PASSWORD}"
         if [ -n "$${MQTT_EDGE_USERNAME}" ] && [ "$${MQTT_EDGE_USERNAME}" != "$${MQTT_USERNAME}" ]; then
-          mosquitto_passwd -b /mosquitto/data/passwd "$${MQTT_EDGE_USERNAME}" "$${MQTT_EDGE_PASSWORD}"
+          mosquitto_passwd -b "$${passwd_tmp}" "$${MQTT_EDGE_USERNAME}" "$${MQTT_EDGE_PASSWORD}"
         fi
         if [ -n "$${MQTT_EDGE_NODES}" ]; then
           OLD_IFS="$$IFS"
+          case "$$-" in
+            *f*) was_noglob=1 ;;
+            *) was_noglob=0 ;;
+          esac
+          set -f
           IFS=','
           for entry in $${MQTT_EDGE_NODES}; do
             node_user="$${entry%%:*}"
             node_pass="$${entry#*:}"
             if [ -n "$${node_user}" ] && [ "$${node_pass}" != "$${entry}" ] && [ -n "$${node_pass}" ]; then
-              mosquitto_passwd -b /mosquitto/data/passwd "$${node_user}" "$${node_pass}"
+              mosquitto_passwd -b "$${passwd_tmp}" "$${node_user}" "$${node_pass}"
             fi
           done
           IFS="$$OLD_IFS"
+          if [ "$${was_noglob}" -eq 0 ]; then
+            set +f
+          fi
         fi
-        chown mosquitto:mosquitto /mosquitto/data/passwd 2>/dev/null || true
+        chown mosquitto:mosquitto "$${passwd_tmp}" 2>/dev/null || true
+        chmod 0600 "$${passwd_tmp}"
+        mv -f "$${passwd_tmp}" /mosquitto/data/passwd
+        trap - EXIT
 
         awk -v admin_user="$${MQTT_USERNAME}" '{
           if ($$0 == "user pigeoncoop") {

@@ -3,14 +3,68 @@ package observers
 import (
 	"context"
 	"log"
-	"strconv"
 	"strings"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 )
 
 func observeGPUNvidia(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	observeGPUNvidiaWithBin(ctx, pub, nodeID, "nvidia-smi")
+}
+
+func parseNvidiaSMIOutput(rawOutput, nodeID string) []*core.CTDPayload {
+	trimmed := strings.TrimSpace(rawOutput)
+	if trimmed == "" {
+		return nil
+	}
+
+	var events []*core.CTDPayload
+	for line := range strings.SplitSeq(trimmed, "\n") {
+		fields := strings.Split(line, ",")
+		if len(fields) < 7 {
+			continue
+		}
+
+		gpuIdx := strings.TrimSpace(fields[0])
+		componentID := "nvidia-gpu-" + gpuIdx
+		if gpuIdx == "" || core.ValidateTopicToken(componentID) != nil {
+			continue
+		}
+
+		gpuName := strings.TrimSpace(fields[1])
+		event := core.NewCTDPayload(nodeID, componentID, "active")
+
+		if temp, ok := parseFiniteFloat(fields[2]); ok {
+			event.AddMetric("temperature_c", temp)
+		}
+		if util, ok := parseFiniteFloat(fields[3]); ok {
+			event.AddMetric("utilization_pct", util)
+		}
+		if memUsed, ok := parseFiniteFloat(fields[4]); ok {
+			event.AddMetric("memory_used_mb", memUsed)
+		}
+		if memTotal, ok := parseFiniteFloat(fields[5]); ok {
+			event.AddMetric("memory_total_mb", memTotal)
+		}
+		if powerW, ok := parseFiniteFloat(fields[6]); ok {
+			event.AddMetric("power_w", powerW)
+		}
+		if len(fields) >= 8 {
+			if fanPct, ok := parseFiniteFloat(fields[7]); ok && fanPct >= 0 {
+				event.AddMetric("fan_speed_pct", fanPct)
+			}
+		}
+
+		if len(event.Metrics) == 0 {
+			continue
+		}
+		if gpuName != "" {
+			event.AddParam("gpu_name", gpuName)
+		}
+		events = append(events, event)
+	}
+	return events
 }
 
 func observeGPUNvidiaWithBin(ctx context.Context, pub core.TelemetryPublisher, nodeID, nvidiaBin string) {
@@ -19,56 +73,23 @@ func observeGPUNvidiaWithBin(ctx context.Context, pub core.TelemetryPublisher, n
 	}
 
 	runPeriodicObserver(ctx, true, func() {
+		cmdCtx, cancelCmd := observer.ContextUntilPaused(ctx)
 		out, err := runCommand(
-			ctx,
+			cmdCtx,
 			defaultCmdTimeout,
 			nvidiaBin,
 			"--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,fan.speed",
 			"--format=csv,noheader,nounits",
 		)
+		cancelCmd()
 		if err != nil {
 			log.Printf("[Nvidia GPU Observer] Sensor query failed: %v", err)
 			return
 		}
 
-		rawOutput := strings.TrimSpace(string(out))
-		if rawOutput == "" {
-			return
-		}
-
-		for line := range strings.SplitSeq(rawOutput, "\n") {
-			fields := strings.Split(line, ",")
-			if len(fields) < 7 {
-				continue
-			}
-
-			gpuIdx := strings.TrimSpace(fields[0])
-			gpuName := strings.TrimSpace(fields[1])
-			temp, _ := strconv.ParseFloat(strings.TrimSpace(fields[2]), 64)
-			util, _ := strconv.ParseFloat(strings.TrimSpace(fields[3]), 64)
-			memUsed, _ := strconv.ParseFloat(strings.TrimSpace(fields[4]), 64)
-			memTotal, _ := strconv.ParseFloat(strings.TrimSpace(fields[5]), 64)
-			powerW, _ := strconv.ParseFloat(strings.TrimSpace(fields[6]), 64)
-
-			componentID := "nvidia-gpu-" + gpuIdx
-			event := core.NewCTDPayload(nodeID, componentID, "active").
-				AddMetric("temperature_c", temp).
-				AddMetric("utilization_pct", util).
-				AddMetric("memory_used_mb", memUsed).
-				AddMetric("memory_total_mb", memTotal).
-				AddMetric("power_w", powerW)
-			if gpuName != "" {
-				event.AddParam("gpu_name", gpuName)
-			}
-
-			if len(fields) >= 8 {
-				if fanPct, err := strconv.ParseFloat(strings.TrimSpace(fields[7]), 64); err == nil && fanPct >= 0 {
-					event.AddMetric("fan_speed_pct", fanPct)
-				}
-			}
-
+		for _, event := range parseNvidiaSMIOutput(string(out), nodeID) {
 			if err := pub.Publish(event); err != nil {
-				log.Printf("[Nvidia GPU Observer] Publish failed for %s: %v", componentID, err)
+				log.Printf("[Nvidia GPU Observer] Publish failed for %s: %v", event.Component, err)
 			}
 		}
 	})

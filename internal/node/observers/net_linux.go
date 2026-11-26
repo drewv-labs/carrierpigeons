@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
@@ -23,8 +22,21 @@ func observeNetPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID
 	observeNetLinux(ctx, pub, nodeID)
 }
 
-func isInterfaceUp(iface string) bool {
-	operBytes, err := os.ReadFile(filepath.Join("/sys/class/net", iface, "operstate"))
+func isSafeLinuxNetIface(iface string) bool {
+	if iface == "" || iface == "." || iface == ".." {
+		return false
+	}
+	if core.ValidateTopicToken(iface) != nil {
+		return false
+	}
+	return core.ValidateTopicToken("net-"+iface) == nil
+}
+
+func isInterfaceUpIn(sysNetRoot, iface string) bool {
+	if !isSafeLinuxNetIface(iface) {
+		return false
+	}
+	operBytes, err := os.ReadFile(filepath.Join(sysNetRoot, iface, "operstate"))
 	if err != nil {
 		return true
 	}
@@ -33,7 +45,11 @@ func isInterfaceUp(iface string) bool {
 }
 
 func emitProcNetDevSamples(pub core.TelemetryPublisher, nodeID string, allowBridges bool) {
-	raw, err := os.ReadFile("/proc/net/dev")
+	emitProcNetDevSamplesFrom("/proc/net/dev", "/sys/class/net", pub, nodeID, allowBridges)
+}
+
+func emitProcNetDevSamplesFrom(procNetDevPath, sysNetRoot string, pub core.TelemetryPublisher, nodeID string, allowBridges bool) {
+	raw, err := os.ReadFile(procNetDevPath)
 	if err != nil {
 		return
 	}
@@ -56,7 +72,10 @@ func emitProcNetDevSamples(pub core.TelemetryPublisher, nodeID string, allowBrid
 		if !allowBridges && strings.HasPrefix(iface, "br-") {
 			continue
 		}
-		if !isInterfaceUp(iface) {
+		if !isSafeLinuxNetIface(iface) {
+			continue
+		}
+		if !isInterfaceUpIn(sysNetRoot, iface) {
 			continue
 		}
 
@@ -65,20 +84,25 @@ func emitProcNetDevSamples(pub core.TelemetryPublisher, nodeID string, allowBrid
 			continue
 		}
 
-		rxBytes, errRx := strconv.ParseFloat(fields[0], 64)
-		rxPkts, _ := strconv.ParseFloat(fields[1], 64)
-		txBytes, errTx := strconv.ParseFloat(fields[8], 64)
-		txPkts, _ := strconv.ParseFloat(fields[9], 64)
-		if errRx != nil || errTx != nil {
-			continue
+		componentID := "net-" + iface
+		event := core.NewCTDPayload(nodeID, componentID, "active")
+
+		if rxBytes, ok := parseFiniteFloat(fields[0]); ok {
+			event.AddMetric("rx_bytes", rxBytes)
+		}
+		if txBytes, ok := parseFiniteFloat(fields[8]); ok {
+			event.AddMetric("tx_bytes", txBytes)
+		}
+		if rxPkts, ok := parseFiniteFloat(fields[1]); ok {
+			event.AddMetric("rx_packets", rxPkts)
+		}
+		if txPkts, ok := parseFiniteFloat(fields[9]); ok {
+			event.AddMetric("tx_packets", txPkts)
 		}
 
-		componentID := "net-" + iface
-		event := core.NewCTDPayload(nodeID, componentID, "active").
-			AddMetric("rx_bytes", rxBytes).
-			AddMetric("tx_bytes", txBytes).
-			AddMetric("rx_packets", rxPkts).
-			AddMetric("tx_packets", txPkts)
+		if len(event.Metrics) == 0 {
+			continue
+		}
 
 		if err := pub.Publish(event); err != nil {
 			log.Printf("[Net Observer] Publish failed for %s: %v", componentID, err)

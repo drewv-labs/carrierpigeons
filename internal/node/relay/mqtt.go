@@ -3,9 +3,13 @@ package relay
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math/rand/v2"
+	"net"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -17,18 +21,33 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang/packets"
 )
 
 const (
-	maxPipelinedPublishes     = 64
-	maxMQTTPayloadBytes       = 1 << 20 // 1 MiB
-	maxPublishAttempts        = 5
-	maxTimeoutPublishAttempts = 10
-	defaultBatchTimeout       = 5 * time.Second
-	defaultBackoffBase        = 500 * time.Millisecond
-	defaultBackoffMax         = 30 * time.Second
-	defaultSubscribeWait      = 5 * time.Second
+	maxPipelinedPublishes        = 64
+	maxMQTTPayloadBytes          = 1 << 20 // 1 MiB
+	maxPublishAttempts           = 5
+	defaultDeadTransportTimeouts = 2
+	defaultBatchTimeout          = 5 * time.Second
+	defaultBackoffBase           = 500 * time.Millisecond
+	defaultBackoffMax            = 30 * time.Second
+	defaultSubscribeWait         = 5 * time.Second
 )
+
+var errRelayClosed = errors.New("relay closed")
+
+// noopStore disables Paho's internal MemoryStore so RingSpool remains the sole bounded retry buffer
+// and Paho's reconnect resume path cannot retain unbounded memory or replay duplicate QoS-1 packets.
+type noopStore struct{}
+
+func (noopStore) Open()                                 {}
+func (noopStore) Put(string, packets.ControlPacket)     {}
+func (noopStore) Get(string) packets.ControlPacket      { return nil }
+func (noopStore) All() []string                         { return nil }
+func (noopStore) Del(string)                            {}
+func (noopStore) Close()                                {}
+func (noopStore) Reset()                                {}
 
 // Options configures a node's MQTT relay, ring-buffer spool, LWT presence, TLS, and NodeHello metadata.
 type Options struct {
@@ -38,6 +57,7 @@ type Options struct {
 	TopicPrefix     string
 	Brand           brand.Spec
 	SpoolCapacity   int
+	MaxSpoolBytes   int64
 	BootTags        []string
 	Username        string
 	Password        string
@@ -64,22 +84,30 @@ type MQTTClient struct {
 	flushDone    chan struct{}
 	stopOnce     sync.Once
 
+	connMu      sync.Mutex
+	connectedCh chan struct{}
+	connGen     atomic.Uint64
+
+	onConnectMu sync.Mutex
+	onConnectWG sync.WaitGroup
+	subWG       sync.WaitGroup
+
 	subMu        sync.RWMutex
-	onConnectSub func(mqtt.Client)
+	onConnectSub func(mqtt.Client, uint64, <-chan struct{})
 
 	runnerMu       sync.Mutex
 	runnersStopped bool
 	runnerWG       sync.WaitGroup
 
 	deliveryDropped atomic.Uint64
-	backoffAttempt  int
+	backoffAttempt  atomic.Int64
 
-	batchTimeout       time.Duration
-	backoffBase        time.Duration
-	backoffMax         time.Duration
-	maxAttempts        int
-	maxTimeoutAttempts int
-	subscribeTimeout   time.Duration
+	batchTimeout          time.Duration
+	backoffBase           time.Duration
+	backoffMax            time.Duration
+	maxAttempts           int
+	deadTransportTimeouts int
+	subscribeTimeout      time.Duration
 }
 
 // NewMQTTClient initializes the broker connection with default CTD topic routing.
@@ -89,6 +117,7 @@ func NewMQTTClient(brokerURL, nodeID string) *MQTTClient {
 		NodeID:        nodeID,
 		TopicPrefix:   brand.Active().CTDPrefix(),
 		SpoolCapacity: DefaultSpoolCapacity,
+		MaxSpoolBytes: DefaultMaxSpoolBytes,
 		RunnerPolicy:  runner.DefaultExecutionPolicy(),
 	})
 }
@@ -100,12 +129,17 @@ func NewMQTTClientWithPrefix(brokerURL, nodeID, topicPrefix string) *MQTTClient 
 		NodeID:        nodeID,
 		TopicPrefix:   topicPrefix,
 		SpoolCapacity: DefaultSpoolCapacity,
+		MaxSpoolBytes: DefaultMaxSpoolBytes,
 		RunnerPolicy:  runner.DefaultExecutionPolicy(),
 	})
 }
 
 // NewMQTTClientWithOptions initializes the broker connection with configurable spool sizing, TLS, and NodeHello tags.
 func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
+	return newMQTTClientWithOptions(cfg, nil)
+}
+
+func newMQTTClientWithOptions(cfg Options, openConn func(*url.URL, mqtt.ClientOptions) (net.Conn, error)) *MQTTClient {
 	bSpec := cfg.Brand
 	if bSpec == (brand.Spec{}) {
 		bSpec = brand.Active()
@@ -125,6 +159,9 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 	if cfg.SpoolCapacity <= 0 {
 		cfg.SpoolCapacity = DefaultSpoolCapacity
 	}
+	if cfg.MaxSpoolBytes <= 0 {
+		cfg.MaxSpoolBytes = DefaultMaxSpoolBytes
+	}
 	pauseCtrl := cfg.PauseController
 	if pauseCtrl == nil {
 		pauseCtrl = observer.NewPauseController()
@@ -135,13 +172,14 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 		topicPrefix:  cfg.TopicPrefix,
 		brand:        bSpec,
 		bootTags:     core.NormalizeTags(cfg.BootTags),
-		meta:         cfg.Meta,
+		meta:         maps.Clone(cfg.Meta),
 		runnerPolicy: cfg.RunnerPolicy,
 		runnerReg:    cfg.RunnerRegistry,
 		pauseCtrl:    pauseCtrl,
-		spool:        NewRingSpool(cfg.SpoolCapacity),
+		spool:        NewRingSpoolWithByteLimit(cfg.SpoolCapacity, cfg.MaxSpoolBytes),
 		stopCh:       make(chan struct{}),
 		flushDone:    make(chan struct{}),
+		connectedCh:  make(chan struct{}),
 	}
 
 	registryTopic := bSpec.RegistryTopic(cfg.NodeID)
@@ -157,17 +195,48 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 	if cfg.TLSConfig != nil {
 		opts.SetTLSConfig(cfg.TLSConfig)
 	}
+	if openConn != nil {
+		opts.SetCustomOpenConnectionFn(openConn)
+	}
 	opts.SetOrderMatters(false)
+	opts.SetCleanSession(true)
+	opts.SetStore(noopStore{})
 	opts.SetAutoReconnect(true)
 	opts.SetConnectRetry(true)
-	opts.SetConnectRetryInterval(3 * time.Second)
-	opts.SetMaxReconnectInterval(15 * time.Second)
+	opts.SetWriteTimeout(5 * time.Second)
+	opts.SetKeepAlive(10 * time.Second)
+	opts.SetPingTimeout(5 * time.Second)
+	retryJitter := time.Duration(rand.Int64N(int64(2*time.Second) + 1))
+	maxReconnJitter := time.Duration(rand.Int64N(int64(5*time.Second) + 1))
+	opts.SetConnectRetryInterval(3*time.Second + retryJitter)
+	opts.SetMaxReconnectInterval(15*time.Second + maxReconnJitter)
 	opts.SetWill(registryTopic, "OFFLINE", 1, true)
 
 	opts.OnConnect = func(client mqtt.Client) {
+		c.onConnectMu.Lock()
+		select {
+		case <-c.stopCh:
+			c.onConnectMu.Unlock()
+			return
+		default:
+		}
+		c.onConnectWG.Add(1)
+		c.onConnectMu.Unlock()
+		defer c.onConnectWG.Done()
+
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
 		// 1. Announce node ONLINE status (retained)
 		client.Publish(registryTopic, 1, true, []byte("ONLINE"))
 
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
 		// 2. Announce hardware capabilities & boot tags via NodeHello (retained)
 		hello := core.NodeHello{
 			NodeID:    cfg.NodeID,
@@ -175,19 +244,27 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 			OS:        runtime.GOOS,
 			NumCPU:    runtime.NumCPU(),
 			BootTags:  c.bootTags,
-			Meta:      c.meta,
+			Meta:      maps.Clone(c.meta),
 			Timestamp: time.Now().UTC(),
 		}
 		if rawHello, err := json.Marshal(hello); err == nil {
 			client.Publish(helloTopic, 1, true, rawHello)
 		}
 
-		// 3. Re-bind control subscriptions across broker restarts
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+		// 3. Advance connection generation and wake flushLoop / backoff waiters
+		gen, nextConnCh := c.notifyConnected()
+
+		// 4. Re-bind control subscriptions across broker restarts
 		c.subMu.RLock()
 		subFn := c.onConnectSub
 		c.subMu.RUnlock()
 		if subFn != nil {
-			subFn(client)
+			subFn(client, gen, nextConnCh)
 		}
 	}
 
@@ -195,9 +272,11 @@ func NewMQTTClientWithOptions(cfg Options) *MQTTClient {
 	c.client = client
 
 	if token := client.Connect(); !token.WaitTimeout(3 * time.Second) {
-		log.Printf("[Relay] Broker connect timed out after 3s on boot, spooling up to %d events", c.spool.Cap())
+		log.Printf("[Relay] Broker connect timed out after 3s on boot, spooling up to %d events (%d MiB cap)",
+			c.spool.Cap(), c.spool.MaxBytes()>>20)
 	} else if err := token.Error(); err != nil {
-		log.Printf("[Relay] Broker unreachable on boot, spooling up to %d events (%v)", c.spool.Cap(), err)
+		log.Printf("[Relay] Broker unreachable on boot, spooling up to %d events (%d MiB cap): %v",
+			c.spool.Cap(), c.spool.MaxBytes()>>20, err)
 	}
 
 	go c.flushLoop()
@@ -210,6 +289,11 @@ func (c *MQTTClient) SpoolLen() int {
 	return c.spool.Len()
 }
 
+// SpoolBytes returns the serialized byte size of queued CTD events currently buffered in the spool.
+func (c *MQTTClient) SpoolBytes() int64 {
+	return c.spool.Bytes()
+}
+
 // SpoolDropped returns the total number of evicted events when the ring buffer saturated.
 func (c *MQTTClient) SpoolDropped() uint64 {
 	return c.spool.Dropped()
@@ -219,8 +303,65 @@ func (c *MQTTClient) isConnected() bool {
 	return c.client != nil && c.client.IsConnected() && c.client.IsConnectionOpen()
 }
 
+func (c *MQTTClient) notifyConnected() (uint64, <-chan struct{}) {
+	c.connMu.Lock()
+	if c.connectedCh != nil {
+		close(c.connectedCh)
+	}
+	nextCh := make(chan struct{})
+	c.connectedCh = nextCh
+	gen := c.connGen.Add(1)
+	c.connMu.Unlock()
+	return gen, nextCh
+}
+
+func (c *MQTTClient) currentConnectedCh() <-chan struct{} {
+	c.connMu.Lock()
+	if c.connectedCh == nil {
+		c.connectedCh = make(chan struct{})
+	}
+	ch := c.connectedCh
+	c.connMu.Unlock()
+	return ch
+}
+
+func (c *MQTTClient) connectionState() (uint64, <-chan struct{}) {
+	c.connMu.Lock()
+	if c.connectedCh == nil {
+		c.connectedCh = make(chan struct{})
+	}
+	ch := c.connectedCh
+	gen := c.connGen.Load()
+	c.connMu.Unlock()
+	return gen, ch
+}
+
+func (c *MQTTClient) waitForConnected() bool {
+	for {
+		if c.stopCh != nil {
+			select {
+			case <-c.stopCh:
+				return false
+			default:
+			}
+		}
+		if c.isConnected() {
+			return true
+		}
+		ch := c.currentConnectedCh()
+		if c.isConnected() {
+			return true
+		}
+		select {
+		case <-c.stopCh:
+			return false
+		case <-ch:
+		}
+	}
+}
+
 // DeliveryDropped returns the cumulative number of payloads dropped due to marshaling failures,
-// oversized MQTT packets (>1 MiB), repeated publish failures while connected, or shutdown timeouts.
+// oversized MQTT packets (>1 MiB), repeated publish failures while connected, post-close publishes, or shutdown timeouts.
 func (c *MQTTClient) DeliveryDropped() uint64 {
 	return c.deliveryDropped.Load()
 }
@@ -258,14 +399,11 @@ func (c *MQTTClient) effectiveMaxAttempts() int {
 	return maxPublishAttempts
 }
 
-func (c *MQTTClient) effectiveMaxTimeoutAttempts() int {
-	if c.maxTimeoutAttempts > 0 {
-		return c.maxTimeoutAttempts
+func (c *MQTTClient) effectiveDeadTransportTimeouts() int {
+	if c.deadTransportTimeouts > 0 {
+		return c.deadTransportTimeouts
 	}
-	if c.maxAttempts > 0 {
-		return c.maxAttempts * 2
-	}
-	return maxTimeoutPublishAttempts
+	return defaultDeadTransportTimeouts
 }
 
 func (c *MQTTClient) effectiveSubscribeTimeout() time.Duration {
@@ -311,15 +449,65 @@ func (c *MQTTClient) nextBackoff(attempt int) time.Duration {
 }
 
 func (c *MQTTClient) waitRetryBackoff() bool {
-	sleepDur := c.nextBackoff(c.backoffAttempt)
-	c.backoffAttempt++
+	attempt := int(c.backoffAttempt.Add(1) - 1)
+	sleepDur := c.nextBackoff(attempt)
+	connCh := c.currentConnectedCh()
 	timer := time.NewTimer(sleepDur)
 	defer timer.Stop()
 	select {
 	case <-c.stopCh:
 		return false
+	case <-connCh:
+		c.backoffAttempt.Store(0)
+		return true
 	case <-timer.C:
 		return true
+	}
+}
+
+func (c *MQTTClient) forceReconnect() {
+	if c.client == nil {
+		return
+	}
+	select {
+	case <-c.stopCh:
+		return
+	default:
+	}
+
+	if !c.isConnected() {
+		return
+	}
+
+	log.Printf("[Relay] Dead transport detected across consecutive full-batch timeouts (0 acks); forcing MQTT reconnect")
+	c.client.Disconnect(50)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+		tok := c.client.Connect()
+		if tok == nil {
+			return
+		}
+		select {
+		case <-tok.Done():
+			if err := tok.Error(); err != nil && time.Now().Before(deadline) {
+				timer := time.NewTimer(20 * time.Millisecond)
+				select {
+				case <-c.stopCh:
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
+		default:
+		}
+		return
 	}
 }
 
@@ -329,30 +517,52 @@ func (c *MQTTClient) Publish(payload *core.CTDPayload) error {
 		return nil
 	}
 
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		c.recordDeliveryDrop("marshal error", payload, err)
+		return err
+	}
+	if len(raw) > maxMQTTPayloadBytes {
+		sizeErr := fmt.Errorf("%d bytes > %d", len(raw), maxMQTTPayloadBytes)
+		c.recordDeliveryDrop("payload exceeds max MQTT packet size", payload, sizeErr)
+		return sizeErr
+	}
+
 	select {
 	case <-c.stopCh:
-		return nil
+		c.recordDeliveryDrop("relay closed", payload, errRelayClosed)
+		return errRelayClosed
 	default:
 	}
 
-	if evicted := c.spool.Push(payload); evicted {
+	evicted, accepted := c.spool.PushSized(payload, int64(len(raw)))
+	if !accepted {
+		if c.spool.IsClosed() {
+			c.recordDeliveryDrop("relay closed", payload, errRelayClosed)
+			return errRelayClosed
+		}
+		capErr := fmt.Errorf("%d bytes > %d max spool bytes", len(raw), c.spool.MaxBytes())
+		c.recordDeliveryDrop("payload exceeds max spool bytes", payload, capErr)
+		return capErr
+	}
+	if evicted {
 		dropped := c.spool.Dropped()
 		if dropped == 1 || dropped%100 == 0 {
-			log.Printf("[Relay] Ring spool saturated (%d cap); evicted %d oldest telemetry events.", c.spool.Cap(), dropped)
+			log.Printf("[Relay] Ring spool saturated (%d slots / %d bytes max); evicted %d oldest telemetry events.",
+				c.spool.Cap(), c.spool.MaxBytes(), dropped)
 		}
 	}
 
 	return nil
 }
 
-// flushLoop pulls micro-batches from the ring buffer and pipelines QoS 1 MQTT publishes to eliminate WAN RTT bottlenecks.
+// flushLoop waits for an active MQTT connection, pulls micro-batches from the ring buffer,
+// and pipelines QoS 1 MQTT publishes to eliminate WAN RTT bottlenecks.
 func (c *MQTTClient) flushLoop() {
 	defer close(c.flushDone)
 	for {
-		select {
-		case <-c.stopCh:
+		if !c.waitForConnected() {
 			return
-		default:
 		}
 		batch, ok := c.spool.PopBatchBlocking(maxPipelinedPublishes, c.stopCh)
 		if !ok {
@@ -405,7 +615,9 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 	}
 
 	maxAttempts := c.effectiveMaxAttempts()
-	maxTimeoutAttempts := c.effectiveMaxTimeoutAttempts()
+	deadTransportThreshold := c.effectiveDeadTransportTimeouts()
+	consecutiveFullTimeouts := 0
+	batchHadSuccess := false
 
 	for len(pending) > 0 {
 		select {
@@ -417,14 +629,8 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		}
 
 		if !c.isConnected() {
-			for i := range pending {
-				pending[i].failures = 0
-			}
-			if !c.waitRetryBackoff() {
-				requeueItems(pending)
-				return
-			}
-			continue
+			requeueItems(pending)
+			return
 		}
 
 		tokens := make([]mqtt.Token, len(pending))
@@ -442,6 +648,7 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		succeeded := 0
 		stopped := false
 		timedOut := false
+		hasExplicitErr := false
 		stopIdx := 0
 
 		for i, tok := range tokens {
@@ -451,6 +658,7 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 					if err := tok.Error(); err != nil {
 						log.Printf("[Relay] Flight error publishing to %s, retrying: %v", pending[i].topic, err)
 						failed = append(failed, failedItem{item: pending[i], explicitErr: true})
+						hasExplicitErr = true
 					} else {
 						succeeded++
 					}
@@ -467,6 +675,7 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 				if err := tok.Error(); err != nil {
 					log.Printf("[Relay] Flight error publishing to %s, retrying: %v", pending[i].topic, err)
 					failed = append(failed, failedItem{item: pending[i], explicitErr: true})
+					hasExplicitErr = true
 				} else {
 					succeeded++
 				}
@@ -506,32 +715,63 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		}
 
 		if len(failed) == 0 {
-			c.backoffAttempt = 0
+			c.backoffAttempt.Store(0)
 			return
 		}
 
 		if succeeded > 0 {
-			c.backoffAttempt = 0
+			c.backoffAttempt.Store(0)
+			consecutiveFullTimeouts = 0
+			batchHadSuccess = true
 		}
 
-		connected := c.isConnected()
+		if !c.isConnected() {
+			requeue := make([]pendingItem, len(failed))
+			for i, f := range failed {
+				requeue[i] = f.item
+			}
+			requeueItems(requeue)
+			return
+		}
+
+		// A full batch timing out with zero acks across the batch and no explicit errors indicates a
+		// dead/half-open transport. Never evict valid telemetry as poison; force a transport reconnect
+		// and return items to the bounded spool. If other items in this batch already succeeded
+		// (batchHadSuccess == true), the transport is alive and remaining stalled items are poison.
+		if !batchHadSuccess && succeeded == 0 && timedOut && !hasExplicitErr {
+			consecutiveFullTimeouts++
+			nextPending := make([]pendingItem, len(failed))
+			for i, f := range failed {
+				item := f.item
+				item.failures = 0
+				nextPending[i] = item
+			}
+			if consecutiveFullTimeouts >= deadTransportThreshold {
+				c.forceReconnect()
+				requeueItems(nextPending)
+				_ = c.waitRetryBackoff()
+				return
+			}
+			pending = nextPending
+			if !c.waitRetryBackoff() {
+				requeueItems(pending)
+				return
+			}
+			continue
+		}
+
+		consecutiveFullTimeouts = 0
 		nextPending := make([]pendingItem, 0, len(failed))
 		for _, f := range failed {
 			item := f.item
-			if !connected {
-				item.failures = 0
-			} else {
-				item.failures++
-				threshold := maxTimeoutAttempts
-				reason := "exceeded consecutive publish timeouts"
-				if f.explicitErr || succeeded > 0 {
-					threshold = maxAttempts
-					reason = "exceeded consecutive publish attempts"
-				}
-				if item.failures >= threshold {
-					c.recordDeliveryDrop(reason, item.payload, fmt.Errorf("%d consecutive failures on %s", item.failures, item.topic))
-					continue
-				}
+			item.failures++
+			reason := "exceeded consecutive publish attempts"
+			if !f.explicitErr {
+				reason = "exceeded consecutive publish timeouts"
+			}
+			if item.failures >= maxAttempts {
+				c.recordDeliveryDrop(reason, item.payload, fmt.Errorf("%d consecutive failures on %s", item.failures, item.topic))
+				continue
 			}
 			nextPending = append(nextPending, item)
 		}
@@ -558,7 +798,7 @@ func countNonNilPayloads(items []*core.CTDPayload) uint64 {
 }
 
 func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
-	remaining := c.spool.DrainAll()
+	remaining := c.spool.CloseAndDrain()
 	if len(remaining) == 0 {
 		return
 	}
@@ -636,9 +876,14 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 // Disconnect flushes pending spooled CTD events, announces OFFLINE state, and closes the socket.
 func (c *MQTTClient) Disconnect() {
 	c.stopOnce.Do(func() {
+		c.onConnectMu.Lock()
 		close(c.stopCh)
+		c.onConnectMu.Unlock()
+
 		<-c.flushDone
 		c.drainRemainingBeforeClose(1500 * time.Millisecond)
+		c.onConnectWG.Wait()
+		c.subWG.Wait()
 		if c.client != nil {
 			if c.isConnected() {
 				tok := c.client.Publish(c.brand.RegistryTopic(c.nodeID), 1, true, []byte("OFFLINE"))

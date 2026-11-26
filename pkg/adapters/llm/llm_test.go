@@ -502,3 +502,60 @@ func TestOllamaChatPropagatesToolLoopAndCancelErrors(t *testing.T) {
 		}
 	})
 }
+
+func TestClaudeCustomEndpointRoutingViaNew(t *testing.T) {
+	for _, provider := range []string{"claude", "anthropic", " Claude "} {
+		t.Run(strings.TrimSpace(provider), func(t *testing.T) {
+			var hits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				if r.Header.Get("x-api-key") != "custom-key" {
+					t.Errorf("expected x-api-key=custom-key, got %q", r.Header.Get("x-api-key"))
+				}
+				if r.Header.Get("anthropic-version") != "2023-06-01" {
+					t.Errorf("expected anthropic-version=2023-06-01, got %q", r.Header.Get("anthropic-version"))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"stop_reason":"end_turn","content":[{"type":"text","text":"custom-endpoint-ok"}]}`)
+			}))
+			defer srv.Close()
+
+			adapter := New(Config{
+				Provider: provider,
+				Endpoint: srv.URL,
+				APIKey:   "custom-key",
+				Model:    "claude-sonnet-4-5",
+			})
+			reply, err := adapter.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "ping"}})
+			if err != nil {
+				t.Fatalf("Chat failed: %v", err)
+			}
+			if reply != "custom-endpoint-ok" {
+				t.Fatalf("unexpected reply: %q", reply)
+			}
+
+			ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "ping"}})
+			if err != nil {
+				t.Fatalf("StreamChat failed: %v", err)
+			}
+			var streamed strings.Builder
+			for tok := range ch {
+				streamed.WriteString(tok)
+			}
+			if streamed.String() != "custom-endpoint-ok" {
+				t.Fatalf("unexpected streamed reply: %q", streamed.String())
+			}
+			if hits.Load() != 2 {
+				t.Fatalf("expected 2 requests to custom endpoint, got %d", hits.Load())
+			}
+		})
+	}
+
+	defaultAdapter, ok := New(Config{Provider: "claude", Endpoint: "   ", APIKey: "k"}).(*ClaudeAdapter)
+	if !ok {
+		t.Fatal("expected *ClaudeAdapter for provider=claude")
+	}
+	if defaultAdapter.endpoint != "https://api.anthropic.com/v1/messages" {
+		t.Fatalf("expected blank endpoint to fall back to default Anthropic URL, got %q", defaultAdapter.endpoint)
+	}
+}

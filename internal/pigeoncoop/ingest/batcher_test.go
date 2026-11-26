@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type mockBatchSink struct {
@@ -277,5 +279,183 @@ func TestBatcherCloseDrainTimeoutDropsUndrained(t *testing.T) {
 	if b.IngestedCount() != 0 || b.DroppedCount() != 30 {
 		t.Fatalf("expected ingested=0 dropped=30 after drain timeout, got ingested=%d dropped=%d",
 			b.IngestedCount(), b.DroppedCount())
+	}
+	if b.QueuedBytes() != 0 {
+		t.Fatalf("expected QueuedBytes to return to 0 after dropRemaining, got %d", b.QueuedBytes())
+	}
+}
+
+func TestBatcherAtomicByteBudget(t *testing.T) {
+	sink := &mockBatchSink{}
+	gate := make(chan struct{})
+	blockingSink := &scriptedSink{
+		fn: func(ctx context.Context, payloads []*core.CTDPayload) (int64, error) {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			return sink.BatchInsertEvents(ctx, payloads)
+		},
+	}
+
+	b := newBatcherWithTiming(blockingSink, Options{
+		QueueSize:     100,
+		MaxQueueBytes: 2048,
+		BatchSize:     2,
+		FlushInterval: time.Hour,
+	}, batcherTiming{
+		flushTimeout: 2 * time.Second,
+		closeTimeout: 2 * time.Second,
+	})
+
+	largeBlob := strings.Repeat("x", 900)
+	// First 2 events (~2400 bytes? Make payload smaller ~600 bytes so 2 fit under 2048, 3rd fits, 4th exceeds).
+	mediumBlob := strings.Repeat("y", 350)
+	for i := range 6 {
+		ev := core.NewCTDPayload("rv64-compute-01", fmt.Sprintf("mem-%d", i), "active").
+			AddMetric("blob", mediumBlob)
+		b.Enqueue(ev)
+	}
+	_ = largeBlob
+
+	if b.DroppedCount() == 0 {
+		close(gate)
+		b.Close()
+		t.Fatal("expected byte budget (2048 bytes) to drop excess queued events before channel cap (100)")
+	}
+	if got := b.QueuedBytes(); got > 2048 {
+		close(gate)
+		b.Close()
+		t.Fatalf("expected QueuedBytes <= 2048, got %d", got)
+	}
+
+	close(gate)
+	b.Close()
+
+	if got := b.QueuedBytes(); got != 0 {
+		t.Fatalf("expected QueuedBytes == 0 after Close drain, got %d", got)
+	}
+}
+
+func TestBatcherTransientPostgresOutageCircuitBreaker(t *testing.T) {
+	var outageDown atomic.Bool
+	outageDown.Store(true)
+	var attempts atomic.Int32
+
+	sink := &scriptedSink{
+		fn: func(_ context.Context, payloads []*core.CTDPayload) (int64, error) {
+			n := attempts.Add(1)
+			if outageDown.Load() {
+				if n%2 == 1 {
+					return 0, errors.New("dial tcp 127.0.0.1:5432: connect: connection refused")
+				}
+				return 0, &pgconn.PgError{Code: "57P03", Message: "the database system is starting up"}
+			}
+			return int64(len(payloads)), nil
+		},
+	}
+
+	b := newBatcherWithTiming(sink, Options{
+		QueueSize:     64,
+		BatchSize:     5,
+		FlushInterval: 10 * time.Millisecond,
+	}, batcherTiming{
+		flushTimeout:   time.Second,
+		closeTimeout:   2 * time.Second,
+		maxRetries:     2,
+		retryBase:      5 * time.Millisecond,
+		retryCap:       10 * time.Millisecond,
+		circuitBase:    25 * time.Millisecond,
+		circuitCap:     80 * time.Millisecond,
+		circuitMaxHold: 500 * time.Millisecond,
+	})
+
+	for i := range 20 {
+		b.Enqueue(core.NewCTDPayload("rv64-compute-01", fmt.Sprintf("outage-%d", i), "active"))
+	}
+
+	// Hold DB down for 160ms (> maxRetries * retryCap) and verify zero batches are shredded.
+	time.Sleep(160 * time.Millisecond)
+	if dropped := b.DroppedCount(); dropped != 0 {
+		b.Close()
+		t.Fatalf("expected 0 dropped events during brief Postgres outage, got %d", dropped)
+	}
+
+	outageDown.Store(false)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && b.IngestedCount() < 20 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	b.Close()
+
+	if b.IngestedCount() != 20 || b.DroppedCount() != 0 {
+		t.Fatalf("expected all 20 events ingested with 0 dropped after recovery, got ingested=%d dropped=%d",
+			b.IngestedCount(), b.DroppedCount())
+	}
+}
+
+func TestBatcherExtendedOutageCircuitOpenRateLimitsShredding(t *testing.T) {
+	var outageDown atomic.Bool
+	outageDown.Store(true)
+	var failedCalls atomic.Int32
+	var ingested atomic.Int32
+
+	sink := &scriptedSink{
+		fn: func(_ context.Context, payloads []*core.CTDPayload) (int64, error) {
+			if outageDown.Load() {
+				failedCalls.Add(1)
+				return 0, errors.New("dial tcp 127.0.0.1:5432: connect: connection refused")
+			}
+			ingested.Add(int32(len(payloads)))
+			return int64(len(payloads)), nil
+		},
+	}
+
+	b := newBatcherWithTiming(sink, Options{
+		QueueSize:     64,
+		BatchSize:     5,
+		FlushInterval: 5 * time.Millisecond,
+	}, batcherTiming{
+		flushTimeout:   time.Second,
+		closeTimeout:   2 * time.Second,
+		maxRetries:     3,
+		retryBase:      5 * time.Millisecond,
+		retryCap:       10 * time.Millisecond,
+		circuitBase:    25 * time.Millisecond,
+		circuitCap:     50 * time.Millisecond,
+		circuitMaxHold: 40 * time.Millisecond,
+	})
+
+	for i := range 20 {
+		b.Enqueue(core.NewCTDPayload("rv64-compute-01", fmt.Sprintf("ext-%d", i), "active"))
+	}
+
+	// Wait until first batch exceeds circuitMaxHold (40ms) and drops, then verify circuit remains open
+	// so remaining batches are rate-limited across circuitCap (50ms) instead of shredded rapidly.
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) && b.DroppedCount() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := b.DroppedCount(); got >= 20 {
+		b.Close()
+		t.Fatalf("expected circuit breaker to rate-limit extended outage drops (<20), got %d", got)
+	}
+
+	outageDown.Store(false)
+
+	ingestDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(ingestDeadline) && b.IngestedCount() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	b.Close()
+
+	if b.DroppedCount() >= 20 {
+		t.Fatalf("expected circuit breaker to preserve queued batches instead of shredding all 20 events, dropped=%d", b.DroppedCount())
+	}
+	if b.IngestedCount() == 0 {
+		t.Fatalf("expected remaining queued batches to ingest after recovery, got ingested=0 (dropped=%d)", b.DroppedCount())
 	}
 }

@@ -15,5 +15,12 @@ func killProcessGroup(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	pid := cmd.Process.Pid
+	if pid <= 0 {
+		_ = cmd.Process.Kill()
+		return
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		_ = cmd.Process.Kill()
+	}
 }

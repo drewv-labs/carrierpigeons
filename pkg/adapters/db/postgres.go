@@ -31,15 +31,25 @@ import (
 // DefaultPostgresURL is the local development fallback DSN matching deployments/compose.
 const DefaultPostgresURL = "postgres://pigeoncoop_admin:ctd_dev_password@127.0.0.1:5432/edge_ledger"
 
-// DefaultReadOnlyMaxRows caps heap materialization for ad-hoc read-only agent/MCP queries.
-const DefaultReadOnlyMaxRows = 500
+const (
+	// DefaultReadOnlyMaxRows caps heap materialization for ad-hoc read-only agent/MCP queries.
+	DefaultReadOnlyMaxRows = 500
+	// DefaultReadOnlyMaxBytes caps total scanned result bytes (2 MiB) for ad-hoc read-only agent/MCP queries.
+	DefaultReadOnlyMaxBytes = 2 << 20
+	// DefaultLedgerPruneBatchLimit bounds rows deleted per PruneLedgerBefore call.
+	DefaultLedgerPruneBatchLimit = 10000
+	maxLedgerPruneBatchLimit     = 100000
+)
+
+// ErrReadOnlyByteLimitExceeded indicates a read-only query exceeded its configured byte ceiling while scanning rows.
+var ErrReadOnlyByteLimitExceeded = errors.New("read-only query result exceeded byte ceiling")
 
 var (
 	validIdentifier    = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
-	validPMVIdentifier = regexp.MustCompile(`^pmv_[a-z0-9_]+$`)
-	dollarTagStartRe   = regexp.MustCompile(`^\$[a-zA-Z0-9_]*\$`)
+	validPMVIdentifier = regexp.MustCompile(`^pmv_[a-z0-9_]{1,59}$`)
+	dollarTagStartRe   = regexp.MustCompile(`^\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$`)
 	forbiddenRowLockRe = regexp.MustCompile(`(?i)\bfor\s+(?:no\s+key\s+update|key\s+share|update|share)\b`)
-	forbiddenViewDMLRe = regexp.MustCompile(`(?i)\b(into|insert|update|delete|drop|alter|truncate|grant|revoke|copy|call|do|create|execute|set|reset|listen|notify|prepare|deallocate|lock|vacuum|analyze|cluster|reindex|refresh|discard|load|security|reassign|pg_sleep|pg_sleep_for|pg_sleep_until|pg_advisory_lock|pg_advisory_lock_shared|pg_try_advisory_lock|pg_try_advisory_lock_shared|pg_advisory_xact_lock|pg_advisory_xact_lock_shared|pg_try_advisory_xact_lock|pg_try_advisory_xact_lock_shared|lo_import|lo_export|lo_unlink|lo_put|lo_from_bytea|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|dblink|dblink_exec|dblink_connect)\b`)
+	forbiddenViewDMLRe = regexp.MustCompile(`(?i)\b(into|insert|update|delete|drop|alter|truncate|grant|revoke|copy|call|do|create|execute|set|set_config|reset|listen|notify|prepare|deallocate|lock|vacuum|analyze|cluster|reindex|refresh|discard|load|security|reassign|pg_sleep|pg_sleep_for|pg_sleep_until|pg_advisory_lock|pg_advisory_lock_shared|pg_try_advisory_lock|pg_try_advisory_lock_shared|pg_advisory_xact_lock|pg_advisory_xact_lock_shared|pg_try_advisory_xact_lock|pg_try_advisory_xact_lock_shared|lo_import|lo_export|lo_unlink|lo_put|lo_from_bytea|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|dblink|dblink_exec|dblink_connect|query_to_xml|query_to_xmlschema|query_to_xml_and_xmlschema|database_to_xml|database_to_xmlschema|database_to_xml_and_xmlschema|schema_to_xml|schema_to_xmlschema|schema_to_xml_and_xmlschema|table_to_xml|table_to_xmlschema|table_to_xml_and_xmlschema|cursor_to_xml|cursor_to_xmlschema|cursor_to_xml_and_xmlschema)\b`)
 )
 
 // ValidateSchemaIdentifier enforces PostgreSQL unquoted identifier rules (max 63 bytes) before DDL interpolation.
@@ -102,13 +112,90 @@ func NormalizePMVName(raw string) (string, error) {
 		name = "pmv_" + name
 	}
 	if !validPMVIdentifier.MatchString(name) {
-		return "", fmt.Errorf("invalid PigeonMath view name %q (must match ^pmv_[a-z0-9_]+$)", name)
+		return "", fmt.Errorf("invalid PigeonMath view name %q (must match ^pmv_[a-z0-9_]{1,59}$)", name)
 	}
 	return name, nil
 }
 
+func isSQLIdentStart(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' || b >= 0x80
+}
+
 func isSQLIdentChar(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$' || b >= 0x80
+	return isSQLIdentStart(b) || (b >= '0' && b <= '9') || b == '$'
+}
+
+// matchDollarQuoteTag matches PostgreSQL dollar-quote opening delimiters:
+// ASCII tags via dollarTagStartRe as well as PostgreSQL scan.l non-ASCII dolq_start/dolq_cont (>= 0x80).
+func matchDollarQuoteTag(s string) string {
+	if tag := dollarTagStartRe.FindString(s); tag != "" {
+		return tag
+	}
+	if len(s) < 3 || s[0] != '$' || !isSQLIdentStart(s[1]) {
+		return ""
+	}
+	j := 2
+	for j < len(s) && (isSQLIdentStart(s[j]) || (s[j] >= '0' && s[j] <= '9')) {
+		j++
+	}
+	if j < len(s) && s[j] == '$' {
+		return s[:j+1]
+	}
+	return ""
+}
+
+// matchQuoteContinue matches PostgreSQL scan.l {quotecontinue} ({whitespace_with_newline}{quote})
+// immediately after a closing single quote so multi-line continued literals preserve escape mode.
+func matchQuoteContinue(sql string, afterQuoteIdx int) (int, bool) {
+	n := len(sql)
+	j := afterQuoteIdx
+	// {non_newline_whitespace}* : horizontal spaces or '--...' line comments before the mandatory newline.
+	for j < n {
+		switch sql[j] {
+		case ' ', '\t', '\f', '\v':
+			j++
+		case '-':
+			if j+1 < n && sql[j+1] == '-' {
+				j += 2
+				for j < n && sql[j] != '\n' && sql[j] != '\r' {
+					j++
+				}
+				continue
+			}
+			return 0, false
+		default:
+			goto needNewline
+		}
+	}
+needNewline:
+	if j >= n || (sql[j] != '\n' && sql[j] != '\r') {
+		return 0, false
+	}
+	j++
+	// {special_whitespace}* : any whitespace or newline-terminated '--...' comments after the first newline.
+	for j < n {
+		switch sql[j] {
+		case ' ', '\t', '\n', '\r', '\f', '\v':
+			j++
+		case '-':
+			if j+1 < n && sql[j+1] == '-' {
+				k := j + 2
+				for k < n && sql[k] != '\n' && sql[k] != '\r' {
+					k++
+				}
+				if k < n && (sql[k] == '\n' || sql[k] == '\r') {
+					j = k + 1
+					continue
+				}
+			}
+			return 0, false
+		case '\'':
+			return j + 1, true
+		default:
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 func consumeSingleQuotedLiteral(sql string, quoteIdx int, backslashEscape bool) (int, error) {
@@ -127,6 +214,10 @@ func consumeSingleQuotedLiteral(sql string, quoteIdx int, backslashEscape bool) 
 				i += 2
 				continue
 			}
+			if nextIdx, continued := matchQuoteContinue(sql, i+1); continued {
+				i = nextIdx
+				continue
+			}
 			return i + 1, nil
 		}
 		i++
@@ -134,25 +225,29 @@ func consumeSingleQuotedLiteral(sql string, quoteIdx int, backslashEscape bool) 
 	return 0, fmt.Errorf("unterminated SQL string literal")
 }
 
-func consumeDoubleQuotedIdent(sql string, quoteIdx int) (int, error) {
+func consumeDoubleQuotedIdent(sql string, quoteIdx int) (string, int, error) {
 	n := len(sql)
 	i := quoteIdx + 1
+	var ident strings.Builder
 	for i < n {
 		if sql[i] == '"' {
 			if i+1 < n && sql[i+1] == '"' {
+				ident.WriteByte('"')
 				i += 2
 				continue
 			}
-			return i + 1, nil
+			return ident.String(), i + 1, nil
 		}
+		ident.WriteByte(sql[i])
 		i++
 	}
-	return 0, fmt.Errorf("unterminated SQL quoted identifier")
+	return "", 0, fmt.Errorf("unterminated SQL quoted identifier")
 }
 
 // stripSQLLiteralsAndComments replaces SQL string literals, quoted identifiers, dollar-quoted strings,
-// Unicode string literals/identifiers, and comments with whitespace so keyword/semicolon validation never
-// misfires on literal string data while still rejecting any unclosed literal or comment tricks.
+// Unicode string literals, and comments with whitespace/placeholders so keyword/semicolon validation never
+// misfires on literal string data while rejecting Unicode quoted identifiers, forbidden quoted identifiers,
+// and unclosed literal or comment tricks.
 func stripSQLLiteralsAndComments(sql string) (string, error) {
 	var out strings.Builder
 	out.Grow(len(sql))
@@ -161,11 +256,11 @@ func stripSQLLiteralsAndComments(sql string) (string, error) {
 	for i := 0; i < n; {
 		ch := sql[i]
 
-		// Line comment: -- ... \n
+		// Line comment: -- ... \n or \r (PostgreSQL scan.l treats both \n and \r as comment terminators)
 		if ch == '-' && i+1 < n && sql[i+1] == '-' {
 			out.WriteByte(' ')
 			i += 2
-			for i < n && sql[i] != '\n' {
+			for i < n && sql[i] != '\n' && sql[i] != '\r' {
 				i++
 			}
 			continue
@@ -193,8 +288,8 @@ func stripSQLLiteralsAndComments(sql string) (string, error) {
 			continue
 		}
 
-		// PostgreSQL escape string literal: E'...' or e'...' (only when preceded by non-identifier char or start)
-		if (ch == 'e' || ch == 'E') && (i == 0 || !isSQLIdentChar(sql[i-1])) && i+1 < n && sql[i+1] == '\'' {
+		// PostgreSQL escape string literal: E'...' or e'...' (only at token start)
+		if (ch == 'e' || ch == 'E') && i+1 < n && sql[i+1] == '\'' {
 			nextIdx, err := consumeSingleQuotedLiteral(sql, i+1, true)
 			if err != nil {
 				return "", err
@@ -204,8 +299,8 @@ func stripSQLLiteralsAndComments(sql string) (string, error) {
 			continue
 		}
 
-		// PostgreSQL Unicode escape string literal (U&'...') and Unicode quoted identifier (U&"...")
-		if (ch == 'u' || ch == 'U') && (i == 0 || !isSQLIdentChar(sql[i-1])) && i+2 < n && sql[i+1] == '&' {
+		// PostgreSQL Unicode escape string literal (U&'...') and rejected Unicode quoted identifier (U&"...")
+		if (ch == 'u' || ch == 'U') && i+2 < n && sql[i+1] == '&' {
 			if sql[i+2] == '\'' {
 				nextIdx, err := consumeSingleQuotedLiteral(sql, i+2, false)
 				if err != nil {
@@ -216,13 +311,7 @@ func stripSQLLiteralsAndComments(sql string) (string, error) {
 				continue
 			}
 			if sql[i+2] == '"' {
-				nextIdx, err := consumeDoubleQuotedIdent(sql, i+2)
-				if err != nil {
-					return "", err
-				}
-				out.WriteString(" _ident ")
-				i = nextIdx
-				continue
+				return "", fmt.Errorf("Unicode quoted SQL identifiers (U&\"...\") are forbidden")
 			}
 		}
 
@@ -237,20 +326,26 @@ func stripSQLLiteralsAndComments(sql string) (string, error) {
 			continue
 		}
 
-		// Double-quoted SQL identifier: "..."
+		// Double-quoted SQL identifier: "..." (unescape and inspect directly so quoted dangerous functions cannot hide)
 		if ch == '"' {
-			nextIdx, err := consumeDoubleQuotedIdent(sql, i)
+			ident, nextIdx, err := consumeDoubleQuotedIdent(sql, i)
 			if err != nil {
 				return "", err
+			}
+			if match := forbiddenRowLockRe.FindString(ident); match != "" {
+				return "", fmt.Errorf("forbidden row-locking clause %q in quoted identifier", match)
+			}
+			if match := forbiddenViewDMLRe.FindString(ident); match != "" {
+				return "", fmt.Errorf("forbidden mutating or session-altering keyword %q in quoted identifier", match)
 			}
 			out.WriteString(" _ident ")
 			i = nextIdx
 			continue
 		}
 
-		// PostgreSQL dollar-quoted string: $$...$$ or $tag$...$tag$
+		// PostgreSQL dollar-quoted string: $$...$$, $tag$...$tag$, or non-ASCII $α$...$α$
 		if ch == '$' {
-			if tag := dollarTagStartRe.FindString(sql[i:]); tag != "" {
+			if tag := matchDollarQuoteTag(sql[i:]); tag != "" {
 				out.WriteString(" '' ")
 				i += len(tag)
 				endIdx := strings.Index(sql[i:], tag)
@@ -260,6 +355,17 @@ func stripSQLLiteralsAndComments(sql string) (string, error) {
 				i += endIdx + len(tag)
 				continue
 			}
+		}
+
+		// Consume full unquoted identifiers in one token so embedded '$', 'e', or 'u' cannot trigger mid-identifier.
+		if isSQLIdentStart(ch) {
+			start := i
+			i++
+			for i < n && isSQLIdentChar(sql[i]) {
+				i++
+			}
+			out.WriteString(sql[start:i])
+			continue
 		}
 
 		out.WriteByte(ch)
@@ -310,15 +416,18 @@ type StoreOptions struct {
 	StatementTimeoutMs  int
 	EnforceNonSuperuser bool
 	MathSchema          string
+	ReadOnlyMaxBytes    int
 }
 
 type PostgresStore struct {
-	pool       *pgxpool.Pool
-	mathSchema string
+	pool             *pgxpool.Pool
+	mathSchema       string
+	readOnlyMaxBytes int
 
 	// Optional unexported test seams for unit testing without a live database.
 	copyBatchFn   func(ctx context.Context, copyRows [][]any, nodeLastSeen map[string]time.Time, artifacts []*core.Artifact, traces []*core.TraceEdge) (int64, error)
 	insertEventFn func(ctx context.Context, p *core.CTDPayload) error
+	pruneExecFn   func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 // NewPostgresStore initializes a connection pool to the PostgreSQL CTD Ledger.
@@ -391,7 +500,12 @@ func NewPostgresStoreWithOptions(ctx context.Context, connStr string, opts Store
 		return nil, err
 	}
 
-	return &PostgresStore{pool: pool, mathSchema: schema}, nil
+	readOnlyMaxBytes := opts.ReadOnlyMaxBytes
+	if readOnlyMaxBytes <= 0 {
+		readOnlyMaxBytes = DefaultReadOnlyMaxBytes
+	}
+
+	return &PostgresStore{pool: pool, mathSchema: schema, readOnlyMaxBytes: readOnlyMaxBytes}, nil
 }
 
 // Pool exposes the underlying pgxpool.Pool for advanced callers.
@@ -1430,6 +1544,18 @@ func (s *PostgresStore) RemoveNodeTags(ctx context.Context, nodeID string, remov
 	return merged, err
 }
 
+const resolveNodesAllQuery = `
+	SELECT DISTINCT node_id FROM (
+		SELECT node_id FROM ctd_nodes
+		WHERE status <> 'OFFLINE'
+		  AND last_seen >= NOW() - INTERVAL '15 minutes'
+		UNION
+		SELECT DISTINCT node_id FROM telemetric_ledger
+		WHERE event_timestamp >= NOW() - INTERVAL '15 minutes'
+	) active_nodes
+	ORDER BY node_id ASC
+`
+
 // ResolveNodes evaluates a RunnerSelector (`--all`, `--node`, `--tag`) against `ctd_nodes` and `telemetric_ledger`.
 func (s *PostgresStore) ResolveNodes(ctx context.Context, sel core.RunnerSelector) ([]string, error) {
 	if sel.IsEmpty() {
@@ -1442,15 +1568,16 @@ func (s *PostgresStore) ResolveNodes(ctx context.Context, sel core.RunnerSelecto
 	}
 	defer tx.Rollback(ctx)
 
+	return s.resolveNodesWithTx(ctx, tx, sel)
+}
+
+func (s *PostgresStore) resolveNodesWithTx(ctx context.Context, tx pgx.Tx, sel core.RunnerSelector) ([]string, error) {
+	if sel.IsEmpty() {
+		return nil, nil
+	}
+
 	if sel.All {
-		rows, err := tx.Query(ctx, `
-			SELECT DISTINCT node_id FROM (
-				SELECT node_id FROM ctd_nodes WHERE status <> 'OFFLINE'
-				UNION
-				SELECT DISTINCT node_id FROM telemetric_ledger WHERE event_timestamp >= NOW() - INTERVAL '15 minutes'
-			) active_nodes
-			ORDER BY node_id ASC
-		`)
+		rows, err := tx.Query(ctx, resolveNodesAllQuery)
 		if err != nil {
 			return nil, err
 		}
@@ -1458,9 +1585,10 @@ func (s *PostgresStore) ResolveNodes(ctx context.Context, sel core.RunnerSelecto
 		var out []string
 		for rows.Next() {
 			var id string
-			if err := rows.Scan(&id); err == nil {
-				out = append(out, id)
+			if err := rows.Scan(&id); err != nil {
+				return nil, err
 			}
+			out = append(out, id)
 		}
 		return out, rows.Err()
 	}
@@ -1487,9 +1615,10 @@ func (s *PostgresStore) ResolveNodes(ctx context.Context, sel core.RunnerSelecto
 		defer rows.Close()
 		for rows.Next() {
 			var id string
-			if err := rows.Scan(&id); err == nil {
-				resolved[id] = struct{}{}
+			if err := rows.Scan(&id); err != nil {
+				return nil, err
 			}
+			resolved[id] = struct{}{}
 		}
 		if err := rows.Err(); err != nil {
 			return nil, err
@@ -1673,10 +1802,63 @@ func (s *PostgresStore) GetLedgerActivity(ctx context.Context, limit int) ([]Led
 	return out, rows.Err()
 }
 
-// GetLineageDAG walks upstream and downstream edges from any Artifact ID using a recursive CTE.
+const (
+	defaultLineageMaxDepth  = 10
+	maxLineageDepth         = 32
+	defaultLineageHopLimit  = 250
+	defaultLineageTotalRows = 2500
+)
+
+const getLineageDAGQuery = `
+	WITH RECURSIVE lineage (
+		id, source_id, verb, target_id, node_id, run_id, meta, event_timestamp, depth
+	) AS (
+		SELECT base.id, base.source_id, base.verb, base.target_id, base.node_id, base.run_id, base.meta, base.event_timestamp, 1 AS depth
+		FROM (
+			SELECT id, source_id, verb, target_id,
+			       COALESCE(node_id, '') AS node_id,
+			       COALESCE(run_id, '') AS run_id,
+			       meta, event_timestamp
+			FROM ctd_traces
+			WHERE source_id = $1 OR target_id = $1
+			ORDER BY event_timestamp DESC, id DESC
+			LIMIT $3
+		) base
+		UNION ALL
+		SELECT t.id, t.source_id, t.verb, t.target_id, t.node_id, t.run_id, t.meta, t.event_timestamp, l.depth + 1
+		FROM lineage l
+		CROSS JOIN LATERAL (
+			SELECT tr.id, tr.source_id, tr.verb, tr.target_id,
+			       COALESCE(tr.node_id, '') AS node_id,
+			       COALESCE(tr.run_id, '') AS run_id,
+			       tr.meta, tr.event_timestamp
+			FROM ctd_traces tr
+			WHERE tr.source_id = l.target_id OR tr.target_id = l.source_id
+			ORDER BY tr.event_timestamp DESC, tr.id DESC
+			LIMIT $3
+		) t
+		WHERE l.depth < $2
+	) CYCLE id SET is_cycle USING path
+	SELECT source_id, verb, target_id, node_id, run_id, meta, event_timestamp
+	FROM (
+		SELECT DISTINCT ON (id) id, source_id, verb, target_id, node_id, run_id, meta, event_timestamp
+		FROM (
+			SELECT id, source_id, verb, target_id, node_id, run_id, meta, event_timestamp
+			FROM lineage
+			WHERE NOT is_cycle
+			LIMIT $4
+		) capped
+		ORDER BY id
+	) bounded
+	ORDER BY event_timestamp ASC
+`
+
+// GetLineageDAG walks upstream and downstream edges from any Artifact ID using a bounded recursive CTE.
 func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, maxDepth int) (*DAG, error) {
 	if maxDepth <= 0 {
-		maxDepth = 10
+		maxDepth = defaultLineageMaxDepth
+	} else if maxDepth > maxLineageDepth {
+		maxDepth = maxLineageDepth
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
@@ -1690,30 +1872,12 @@ func (s *PostgresStore) GetLineageDAG(ctx context.Context, artifactID string, ma
 
 func (s *PostgresStore) getLineageDAGWithTx(ctx context.Context, tx pgx.Tx, artifactID string, maxDepth int) (*DAG, error) {
 	if maxDepth <= 0 {
-		maxDepth = 10
+		maxDepth = defaultLineageMaxDepth
+	} else if maxDepth > maxLineageDepth {
+		maxDepth = maxLineageDepth
 	}
 
-	rows, err := tx.Query(ctx, `
-		WITH RECURSIVE lineage AS (
-			SELECT id, source_id, verb, target_id, COALESCE(node_id, '') AS node_id, COALESCE(run_id, '') AS run_id, meta, event_timestamp, 1 AS depth, ARRAY[id::text] AS visited_edges
-			FROM ctd_traces
-			WHERE source_id = $1 OR target_id = $1
-			UNION ALL
-			SELECT t.id, t.source_id, t.verb, t.target_id, COALESCE(t.node_id, ''), COALESCE(t.run_id, ''), t.meta, t.event_timestamp, l.depth + 1, l.visited_edges || t.id::text
-			FROM ctd_traces t
-			INNER JOIN lineage l ON (t.source_id = l.target_id OR t.target_id = l.source_id)
-			WHERE l.depth < $2
-			  AND NOT (t.id::text = ANY(l.visited_edges))
-		)
-		SELECT source_id, verb, target_id, node_id, run_id, meta, event_timestamp
-		FROM (
-			SELECT DISTINCT ON (id) id, source_id, verb, target_id, node_id, run_id, meta, event_timestamp
-			FROM lineage
-			ORDER BY id
-			LIMIT 2500
-		) bounded
-		ORDER BY event_timestamp ASC
-	`, artifactID, maxDepth)
+	rows, err := tx.Query(ctx, getLineageDAGQuery, artifactID, maxDepth, defaultLineageHopLimit, defaultLineageTotalRows)
 	if err != nil {
 		return nil, err
 	}
@@ -1828,21 +1992,155 @@ func (s *PostgresStore) FetchForUnload(ctx context.Context, f UnloadFilter) ([]c
 	return results, rows.Err()
 }
 
+const pruneLedgerBeforeSQL = `
+	WITH doomed AS (
+		SELECT id
+		FROM telemetric_ledger
+		WHERE event_timestamp < $1
+		LIMIT $2
+		FOR UPDATE SKIP LOCKED
+	)
+	DELETE FROM telemetric_ledger t
+	USING doomed d
+	WHERE t.id = d.id
+`
+
+// PruneLedgerBefore deletes up to batchLimit telemetric_ledger rows older than cutoff in a single bounded transaction batch.
+func (s *PostgresStore) PruneLedgerBefore(ctx context.Context, cutoff time.Time, batchLimit int) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, fmt.Errorf("prune cutoff timestamp cannot be zero")
+	}
+	if batchLimit <= 0 {
+		batchLimit = DefaultLedgerPruneBatchLimit
+	} else if batchLimit > maxLedgerPruneBatchLimit {
+		batchLimit = maxLedgerPruneBatchLimit
+	}
+
+	cutoffUTC := cutoff.UTC()
+	if s.pruneExecFn != nil {
+		tag, err := s.pruneExecFn(ctx, pruneLedgerBeforeSQL, cutoffUTC, batchLimit)
+		if err != nil {
+			return 0, err
+		}
+		return tag.RowsAffected(), nil
+	}
+	if s.pool == nil {
+		return 0, fmt.Errorf("postgres store pool is not initialized")
+	}
+	tag, err := s.pool.Exec(ctx, pruneLedgerBeforeSQL, cutoffUTC, batchLimit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func rawRowBytes(rawVals [][]byte) int {
+	var total int
+	for _, raw := range rawVals {
+		total += len(raw)
+	}
+	return total
+}
+
+func estimateValueBytes(v any) int {
+	switch val := v.(type) {
+	case nil:
+		return 8
+	case string:
+		return len(val)
+	case []byte:
+		return len(val)
+	case []any:
+		total := 24
+		for _, item := range val {
+			total += estimateValueBytes(item)
+		}
+		return total
+	case map[string]any:
+		return estimateRowMapBytes(val)
+	case []string:
+		total := 24
+		for _, s := range val {
+			total += len(s)
+		}
+		return total
+	default:
+		return 16
+	}
+}
+
+func estimateRowMapBytes(m map[string]any) int {
+	total := 16
+	for k, v := range m {
+		total += len(k) + estimateValueBytes(v)
+	}
+	return total
+}
+
+func scanReadOnlyRows(rows pgx.Rows, maxRows, maxBytes int) ([]map[string]any, error) {
+	if maxRows <= 0 {
+		maxRows = DefaultReadOnlyMaxRows
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultReadOnlyMaxBytes
+	}
+
+	out := make([]map[string]any, 0, min(maxRows, 64))
+	totalBytes := 0
+	for len(out) < maxRows && rows.Next() {
+		rawBytes := rawRowBytes(rows.RawValues())
+		if rawBytes > 0 && totalBytes+rawBytes > maxBytes {
+			return nil, fmt.Errorf("%w: scanned %d bytes (limit %d)", ErrReadOnlyByteLimitExceeded, totalBytes+rawBytes, maxBytes)
+		}
+		m, err := pgx.RowToMap(rows)
+		if err != nil {
+			return nil, err
+		}
+		rowBytes := max(rawBytes, estimateRowMapBytes(m))
+		if totalBytes+rowBytes > maxBytes {
+			return nil, fmt.Errorf("%w: scanned %d bytes (limit %d)", ErrReadOnlyByteLimitExceeded, totalBytes+rowBytes, maxBytes)
+		}
+		totalBytes += rowBytes
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // QueryReadOnlyMaps executes arbitrary read queries strictly inside a PostgreSQL `READ ONLY` transaction
-// with bounded statement timeout and bounded Go heap materialization (`DefaultReadOnlyMaxRows`).
+// with bounded statement timeout, bounded row count (`DefaultReadOnlyMaxRows`), and bounded heap bytes (`DefaultReadOnlyMaxBytes`).
 func (s *PostgresStore) QueryReadOnlyMaps(ctx context.Context, sql string, args ...any) ([]map[string]any, error) {
 	return s.QueryReadOnlyMapsBounded(ctx, DefaultReadOnlyMaxRows, sql, args...)
 }
 
 // QueryReadOnlyMapsBounded executes a validated read-only SELECT inside a PostgreSQL `READ ONLY` transaction,
-// enforcing `SET LOCAL statement_timeout = '5000ms'` and stopping stream consumption at `maxRows`.
+// enforcing `SET LOCAL statement_timeout = '5000ms'`, stopping stream consumption at `maxRows`, and enforcing the store byte ceiling.
 func (s *PostgresStore) QueryReadOnlyMapsBounded(ctx context.Context, maxRows int, sql string, args ...any) ([]map[string]any, error) {
+	maxBytes := DefaultReadOnlyMaxBytes
+	if s != nil && s.readOnlyMaxBytes > 0 {
+		maxBytes = s.readOnlyMaxBytes
+	}
+	return s.QueryReadOnlyMapsBoundedBytes(ctx, maxRows, maxBytes, sql, args...)
+}
+
+// QueryReadOnlyMapsBoundedBytes executes a validated read-only SELECT inside a PostgreSQL `READ ONLY` transaction
+// with explicit row and total byte ceilings.
+func (s *PostgresStore) QueryReadOnlyMapsBoundedBytes(ctx context.Context, maxRows, maxBytes int, sql string, args ...any) ([]map[string]any, error) {
 	cleaned, err := ValidateSelectOnlySQL(sql)
 	if err != nil {
 		return nil, err
 	}
 	if maxRows <= 0 {
 		maxRows = DefaultReadOnlyMaxRows
+	}
+	if maxBytes <= 0 {
+		if s != nil && s.readOnlyMaxBytes > 0 {
+			maxBytes = s.readOnlyMaxBytes
+		} else {
+			maxBytes = DefaultReadOnlyMaxBytes
+		}
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
@@ -1851,28 +2149,21 @@ func (s *PostgresStore) QueryReadOnlyMapsBounded(ctx context.Context, maxRows in
 	}
 	defer tx.Rollback(ctx)
 
+	return s.queryReadOnlyMapsWithTx(ctx, tx, maxRows, maxBytes, cleaned, args...)
+}
+
+func (s *PostgresStore) queryReadOnlyMapsWithTx(ctx context.Context, tx pgx.Tx, maxRows, maxBytes int, cleanedSQL string, args ...any) ([]map[string]any, error) {
 	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '5000ms'"); err != nil {
 		return nil, err
 	}
 
-	rows, err := tx.Query(ctx, cleaned, args...)
+	rows, err := tx.Query(ctx, cleanedSQL, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := make([]map[string]any, 0, min(maxRows, 64))
-	for len(out) < maxRows && rows.Next() {
-		m, err := pgx.RowToMap(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return scanReadOnlyRows(rows, maxRows, maxBytes)
 }
 
 // ExplainReadOnly validates syntax and planner structure of a candidate SELECT query inside a rolled-back READ ONLY transaction.

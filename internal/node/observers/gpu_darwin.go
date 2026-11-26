@@ -23,13 +23,17 @@ func observeGPUPlatform(ctx context.Context, pub core.TelemetryPublisher, nodeID
 		return true
 	}
 	log.Println("[GPU Observer] Apple/Darwin hardware detected. Booting shared powermetrics observer.")
-	go observeGPUDarwin(ctx, pub, nodeID)
+	observeGPUDarwin(ctx, pub, nodeID)
 	return true
 }
 
 func observeGPUDarwin(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	observeGPUDarwinWithSample(ctx, pub, nodeID, sampleDarwinPowermetrics)
+}
+
+func observeGPUDarwinWithSample(ctx context.Context, pub core.TelemetryPublisher, nodeID string, sampleFn func(context.Context) (string, error)) {
 	runPeriodicObserver(ctx, true, func() {
-		output, err := sampleDarwinPowermetrics(ctx)
+		output, err := sampleFn(ctx)
 		if err != nil {
 			log.Printf("[Darwin GPU Observer] Failed to read powermetrics: %v", err)
 			return

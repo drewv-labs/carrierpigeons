@@ -8,10 +8,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -470,5 +472,206 @@ func TestEmbeddedBrokerMutualTLSNodeIDBinding(t *testing.T) {
 	if tok := certOnlySpoof.Connect(); tok.WaitTimeout(2*time.Second) && tok.Error() == nil {
 		certOnlySpoof.Disconnect(50)
 		t.Fatal("expected cert-only edge client with mismatched client_id to be rejected")
+	}
+}
+
+func TestPerNodeAuthHookRejectsRetainedCTDAndNonCanonicalClientID(t *testing.T) {
+	hook := &perNodeAuthHook{
+		adminUser:  "coop_admin",
+		adminPass:  "admin_secret",
+		edgeUser:   "edge_node",
+		edgePass:   "edge_secret",
+		edgePrefix: "pigeoneer-",
+		topicRoot:  "pigeons",
+	}
+
+	// OnPublish must reject Retain=true on <root>/ctd/#.
+	retainedCTD := packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Retain: true, Qos: 1},
+		TopicName:   "pigeons/ctd/observer/edge-01/host-os",
+		Payload:     []byte(`{"node_id":"edge-01"}`),
+	}
+	if _, err := hook.OnPublish(&mochi.Client{ID: "pigeoneer-edge-01"}, retainedCTD); !errors.Is(err, packets.ErrRejectPacket) {
+		t.Fatalf("expected packets.ErrRejectPacket for retained CTD publish, got %v", err)
+	}
+
+	nonRetainedCTD := retainedCTD
+	nonRetainedCTD.FixedHeader.Retain = false
+	if _, err := hook.OnPublish(&mochi.Client{ID: "pigeoneer-edge-01"}, nonRetainedCTD); err != nil {
+		t.Fatalf("expected non-retained CTD publish to be allowed, got %v", err)
+	}
+
+	retainedStatus := packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Retain: true, Qos: 1},
+		TopicName:   "pigeons/registry/edge-01/status",
+		Payload:     []byte("ONLINE"),
+	}
+	if _, err := hook.OnPublish(&mochi.Client{ID: "pigeoneer-edge-01"}, retainedStatus); err != nil {
+		t.Fatalf("expected retained registry status publish to be allowed, got %v", err)
+	}
+
+	// Stealth / non-canonical ClientIDs must be rejected on connect and ACL check.
+	for _, badID := range []string{
+		"",
+		"edge-01",
+		"pigeoneer-",
+		" pigeoneer-edge-01",
+		"pigeoneer-edge-01 ",
+		"\tpigeoneer-edge-01\n",
+		"pigeoneer-edge 01",
+	} {
+		cl := &mochi.Client{
+			ID:         badID,
+			Properties: mochi.ClientProperties{Username: []byte("edge_node")},
+		}
+		if hook.OnConnectAuthenticate(cl, packets.Packet{
+			Connect: packets.ConnectParams{
+				Username: []byte("edge_node"),
+				Password: []byte("edge_secret"),
+			},
+		}) {
+			t.Fatalf("expected non-canonical/whitespace edge client_id %q to fail auth", badID)
+		}
+		if hook.OnACLCheck(cl, "pigeons/registry/edge-01/status", true) {
+			t.Fatalf("expected non-canonical/whitespace edge client_id %q to fail ACL", badID)
+		}
+	}
+
+	// Prefix stripping is strictly single-prefix so two distinct ClientIDs cannot alias the same nodeID.
+	prefixedNode := &mochi.Client{
+		ID:         "pigeoneer-pigeoneer-01",
+		Properties: mochi.ClientProperties{Username: []byte("edge_node")},
+	}
+	if !hook.OnACLCheck(prefixedNode, "pigeons/registry/pigeoneer-01/status", true) {
+		t.Fatal("expected pigeoneer-pigeoneer-01 to map strictly to node_id pigeoneer-01")
+	}
+	singlePrefixed := &mochi.Client{
+		ID:         "pigeoneer-01",
+		Properties: mochi.ClientProperties{Username: []byte("edge_node")},
+	}
+	if hook.OnACLCheck(singlePrefixed, "pigeons/registry/pigeoneer-01/status", true) {
+		t.Fatal("expected pigeoneer-01 NOT to alias node_id pigeoneer-01")
+	}
+
+	// Retained LWT on <root>/ctd/... must be rejected on connect.
+	if hook.OnConnectAuthenticate(&mochi.Client{ID: "pigeoneer-edge-01"}, packets.Packet{
+		Connect: packets.ConnectParams{
+			Username:   []byte("edge_node"),
+			Password:   []byte("edge_secret"),
+			WillFlag:   true,
+			WillRetain: true,
+			WillTopic:  "pigeons/ctd/observer/edge-01/host-os",
+		},
+	}) {
+		t.Fatal("expected retained WillTopic on ctd/# to fail auth")
+	}
+}
+
+func TestEmbeddedBrokerRetainCTDRejectionBoundsAndLocalClientURL(t *testing.T) {
+	emb, err := StartEmbedded(EmbeddedOptions{
+		ListenAddr:   "127.0.0.1:0",
+		Username:     "coop_admin",
+		Password:     "admin_secret",
+		EdgeUsername: "edge_node",
+		EdgePassword: "edge_secret",
+		TopicRoot:    "pigeons",
+	})
+	if err != nil {
+		t.Fatalf("StartEmbedded failed: %v", err)
+	}
+	defer emb.Close()
+
+	caps := emb.server.Options.Capabilities
+	if caps.MaximumSessionExpiryInterval != 600 ||
+		caps.MaximumInflight != 1024 ||
+		caps.MaximumClientWritesPending != 2048 ||
+		caps.MaximumClients != 512 ||
+		caps.MaximumPacketSize != 1<<20 {
+		t.Fatalf("unexpected Mochi capabilities bounds: %+v", caps)
+	}
+
+	// Reject stealth ClientIDs live over MQTT.
+	for _, badID := range []string{"edge-01", " pigeoneer-edge-01 ", "pigeoneer-"} {
+		cli := mqtt.NewClient(mqtt.NewClientOptions().
+			AddBroker(emb.LocalClientURL()).
+			SetClientID(badID).
+			SetUsername("edge_node").
+			SetPassword("edge_secret").
+			SetConnectRetry(false))
+		if tok := cli.Connect(); tok.WaitTimeout(2*time.Second) && tok.Error() == nil {
+			cli.Disconnect(50)
+			t.Fatalf("expected live embedded broker to reject stealth client_id %q", badID)
+		}
+	}
+
+	edgeCli := mqtt.NewClient(mqtt.NewClientOptions().
+		AddBroker(emb.LocalClientURL()).
+		SetClientID("pigeoneer-edge-01").
+		SetUsername("edge_node").
+		SetPassword("edge_secret").
+		SetConnectRetry(false))
+	if tok := edgeCli.Connect(); !tok.WaitTimeout(2*time.Second) || tok.Error() != nil {
+		t.Fatalf("canonical edge connect failed: %v", tok.Error())
+	}
+	defer edgeCli.Disconnect(50)
+
+	// Publish retained message on ctd/# (QoS 0 so client doesn't block waiting for PUBACK) -> must be rejected/not retained.
+	_ = edgeCli.Publish("pigeons/ctd/observer/edge-01/host-os", 0, true, []byte(`{"node_id":"edge-01"}`)).WaitTimeout(500 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	if retained := emb.server.Topics.Messages("pigeons/ctd/#"); len(retained) != 0 {
+		t.Fatalf("expected 0 retained messages on pigeons/ctd/#, got %d", len(retained))
+	}
+
+	// Also verify anonymous mode enforces ctd/# retain guard.
+	embAnon, err := StartEmbedded(EmbeddedOptions{ListenAddr: "127.0.0.1:0", TopicRoot: "pigeons"})
+	if err != nil {
+		t.Fatalf("StartEmbedded anon failed: %v", err)
+	}
+	defer embAnon.Close()
+
+	anonCli := mqtt.NewClient(mqtt.NewClientOptions().
+		AddBroker(embAnon.LocalClientURL()).
+		SetClientID("anon-retain-tester").
+		SetConnectRetry(false))
+	if tok := anonCli.Connect(); !tok.WaitTimeout(2*time.Second) || tok.Error() != nil {
+		t.Fatalf("anon connect failed: %v", tok.Error())
+	}
+	defer anonCli.Disconnect(50)
+
+	_ = anonCli.Publish("pigeons/ctd/observer/edge-01/host-os", 0, true, []byte(`{"node_id":"edge-01"}`)).WaitTimeout(500 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	if retained := embAnon.server.Topics.Messages("pigeons/ctd/#"); len(retained) != 0 {
+		t.Fatalf("expected 0 retained messages on pigeons/ctd/# in anon mode, got %d", len(retained))
+	}
+
+	// LocalClientURL rewrite vs preservation rules.
+	cases := []struct {
+		boundAddr string
+		tlsActive bool
+		want      string
+	}{
+		{boundAddr: "", tlsActive: false, want: "tcp://127.0.0.1:1883"},
+		{boundAddr: ":1883", tlsActive: false, want: "tcp://127.0.0.1:1883"},
+		{boundAddr: "0.0.0.0:1883", tlsActive: false, want: "tcp://127.0.0.1:1883"},
+		{boundAddr: "[::]:1883", tlsActive: false, want: "tcp://[::1]:1883"},
+		{boundAddr: "[::]:8883", tlsActive: true, want: "tls://[::1]:8883"},
+		{boundAddr: "127.0.0.1:1884", tlsActive: false, want: "tcp://127.0.0.1:1884"},
+		{boundAddr: "192.0.2.10:1883", tlsActive: false, want: "tcp://192.0.2.10:1883"},
+		{boundAddr: "[2001:db8::1]:8883", tlsActive: true, want: "tls://[2001:db8::1]:8883"},
+		{boundAddr: "[::1]:1885", tlsActive: false, want: "tcp://[::1]:1885"},
+	}
+	for _, tc := range cases {
+		b := &EmbeddedBroker{boundAddr: tc.boundAddr, tlsActive: tc.tlsActive}
+		if got := b.LocalClientURL(); got != tc.want {
+			t.Fatalf("LocalClientURL(%q, tls=%v) = %q, want %q", tc.boundAddr, tc.tlsActive, got, tc.want)
+		}
+	}
+
+	if embV6, err := StartEmbedded(EmbeddedOptions{ListenAddr: "[::1]:0"}); err == nil {
+		defer embV6.Close()
+		gotURL := embV6.LocalClientURL()
+		if !strings.HasPrefix(gotURL, "tcp://[::1]:") {
+			t.Fatalf("expected IPv6 loopback LocalClientURL to preserve ::1, got %q", gotURL)
+		}
 	}
 }

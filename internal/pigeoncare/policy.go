@@ -2,12 +2,15 @@ package pigeoncare
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 )
 
 // PermissionMode emulates Google Antigravity / Zed agent autonomy tiers.
@@ -90,24 +93,110 @@ type ActionProposal struct {
 // Prompter asks the human operator `[Allow, Always Allow, Deny]` when PolicyGate requires confirmation.
 type Prompter func(ctx context.Context, proposal ActionProposal) (ConfirmationDecision, error)
 
+type ephemeralApprovalKey struct {
+	interpreter string
+	sha256      string
+	selectors   string
+}
+
+type canonicalSelector struct {
+	All   bool     `json:"all"`
+	Nodes []string `json:"nodes,omitempty"`
+	Tags  []string `json:"tags,omitempty"`
+}
+
+func canonicalizeSelectors(sel core.RunnerSelector) string {
+	var nodes []string
+	if len(sel.Nodes) > 0 {
+		seen := make(map[string]struct{}, len(sel.Nodes))
+		nodes = make([]string, 0, len(sel.Nodes))
+		for _, raw := range sel.Nodes {
+			n := strings.TrimSpace(raw)
+			if n == "" {
+				continue
+			}
+			if _, ok := seen[n]; !ok {
+				seen[n] = struct{}{}
+				nodes = append(nodes, n)
+			}
+		}
+		slices.Sort(nodes)
+	}
+	tags := core.NormalizeTags(sel.Tags)
+	if len(tags) == 0 {
+		tags = nil
+	}
+	raw, _ := json.Marshal(canonicalSelector{
+		All:   sel.All,
+		Nodes: nodes,
+		Tags:  tags,
+	})
+	return string(raw)
+}
+
+func isValidSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeProposalScript(proposal ActionProposal) (interp string, bodyHash string, boundHash string, key ephemeralApprovalKey, valid bool) {
+	interp = runner.NormalizeInterpreter(proposal.Interpreter)
+	if interp == "" {
+		return "", "", "", ephemeralApprovalKey{}, false
+	}
+
+	sha := strings.ToLower(strings.TrimSpace(proposal.SHA256))
+	if proposal.ScriptBody != "" {
+		if strings.TrimSpace(proposal.ScriptBody) == "" {
+			return "", "", "", ephemeralApprovalKey{}, false
+		}
+		computedBody := runner.ComputeScriptSHA256(proposal.ScriptBody)
+		if sha == "" {
+			sha = computedBody
+		} else if sha != computedBody {
+			return "", "", "", ephemeralApprovalKey{}, false
+		}
+		boundHash = runner.ComputeBoundScriptSHA256(interp, proposal.ScriptBody)
+	}
+	if !isValidSHA256Hex(sha) {
+		return "", "", "", ephemeralApprovalKey{}, false
+	}
+
+	return interp, sha, boundHash, ephemeralApprovalKey{
+		interpreter: interp,
+		sha256:      sha,
+		selectors:   canonicalizeSelectors(proposal.Selectors),
+	}, true
+}
+
 // PolicyGate enforces `[Default, Auto Edit, YOLO]` modes and session/config allowlists.
 type PolicyGate struct {
-	mu                  sync.RWMutex
-	mode                PermissionMode
-	allowedRunners      map[string]struct{}
-	allowedScriptHashes map[string]struct{}
-	allowedViews        map[string]struct{}
-	prompter            Prompter
+	mu                   sync.RWMutex
+	mode                 PermissionMode
+	allowedRunners       map[string]struct{}
+	allowedScriptHashes  map[string]struct{}
+	alwaysAllowedScripts map[ephemeralApprovalKey]struct{}
+	allowedViews         map[string]struct{}
+	prompter             Prompter
 }
 
 // NewPolicyGate initializes a PolicyGate from WorkstationConfig permission settings.
 func NewPolicyGate(cfg config.PermissionConfig, prompter Prompter) *PolicyGate {
 	g := &PolicyGate{
-		mode:                ParseMode(cfg.Mode),
-		allowedRunners:      make(map[string]struct{}),
-		allowedScriptHashes: make(map[string]struct{}),
-		allowedViews:        make(map[string]struct{}),
-		prompter:            prompter,
+		mode:                 ParseMode(cfg.Mode),
+		allowedRunners:       make(map[string]struct{}),
+		allowedScriptHashes:  make(map[string]struct{}),
+		alwaysAllowedScripts: make(map[ephemeralApprovalKey]struct{}),
+		allowedViews:         make(map[string]struct{}),
+		prompter:             prompter,
 	}
 	for _, r := range cfg.AllowedRunners {
 		if trimmed := strings.ToLower(strings.TrimSpace(r)); trimmed != "" {
@@ -115,8 +204,8 @@ func NewPolicyGate(cfg config.PermissionConfig, prompter Prompter) *PolicyGate {
 		}
 	}
 	for _, h := range cfg.AllowedScriptHashes {
-		if trimmed := strings.ToLower(strings.TrimSpace(h)); trimmed != "" {
-			g.allowedScriptHashes[trimmed] = struct{}{}
+		if norm, ok := runner.NormalizeAllowedScriptHashEntry(h); ok {
+			g.allowedScriptHashes[norm] = struct{}{}
 		}
 	}
 	return g
@@ -147,13 +236,49 @@ func (g *PolicyGate) SetPrompter(p Prompter) {
 	g.prompter = p
 }
 
+func (g *PolicyGate) isConfigScriptHashAllowedLocked(interp, bodyHash, boundHash string) bool {
+	if _, ok := g.allowedScriptHashes[interp+":"+bodyHash]; ok {
+		return true
+	}
+	if boundHash != "" {
+		if _, ok := g.allowedScriptHashes[interp+":"+boundHash]; ok {
+			return true
+		}
+		if _, ok := g.allowedScriptHashes[boundHash]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Authorize evaluates whether `proposal` may execute immediately or requires `[Allow / Always Allow / Deny]`.
 func (g *PolicyGate) Authorize(ctx context.Context, proposal ActionProposal) error {
+	var (
+		interp    string
+		bodyHash  string
+		boundHash string
+		scriptKey ephemeralApprovalKey
+		scriptOK  bool
+	)
+	if proposal.Kind == ActionEphemeralRunner {
+		interp, bodyHash, boundHash, scriptKey, scriptOK = normalizeProposalScript(proposal)
+		if !scriptOK {
+			return fmt.Errorf("ephemeral runner proposal %q failed script/hash validation", proposal.Title)
+		}
+	}
+
 	g.mu.RLock()
 	mode := g.mode
 	prompter := g.prompter
 	_, runnerAllowed := g.allowedRunners[strings.ToLower(strings.TrimSpace(proposal.Runner))]
-	_, hashAllowed := g.allowedScriptHashes[strings.ToLower(strings.TrimSpace(proposal.SHA256))]
+	scriptAllowed := false
+	if scriptOK {
+		if _, ok := g.alwaysAllowedScripts[scriptKey]; ok {
+			scriptAllowed = true
+		} else if g.isConfigScriptHashAllowedLocked(interp, bodyHash, boundHash) {
+			scriptAllowed = true
+		}
+	}
 	_, viewAllowed := g.allowedViews[strings.ToLower(strings.TrimSpace(proposal.ViewName))]
 	g.mu.RUnlock()
 
@@ -165,7 +290,7 @@ func (g *PolicyGate) Authorize(ctx context.Context, proposal ActionProposal) err
 	// 2. Check existing session / config allowlists.
 	switch proposal.Kind {
 	case ActionEphemeralRunner:
-		if hashAllowed && proposal.SHA256 != "" {
+		if scriptAllowed {
 			return nil
 		}
 	case ActionStandardRunner:
@@ -196,8 +321,8 @@ func (g *PolicyGate) Authorize(ctx context.Context, proposal ActionProposal) err
 		g.mu.Lock()
 		switch proposal.Kind {
 		case ActionEphemeralRunner:
-			if proposal.SHA256 != "" {
-				g.allowedScriptHashes[strings.ToLower(proposal.SHA256)] = struct{}{}
+			if scriptOK {
+				g.alwaysAllowedScripts[scriptKey] = struct{}{}
 			}
 		case ActionStandardRunner:
 			if proposal.Runner != "" {

@@ -44,3 +44,14 @@ func TestResolveAllowSuperuserRO(t *testing.T) {
 		}
 	})
 }
+
+func TestWrapAgentSafeDBByteCeilingConfig(t *testing.T) {
+	defaultWrapped := WrapAgentSafeDB(&PostgresStore{})
+	if defaultWrapped.maxBytes != DefaultReadOnlyMaxBytes {
+		t.Fatalf("expected default maxBytes=%d, got %d", DefaultReadOnlyMaxBytes, defaultWrapped.maxBytes)
+	}
+	customWrapped := WrapAgentSafeDB(&PostgresStore{readOnlyMaxBytes: 65536})
+	if customWrapped.maxBytes != 65536 {
+		t.Fatalf("expected inherited maxBytes=65536, got %d", customWrapped.maxBytes)
+	}
+}

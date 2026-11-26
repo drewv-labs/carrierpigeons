@@ -26,7 +26,7 @@ var listCmd = &cobra.Command{
 		state := cliStateFromCommand(cmd)
 		tagFilter, _ := cmd.Flags().GetString("tag")
 
-		store, err := openOperatorStoreForConfig(ctx, state.wsCfg)
+		store, err := openReadStoreForConfig(ctx, state.wsCfg, strings.ToLower(state.wsCfg.Brand.CLIName)+"-list")
 		if err != nil {
 			return fmt.Errorf("connect CTD Ledger: %w", err)
 		}

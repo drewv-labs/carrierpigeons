@@ -156,7 +156,7 @@ func New(cfg Config) BaseLLM {
 	case "ollama":
 		return NewOllamaAdapter(cfg.Endpoint, cfg.Model, cfg.Tools)
 	case "claude", "anthropic":
-		return NewClaudeAdapter(cfg.APIKey, cfg.Model, cfg.Tools)
+		return NewClaudeAdapterWithEndpoint(cfg.Endpoint, cfg.APIKey, cfg.Model, cfg.Tools)
 	case "openai":
 		return NewOpenAIAdapter(cfg.Endpoint, cfg.APIKey, cfg.Model, cfg.Tools)
 	case "llamacpp", "llama.cpp":

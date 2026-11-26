@@ -19,7 +19,7 @@ var mathCmd = &cobra.Command{
 	Short: "Manage PigeonMath analytical views (pigeonmath.pmv_*) or open the PigeonMath TUI",
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		state := cliStateFromCommand(cmd)
-		return launchDashboardWithConfig(state.wsCfg, tui.TabPigeonMath, "", "", "")
+		return launchDashboardWithConfig(cmd.Context(), state.wsCfg, tui.TabPigeonMath, "", "", "")
 	},
 }
 

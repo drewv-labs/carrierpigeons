@@ -50,6 +50,20 @@ func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
 	if _, err := NormalizePMVName("bad-name!"); err == nil {
 		t.Fatal("expected invalid PMV name to fail")
 	}
+	if _, err := NormalizePMVName("pmv_"); err == nil {
+		t.Fatal("expected empty pmv_ suffix to fail")
+	}
+	maxLenSlug := strings.Repeat("a", 59)
+	got, err = NormalizePMVName(maxLenSlug)
+	if err != nil || len(got) != 63 {
+		t.Fatalf("expected 63-byte PMV identifier to pass, got %q (len=%d, err=%v)", got, len(got), err)
+	}
+	if _, err := NormalizePMVName(strings.Repeat("a", 60)); err == nil {
+		t.Fatal("expected 64-byte PMV identifier (>63 bytes) to be rejected")
+	}
+	if _, err := NormalizePMVName("pmv_" + strings.Repeat("b", 60)); err == nil {
+		t.Fatal("expected >63-byte prefixed PMV identifier to be rejected")
+	}
 
 	validQueries := []string{
 		"SELECT node_id, created_at, updated_at FROM ctd_nodes;",
@@ -57,8 +71,12 @@ func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
 		"SELECT 'drop table telemetric_ledger; update ctd_nodes' AS literal_note FROM ctd_nodes",
 		"SELECT $$delete from telemetric_ledger$$ AS dollar_literal /* nested /* drop */ comment */ FROM ctd_nodes",
 		"SELECT node_id -- trailing comment with delete keyword\nFROM ctd_nodes",
+		"SELECT node_id FROM ctd_nodes -- trailing line comment at EOF",
 		"SELECT E'escaped\\'quote; drop table x' AS esc_lit FROM ctd_nodes",
-		"SELECT U&'d\\0061t\\+000061' AS u_lit, U&\"col\\0020name\" FROM ctd_nodes",
+		"SELECT 'hello '\n'world' AS multiline_concat FROM ctd_nodes",
+		"SELECT $α$safe_payload$α$ AS non_ascii_dollar FROM ctd_nodes",
+		"SELECT U&'d\\0061t\\+000061' AS u_lit FROM ctd_nodes",
+		"SELECT \"node_id\", \"foo\"\"bar\" AS \"CPU; Temp\" FROM \"ctd_nodes\"",
 		"SELECT true, 'not an E string\\' FROM ctd_nodes",
 	}
 	for _, q := range validQueries {
@@ -82,6 +100,39 @@ func TestNormalizePMVNameAndValidateSelectOnlySQL(t *testing.T) {
 		"SELECT pg_advisory_lock_shared(1)",
 		"SELECT pg_try_advisory_lock(1)",
 		"SELECT pg_sleep(30)",
+		"SELECT \"pg_sleep\"(5)",
+		"SELECT \"PG_SLEEP\"(5)",
+		"SELECT \"x\"\"pg_sleep\"(5)",
+		"SELECT pg_catalog.\"pg_read_file\"('/etc/passwd')",
+		"SELECT \"pg_catalog\".\"pg_read_file\"('/etc/passwd')",
+		"SELECT \"for update\" FROM ctd_nodes",
+		"\"SELECT\" * FROM ctd_nodes",
+		"SELECT U&\"pg_sleep\"(5)",
+		"SELECT u&\"pg_sleep\"(5)",
+		"SELECT U&\"\\0070g_sleep\"(5)",
+		"SELECT U&\"!0070g_sleep\" UESCAPE '!' (5)",
+		"SELECT U&\"col\\0020name\" FROM ctd_nodes",
+		"SELECT $1$; DROP TABLE ctd_nodes; --$1$",
+		"SELECT foo$tag$; DROP TABLE ctd_nodes; --$tag$",
+		"SELECT 1 -- comment\r; DROP TABLE ctd_nodes",
+		"SELECT E'a'\n'\\'' || pg_sleep(5)::text --'",
+		"SELECT E'a' -- comment\n'\\'' || pg_sleep(5)::text --'",
+		"SELECT E'a'\n-- line comment\n'\\'' || pg_sleep(5)::text --'",
+		"SELECT $α$';--$α$ || pg_sleep(5)::text --'",
+		"SELECT $aα$';--$aα$ || pg_sleep(5)::text --'",
+		"SELECT 1$$';--$$ || pg_sleep(5)::text --'",
+		"SELECT set_config('statement_timeout', '0', true)",
+		"SELECT \"set_config\"('statement_timeout', '0', true)",
+		"SELECT query_to_xml('SELECT pg_sleep(30)', true, false, '')",
+		"SELECT \"query_to_xml\"('SELECT pg_sleep(30)', true, false, '')",
+		"SELECT query_to_xmlschema('SELECT 1', true, false, '')",
+		"SELECT query_to_xml_and_xmlschema('SELECT 1', true, false, '')",
+		"SELECT database_to_xml(true, false, '')",
+		"SELECT database_to_xmlschema(true, false, '')",
+		"SELECT database_to_xml_and_xmlschema(true, false, '')",
+		"SELECT schema_to_xml('public', true, false, '')",
+		"SELECT table_to_xml('ctd_nodes', true, false, '')",
+		"SELECT cursor_to_xml('c', 1, true, false, '')",
 		"SELECT lo_import('/etc/passwd')",
 		"SELECT lo_export(1, '/tmp/x')",
 		"SELECT dblink('dbname=x', 'SELECT 1')",
@@ -508,10 +559,31 @@ type fakePGXRows struct {
 	pgx.Rows
 	remaining int
 	scanFn    func(dest ...any) error
+	fields    []pgconn.FieldDescription
+	valuesFn  func() ([]any, error)
+	rawFn     func() [][]byte
 	err       error
 }
 
 func (r *fakePGXRows) Close() {}
+
+func (r *fakePGXRows) FieldDescriptions() []pgconn.FieldDescription {
+	return r.fields
+}
+
+func (r *fakePGXRows) Values() ([]any, error) {
+	if r.valuesFn != nil {
+		return r.valuesFn()
+	}
+	return nil, nil
+}
+
+func (r *fakePGXRows) RawValues() [][]byte {
+	if r.rawFn != nil {
+		return r.rawFn()
+	}
+	return nil
+}
 
 func (r *fakePGXRows) Next() bool {
 	if r.remaining <= 0 {
@@ -524,6 +596,15 @@ func (r *fakePGXRows) Next() bool {
 func (r *fakePGXRows) Scan(dest ...any) error {
 	if r.scanFn != nil {
 		return r.scanFn(dest...)
+	}
+	return r.scanRowFallback(dest...)
+}
+
+func (r *fakePGXRows) scanRowFallback(dest ...any) error {
+	if len(dest) == 1 {
+		if rs, ok := dest[0].(pgx.RowScanner); ok {
+			return rs.ScanRow(r)
+		}
 	}
 	return nil
 }
@@ -636,6 +717,195 @@ func TestGetLineageDAGPropagatesArtifactErrors(t *testing.T) {
 		dag, err := (&PostgresStore{}).getLineageDAGWithTx(context.Background(), tx, "art-root", 5)
 		if !errors.Is(err, wantErr) || dag != nil {
 			t.Fatalf("expected (nil, %v), got (%v, %v)", wantErr, dag, err)
+		}
+	})
+}
+
+func TestQueryReadOnlyMapsByteCeiling(t *testing.T) {
+	if DefaultReadOnlyMaxBytes != 2<<20 {
+		t.Fatalf("expected DefaultReadOnlyMaxBytes == 2 MiB, got %d", DefaultReadOnlyMaxBytes)
+	}
+
+	makeRows := func(count int, payload string, useRaw bool) pgx.Rows {
+		var r *fakePGXRows
+		r = &fakePGXRows{
+			remaining: count,
+			fields: []pgconn.FieldDescription{
+				{Name: "payload"},
+			},
+			valuesFn: func() ([]any, error) {
+				return []any{payload}, nil
+			},
+		}
+		if useRaw {
+			r.rawFn = func() [][]byte {
+				return [][]byte{[]byte(payload)}
+			}
+		}
+		return r
+	}
+
+	t.Run("within row and byte bounds succeeds", func(t *testing.T) {
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return makeRows(3, strings.Repeat("a", 20), true), nil
+			},
+		}
+		got, err := (&PostgresStore{}).queryReadOnlyMapsWithTx(context.Background(), tx, 10, 512, "SELECT payload FROM ctd_nodes")
+		if err != nil {
+			t.Fatalf("expected scan within byte limit to succeed, got %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("expected 3 rows, got %d", len(got))
+		}
+		if len(tx.execs) != 1 || !strings.Contains(tx.execs[0].sql, "statement_timeout") {
+			t.Fatalf("expected statement_timeout SET LOCAL, got %+v", tx.execs)
+		}
+	})
+
+	t.Run("cumulative rows exceeding maxBytes fail fast", func(t *testing.T) {
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return makeRows(10, strings.Repeat("b", 40), false), nil
+			},
+		}
+		_, err := (&PostgresStore{}).queryReadOnlyMapsWithTx(context.Background(), tx, 100, 120, "SELECT payload FROM ctd_nodes")
+		if !errors.Is(err, ErrReadOnlyByteLimitExceeded) {
+			t.Fatalf("expected ErrReadOnlyByteLimitExceeded, got %v", err)
+		}
+	})
+
+	t.Run("single oversized raw row fails before RowToMap decode", func(t *testing.T) {
+		valuesCalled := false
+		r := &fakePGXRows{
+			remaining: 1,
+			fields:    []pgconn.FieldDescription{{Name: "payload"}},
+			rawFn: func() [][]byte {
+				return [][]byte{make([]byte, 512)}
+			},
+			valuesFn: func() ([]any, error) {
+				valuesCalled = true
+				return []any{"should-not-decode"}, nil
+			},
+		}
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return r, nil
+			},
+		}
+		_, err := (&PostgresStore{}).queryReadOnlyMapsWithTx(context.Background(), tx, 100, 256, "SELECT payload FROM ctd_nodes")
+		if !errors.Is(err, ErrReadOnlyByteLimitExceeded) {
+			t.Fatalf("expected ErrReadOnlyByteLimitExceeded, got %v", err)
+		}
+		if valuesCalled {
+			t.Fatal("expected RawValues byte check to abort before decoding oversized row")
+		}
+	})
+}
+
+func TestResolveNodesAllFreshnessAndLineageCTEBoundsAndPrune(t *testing.T) {
+	t.Run("ResolveNodes All includes last_seen freshness bound", func(t *testing.T) {
+		if !strings.Contains(resolveNodesAllQuery, "last_seen >= NOW() - INTERVAL '15 minutes'") {
+			t.Fatalf("resolveNodesAllQuery missing last_seen freshness predicate:\n%s", resolveNodesAllQuery)
+		}
+		var capturedSQL string
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+				capturedSQL = sql
+				return &fakePGXRows{
+					remaining: 1,
+					scanFn: func(dest ...any) error {
+						*dest[0].(*string) = "node-fresh-01"
+						return nil
+					},
+				}, nil
+			},
+		}
+		nodes, err := (&PostgresStore{}).resolveNodesWithTx(context.Background(), tx, core.RunnerSelector{All: true})
+		if err != nil {
+			t.Fatalf("resolveNodesWithTx failed: %v", err)
+		}
+		if capturedSQL != resolveNodesAllQuery {
+			t.Fatal("expected ResolveNodes(All: true) to execute resolveNodesAllQuery")
+		}
+		if len(nodes) != 1 || nodes[0] != "node-fresh-01" {
+			t.Fatalf("unexpected resolved nodes: %v", nodes)
+		}
+	})
+
+	t.Run("getLineageDAGWithTx bounds recursion depth, per-hop rows, and cycles", func(t *testing.T) {
+		for _, tok := range []string{
+			"CROSS JOIN LATERAL",
+			"LIMIT $3",
+			"CYCLE id SET is_cycle USING path",
+			"WHERE NOT is_cycle",
+			"LIMIT $4",
+		} {
+			if !strings.Contains(getLineageDAGQuery, tok) {
+				t.Fatalf("getLineageDAGQuery missing %q", tok)
+			}
+		}
+
+		var gotSQL string
+		var gotArgs []any
+		call := 0
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+				call++
+				if call == 1 {
+					gotSQL = sql
+					gotArgs = args
+				}
+				return &fakePGXRows{remaining: 0}, nil
+			},
+		}
+		dag, err := (&PostgresStore{}).getLineageDAGWithTx(context.Background(), tx, "art-root", 9999)
+		if err != nil || dag == nil {
+			t.Fatalf("getLineageDAGWithTx failed: dag=%v err=%v", dag, err)
+		}
+		if gotSQL != getLineageDAGQuery {
+			t.Fatal("expected getLineageDAGWithTx to execute getLineageDAGQuery")
+		}
+		if len(gotArgs) != 4 || gotArgs[0] != "art-root" || gotArgs[1] != maxLineageDepth || gotArgs[2] != defaultLineageHopLimit || gotArgs[3] != defaultLineageTotalRows {
+			t.Fatalf("unexpected lineage CTE args: %#v", gotArgs)
+		}
+	})
+
+	t.Run("PruneLedgerBefore validates cutoff, clamps batchLimit, and returns affected count", func(t *testing.T) {
+		store := &PostgresStore{}
+		if _, err := store.PruneLedgerBefore(context.Background(), time.Time{}, 100); err == nil {
+			t.Fatal("expected zero cutoff error")
+		}
+
+		var gotSQL string
+		var gotArgs []any
+		store.pruneExecFn = func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			gotSQL = sql
+			gotArgs = args
+			return pgconn.NewCommandTag("DELETE 42"), nil
+		}
+
+		loc := time.FixedZone("CST", -6*3600)
+		cutoff := time.Date(2026, 11, 1, 12, 0, 0, 0, loc)
+		deleted, err := store.PruneLedgerBefore(context.Background(), cutoff, 0)
+		if err != nil {
+			t.Fatalf("PruneLedgerBefore failed: %v", err)
+		}
+		if deleted != 42 {
+			t.Fatalf("expected 42 deleted rows, got %d", deleted)
+		}
+		if !strings.Contains(gotSQL, "FOR UPDATE SKIP LOCKED") || !strings.Contains(gotSQL, "DELETE FROM telemetric_ledger") {
+			t.Fatalf("unexpected prune SQL: %s", gotSQL)
+		}
+		if len(gotArgs) != 2 || !gotArgs[0].(time.Time).Equal(cutoff.UTC()) || gotArgs[0].(time.Time).Location() != time.UTC || gotArgs[1] != DefaultLedgerPruneBatchLimit {
+			t.Fatalf("unexpected prune args for default batchLimit: %#v", gotArgs)
+		}
+
+		if _, err := store.PruneLedgerBefore(context.Background(), cutoff, maxLedgerPruneBatchLimit*5); err != nil {
+			t.Fatalf("PruneLedgerBefore clamp failed: %v", err)
+		}
+		if gotArgs[1] != maxLedgerPruneBatchLimit {
+			t.Fatalf("expected batchLimit clamped to %d, got %v", maxLedgerPruneBatchLimit, gotArgs[1])
 		}
 	})
 }

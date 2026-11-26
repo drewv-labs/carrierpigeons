@@ -3,7 +3,9 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -43,14 +45,14 @@ var coopStatusCmd = &cobra.Command{
 
 		brokerURL := resolveBrokerURLForConfig(cfg)
 		clientID := fmt.Sprintf("%s-coop-probe-%d", cfg.Brand.CLIName, os.Getpid())
-		if mClient, err := dialMQTTClientWithConfig(cfg, brokerURL, clientID, 3*time.Second); err != nil {
+		if mClient, err := dialMQTTClientWithConfig(ctx, cfg, brokerURL, clientID, 3*time.Second); err != nil {
 			fmt.Fprintf(out, "[MQTT Broker]  DEGRADED (%v)\n", err)
 		} else {
 			fmt.Fprintf(out, "[MQTT Broker]  ONLINE   (%s)\n", config.RedactURL(brokerURL))
 			mClient.Disconnect(100)
 		}
 
-		store, err := openOperatorStoreForConfig(ctx, cfg)
+		store, err := openReadStoreForConfig(ctx, cfg, strings.ToLower(cfg.Brand.CLIName)+"-coop-status")
 		if err != nil {
 			fmt.Fprintf(out, "[CTD Ledger]   OFFLINE  (%v)\n", err)
 			return err
@@ -58,39 +60,46 @@ var coopStatusCmd = &cobra.Command{
 		defer store.Close()
 
 		fmt.Fprintf(out, "[CTD Ledger]   ONLINE\n")
-
-		if meshID, mErr := store.GetMeshIdentity(ctx); mErr == nil && meshID != nil {
-			fmt.Fprintf(out, "[Mesh (MNS)]   %s (coop=%s, topic_root=%s)\n",
-				meshID.MeshName, meshID.CoopNodeID, meshID.TopicRoot)
-			if cfg.ActiveMesh != "" && meshID.MeshName != "" && meshID.MeshName != cfg.ActiveMesh {
-				fmt.Fprintf(out, "[Mesh Warning] MISMATCH: workstation working mesh is %q, but Coop ledger reports %q!\n",
-					cfg.ActiveMesh, meshID.MeshName)
-			}
-		}
-
-		mathSchema := cfg.Brand.MathSchema
-		if err := db.ValidateSchemaIdentifier(mathSchema); err != nil {
-			return fmt.Errorf("invalid math_schema configuration: %w", err)
-		}
-
-		counts, err := store.QueryMaps(ctx, fmt.Sprintf(`
-			SELECT
-				GREATEST(
-					COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = 'public.telemetric_ledger'::regclass), 0),
-					(SELECT COUNT(*) FROM (SELECT 1 FROM telemetric_ledger LIMIT 100000) _bounded_ledger)
-				) AS events,
-				(SELECT COUNT(*) FROM ctd_nodes) AS registered_nodes,
-				(SELECT COUNT(*) FROM ctd_artifacts) AS artifacts,
-				(SELECT COUNT(*) FROM (SELECT 1 FROM ctd_traces LIMIT 100000) _bounded_traces) AS traces,
-				(SELECT COUNT(*) FROM %s.pmv_catalog WHERE status = 'certified') AS certified_pmvs
-		`, mathSchema))
-		if err == nil && len(counts) > 0 {
-			c := counts[0]
-			fmt.Fprintf(out, "  Nodes: %v | Events: %v | Artifacts: %v | Traces: %v | Certified PMVs: %v\n",
-				c["registered_nodes"], c["events"], c["artifacts"], c["traces"], c["certified_pmvs"])
-		}
-		return nil
+		return queryAndPrintCoopStatus(ctx, out, cfg, store)
 	},
+}
+
+func queryAndPrintCoopStatus(ctx context.Context, out io.Writer, cfg config.WorkstationConfig, store db.ReadOnlyDB) error {
+	if meshID, mErr := store.GetMeshIdentity(ctx); mErr != nil {
+		fmt.Fprintf(out, "[Mesh Warning] Failed querying MNS identity: %v\n", mErr)
+	} else if meshID != nil {
+		fmt.Fprintf(out, "[Mesh (MNS)]   %s (coop=%s, topic_root=%s)\n",
+			meshID.MeshName, meshID.CoopNodeID, meshID.TopicRoot)
+		if cfg.ActiveMesh != "" && meshID.MeshName != "" && meshID.MeshName != cfg.ActiveMesh {
+			fmt.Fprintf(out, "[Mesh Warning] MISMATCH: workstation working mesh is %q, but Coop ledger reports %q!\n",
+				cfg.ActiveMesh, meshID.MeshName)
+		}
+	}
+
+	mathSchema := cfg.Brand.MathSchema
+	if err := db.ValidateSchemaIdentifier(mathSchema); err != nil {
+		return fmt.Errorf("invalid math_schema configuration: %w", err)
+	}
+
+	counts, err := store.QueryReadOnlyMaps(ctx, fmt.Sprintf(`
+		SELECT
+			GREATEST(
+				COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = 'public.telemetric_ledger'::regclass), 0),
+				(SELECT COUNT(*) FROM (SELECT 1 FROM telemetric_ledger LIMIT 100000) _bounded_ledger)
+			) AS events,
+			(SELECT COUNT(*) FROM ctd_nodes) AS registered_nodes,
+			(SELECT COUNT(*) FROM ctd_artifacts) AS artifacts,
+			(SELECT COUNT(*) FROM (SELECT 1 FROM ctd_traces LIMIT 100000) _bounded_traces) AS traces,
+			(SELECT COUNT(*) FROM %s.pmv_catalog WHERE status = 'certified') AS certified_pmvs
+	`, mathSchema))
+	if err != nil {
+		fmt.Fprintf(out, "[Ledger Warning] Failed querying summary counts: %v\n", err)
+	} else if len(counts) > 0 {
+		c := counts[0]
+		fmt.Fprintf(out, "  Nodes: %v | Events: %v | Artifacts: %v | Traces: %v | Certified PMVs: %v\n",
+			c["registered_nodes"], c["events"], c["artifacts"], c["traces"], c["certified_pmvs"])
+	}
+	return nil
 }
 
 var coopMigrateCmd = &cobra.Command{
@@ -173,7 +182,7 @@ var coopActivityCmd = &cobra.Command{
 		out := cmd.OutOrStdout()
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		store, err := openOperatorStoreForConfig(ctx, cfg)
+		store, err := openReadStoreForConfig(ctx, cfg, strings.ToLower(cfg.Brand.CLIName)+"-coop-activity")
 		if err != nil {
 			return err
 		}

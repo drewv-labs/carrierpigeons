@@ -52,22 +52,67 @@ func (h *perNodeAuthHook) ID() string {
 }
 
 func (h *perNodeAuthHook) Provides(b byte) bool {
-	return bytes.Contains([]byte{mochi.OnConnectAuthenticate, mochi.OnACLCheck}, []byte{b})
+	return bytes.Contains([]byte{mochi.OnConnectAuthenticate, mochi.OnACLCheck, mochi.OnPublish}, []byte{b})
+}
+
+func isCTDTopic(topic, topicRoot string) bool {
+	if topicRoot == "" {
+		return false
+	}
+	prefix := topicRoot + "/ctd"
+	return topic == prefix || strings.HasPrefix(topic, prefix+"/")
+}
+
+func rejectRetainedCTD(pk packets.Packet, topicRoot string) (packets.Packet, error) {
+	if pk.FixedHeader.Retain && isCTDTopic(pk.TopicName, topicRoot) {
+		return pk, packets.ErrRejectPacket
+	}
+	return pk, nil
+}
+
+func (h *perNodeAuthHook) OnPublish(_ *mochi.Client, pk packets.Packet) (packets.Packet, error) {
+	return rejectRetainedCTD(pk, h.topicRoot)
+}
+
+type ctdRetainGuardHook struct {
+	mochi.HookBase
+	topicRoot string
+}
+
+func (h *ctdRetainGuardHook) ID() string {
+	return "ctd-retain-guard"
+}
+
+func (h *ctdRetainGuardHook) Provides(b byte) bool {
+	return b == mochi.OnPublish
+}
+
+func (h *ctdRetainGuardHook) OnPublish(_ *mochi.Client, pk packets.Packet) (packets.Packet, error) {
+	return rejectRetainedCTD(pk, h.topicRoot)
 }
 
 func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-func extractEdgeNodeID(clientID, edgePrefix string) string {
-	id := strings.TrimSpace(clientID)
-	if edgePrefix != "" && strings.HasPrefix(id, edgePrefix) {
-		trimmed := strings.TrimPrefix(id, edgePrefix)
-		if trimmed != "" {
-			return trimmed
-		}
+func extractEdgeNodeID(clientID, edgePrefix string) (string, bool) {
+	if clientID == "" || strings.TrimSpace(clientID) != clientID {
+		return "", false
 	}
-	return id
+	nodeID := clientID
+	if edgePrefix != "" {
+		if !strings.HasPrefix(clientID, edgePrefix) {
+			return "", false
+		}
+		nodeID = strings.TrimPrefix(clientID, edgePrefix)
+	}
+	if nodeID == "" {
+		return "", false
+	}
+	if err := core.ValidateTopicToken(nodeID); err != nil {
+		return "", false
+	}
+	return nodeID, true
 }
 
 func certMatchesNodeID(cert *x509.Certificate, nodeID string) bool {
@@ -125,15 +170,20 @@ func (h *perNodeAuthHook) OnConnectAuthenticate(cl *mochi.Client, pk packets.Pac
 		return false
 	}
 
-	nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
-	if err := core.ValidateTopicToken(nodeID); err != nil {
+	nodeID, ok := extractEdgeNodeID(cl.ID, h.edgePrefix)
+	if !ok {
 		return false
 	}
 	if verifiedCert != nil && !certMatchesNodeID(verifiedCert, nodeID) {
 		return false
 	}
-	if pk.Connect.WillFlag && !h.allowEdgeWrite(nodeID, pk.Connect.WillTopic) {
-		return false
+	if pk.Connect.WillFlag {
+		if pk.Connect.WillRetain && isCTDTopic(pk.Connect.WillTopic, h.topicRoot) {
+			return false
+		}
+		if !h.allowEdgeWrite(nodeID, pk.Connect.WillTopic) {
+			return false
+		}
 	}
 	return true
 }
@@ -169,13 +219,14 @@ func (h *perNodeAuthHook) OnACLCheck(cl *mochi.Client, topic string, write bool)
 	certOnlyEdge := false
 	if h.edgeUser == "" && h.edgePass == "" && h.requireClientCert {
 		if cert := verifiedClientCert(cl); cert != nil {
-			nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
-			certOnlyEdge = certMatchesNodeID(cert, nodeID)
+			if nodeID, ok := extractEdgeNodeID(cl.ID, h.edgePrefix); ok {
+				certOnlyEdge = certMatchesNodeID(cert, nodeID)
+			}
 		}
 	}
 	if edgeCredMatch || certOnlyEdge {
-		nodeID := extractEdgeNodeID(cl.ID, h.edgePrefix)
-		if err := core.ValidateTopicToken(nodeID); err != nil {
+		nodeID, ok := extractEdgeNodeID(cl.ID, h.edgePrefix)
+		if !ok {
 			return false
 		}
 		if !write {
@@ -257,8 +308,10 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 
 	caps := mochi.NewDefaultServerCapabilities()
 	caps.MaximumPacketSize = 1 << 20 // 1 MiB ceiling prevents OOM packet floods
-	caps.MaximumClients = 4096
-	caps.MaximumClientWritesPending = 8192
+	caps.MaximumSessionExpiryInterval = 600
+	caps.MaximumInflight = 1024
+	caps.MaximumClientWritesPending = 2048
+	caps.MaximumClients = 512
 
 	warnLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
@@ -299,7 +352,9 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 		}
 		err = srv.AddHook(hook, nil)
 	} else {
-		err = srv.AddHook(new(auth.AllowHook), nil)
+		if err = srv.AddHook(new(auth.AllowHook), nil); err == nil {
+			err = srv.AddHook(&ctdRetainGuardHook{topicRoot: topicRoot}, nil)
+		}
 	}
 	if err != nil {
 		_ = ln.Close()
@@ -330,17 +385,27 @@ func (b *EmbeddedBroker) BoundAddr() string {
 	return b.boundAddr
 }
 
-// LocalClientURL returns a dialable `tcp://127.0.0.1:<port>` (or `tls://`) URL for local Coop & self-observer clients.
+// LocalClientURL returns a dialable `tcp://` (or `tls://`) URL for local Coop & self-observer clients.
+// Empty or unspecified bound hosts are rewritten to `127.0.0.1` (or `::1` for `[::]`); specific bound hosts are preserved.
 func (b *EmbeddedBroker) LocalClientURL() string {
 	scheme := "tcp://"
 	if b.tlsActive {
 		scheme = "tls://"
 	}
-	_, port, err := net.SplitHostPort(b.boundAddr)
+	host, port, err := net.SplitHostPort(b.boundAddr)
 	if err != nil || port == "" {
 		return scheme + "127.0.0.1:1883"
 	}
-	return scheme + "127.0.0.1:" + port
+	if host == "" {
+		host = "127.0.0.1"
+	} else if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		if ip.To4() == nil {
+			host = "::1"
+		} else {
+			host = "127.0.0.1"
+		}
+	}
+	return scheme + net.JoinHostPort(host, port)
 }
 
 // Close gracefully terminates the embedded MQTT broker and closes all active client sockets.

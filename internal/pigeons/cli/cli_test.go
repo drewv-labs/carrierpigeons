@@ -4,18 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/broker"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncoop/ingest"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
@@ -841,4 +846,652 @@ database_url = %q
 			t.Fatalf("expected %s against closed Postgres to return error", name)
 		}
 	}
+}
+
+type stubAgentSafeDB struct {
+	mu           sync.Mutex
+	closed       atomic.Bool
+	meshID       *core.MeshIdentity
+	meshErr      error
+	clusterNodes []db.NodeSummary
+	clusterErr   error
+	queryFn      func(ctx context.Context, sql string, args ...any) ([]map[string]any, error)
+}
+
+func (s *stubAgentSafeDB) GetMeshIdentity(_ context.Context) (*core.MeshIdentity, error) {
+	return s.meshID, s.meshErr
+}
+
+func (s *stubAgentSafeDB) GetClusterStatus(_ context.Context, _ time.Duration) ([]db.NodeSummary, error) {
+	return s.clusterNodes, s.clusterErr
+}
+
+func (s *stubAgentSafeDB) ResolveNodes(_ context.Context, _ core.RunnerSelector) ([]string, error) {
+	return nil, nil
+}
+
+func (s *stubAgentSafeDB) GetLineageDAG(_ context.Context, _ string, _ int) (*db.DAG, error) {
+	return nil, nil
+}
+
+func (s *stubAgentSafeDB) GetLedgerActivity(_ context.Context, _ int) ([]db.LedgerActivity, error) {
+	return nil, nil
+}
+
+func (s *stubAgentSafeDB) QueryReadOnlyMaps(ctx context.Context, sql string, args ...any) ([]map[string]any, error) {
+	if s.queryFn != nil {
+		return s.queryFn(ctx, sql, args...)
+	}
+	return nil, nil
+}
+
+func (s *stubAgentSafeDB) ExplainReadOnly(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+
+func (s *stubAgentSafeDB) EnsureMathSchema(_ context.Context) error { return nil }
+func (s *stubAgentSafeDB) SavePMVDraft(_ context.Context, rec db.PMVRecord) (*db.PMVRecord, error) {
+	return &rec, nil
+}
+func (s *stubAgentSafeDB) UpdatePMVState(_ context.Context, _ db.PMVRecord) error { return nil }
+func (s *stubAgentSafeDB) GetPMV(_ context.Context, _ string) (*db.PMVRecord, error) {
+	return nil, nil
+}
+func (s *stubAgentSafeDB) ListPMVs(_ context.Context) ([]db.PMVRecord, error)       { return nil, nil }
+func (s *stubAgentSafeDB) MaterializePMV(_ context.Context, _, _ string) error    { return nil }
+func (s *stubAgentSafeDB) DropPMV(_ context.Context, _ string) error              { return nil }
+func (s *stubAgentSafeDB) Close()                                                 { s.closed.Store(true) }
+
+func startSilentAcceptListener(t *testing.T) (string, *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	var accepts atomic.Int64
+	done := make(chan struct{})
+	var connsMu sync.Mutex
+	var heldConns []net.Conn
+
+	go func() {
+		for {
+			c, aErr := ln.Accept()
+			if aErr != nil {
+				return
+			}
+			accepts.Add(1)
+			connsMu.Lock()
+			heldConns = append(heldConns, c)
+			connsMu.Unlock()
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}()
+
+	t.Cleanup(func() {
+		close(done)
+		_ = ln.Close()
+		connsMu.Lock()
+		for _, c := range heldConns {
+			_ = c.Close()
+		}
+		connsMu.Unlock()
+	})
+	return ln.Addr().String(), &accepts
+}
+
+func startAcceptAndCloseListener(t *testing.T) (string, *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	var hits atomic.Int64
+	go func() {
+		for {
+			c, aErr := ln.Accept()
+			if aErr != nil {
+				return
+			}
+			hits.Add(1)
+			_ = c.Close()
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.Addr().String(), &hits
+}
+
+func TestDialMQTTClientWithConfigTimeoutCleanupAndTLSValidation(t *testing.T) {
+	// 1. Live connect disables AutoReconnect.
+	brokerURL := startTestMeshBroker(t, "dial-test-mesh", "rv64-coop-dial")
+	cfg := config.DefaultWorkstationConfig()
+	client, err := dialMQTTClientWithConfig(context.Background(), cfg, brokerURL, "test-auto-reconn-off", 3*time.Second)
+	if err != nil {
+		t.Fatalf("dialMQTTClientWithConfig failed: %v", err)
+	}
+	reader := client.OptionsReader()
+	if reader.AutoReconnect() {
+		client.Disconnect(0)
+		t.Fatal("expected SetAutoReconnect(false) on CLI MQTT client")
+	}
+	client.Disconnect(50)
+
+	// 2. TLS configured against non-TLS schemes (tcp://, ws://) must fail fast without dialing.
+	silentAddr, silentAccepts := startSilentAcceptListener(t)
+	tlsCfg := config.DefaultWorkstationConfig()
+	tlsCfg.TLSInsecureSkipVerify = true
+	for _, badSchemeURL := range []string{
+		"tcp://mqttuser:secret@" + silentAddr,
+		"ws://mqttuser:secret@" + silentAddr + "/mqtt",
+	} {
+		_, err := dialMQTTClientWithConfig(context.Background(), tlsCfg, badSchemeURL, "test-tls-scheme", 500*time.Millisecond)
+		if err == nil || !strings.Contains(err.Error(), "TLS") {
+			t.Fatalf("expected TLS-on-non-TLS fail-fast error for %q, got %v", badSchemeURL, err)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("TLS scheme error leaked password: %v", err)
+		}
+	}
+	if silentAccepts.Load() != 0 {
+		t.Fatalf("expected zero TCP dials on TLS-scheme validation failure, got %d", silentAccepts.Load())
+	}
+
+	// 3. Dial timeout against silent listener must fail and disconnect cleanly.
+	_, err = dialMQTTClientWithConfig(context.Background(), cfg, "tcp://"+silentAddr, "test-timeout-clean", 80*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("expected dial timeout error, got %v", err)
+	}
+
+	// 4. Context cancellation aborts dial and publishRunnerRequestWithConfig cleanly.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err = dialMQTTClientWithConfig(cancelCtx, cfg, "tcp://"+silentAddr, "test-cancel-clean", 3*time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled on dial cancel, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("dial cancel took too long (%s)", elapsed)
+	}
+
+	canceledCtx, stop := context.WithCancel(context.Background())
+	stop()
+	req := core.RunnerRequestCTD{
+		RequestID:   "req-canceled",
+		Action:      "start",
+		Runner:      "PauseRnr",
+		Selectors:   core.RunnerSelector{All: true},
+		RequestedBy: "operator",
+		RequestedAt: time.Now().UTC(),
+	}
+	if err := publishRunnerRequestWithConfig(canceledCtx, cfg, brokerURL, req); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected publishRunnerRequestWithConfig with canceled ctx to fail with context.Canceled, got %v", err)
+	}
+}
+
+func TestBrandCloningStateBrandAndEnvMeshSource(t *testing.T) {
+	dir := t.TempDir()
+	customMeshFile := filepath.Join(dir, "custom_current_mesh")
+	t.Setenv("CUSTOM_CURRENT_MESH_FILE", customMeshFile)
+	t.Setenv("CUSTOM_MESH", "env-mesh")
+
+	wsPath := filepath.Join(dir, "custom.toml")
+	tomlContent := `operator = "custom-op"
+
+[brand]
+product_name = "CustomProd"
+coop_name = "CustomCoop"
+cli_name = "customcli"
+agent_name = "CustomCare"
+topic_root = "customroot"
+env_prefix = "CUSTOM"
+math_schema = "custommath"
+
+[meshes.env-mesh]
+broker_url = "tcp://127.0.0.1:1883"
+
+[meshes.mesh-a]
+broker_url = "tcp://127.0.0.1:1884"
+[meshes.mesh-a.brand]
+topic_root = "only-a-root"
+
+[meshes.mesh-b]
+broker_url = "tcp://127.0.0.1:1885"
+`
+	if err := os.WriteFile(wsPath, []byte(tomlContent), 0o600); err != nil {
+		t.Fatalf("write custom.toml: %v", err)
+	}
+
+	// Verify PersistentPreRunE updates state.brand = loaded.Brand and preserves ActiveMeshSource="env"
+	// (no duplicate <BRAND>_MESH pre-read turning "env" into "flag").
+	root := NewRootCommand(brand.Default())
+	var preRunState *cliState
+	probeCmd := &cobra.Command{
+		Use: "inspect-state",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			preRunState = cliStateFromCommand(cmd)
+			return nil
+		},
+	}
+	root.AddCommand(probeCmd)
+
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"--config", wsPath, "inspect-state"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("inspect-state failed: %v\n%s", err, out.String())
+	}
+	if preRunState == nil {
+		t.Fatal("expected cliState from command context")
+	}
+	if preRunState.brand.ProductName != "CustomProd" ||
+		preRunState.brand.CoopName != "CustomCoop" ||
+		preRunState.brand.TopicRoot != "customroot" ||
+		preRunState.brand.EnvPrefix != "CUSTOM" ||
+		preRunState.brand.MathSchema != "custommath" {
+		t.Fatalf("expected cloneCommandTree PersistentPreRunE to set state.brand = loaded.Brand, got %+v", preRunState.brand)
+	}
+	if preRunState.wsCfg.ActiveMesh != "env-mesh" || preRunState.wsCfg.ActiveMeshSource != "env" {
+		t.Fatalf("expected ActiveMesh=env-mesh source=env, got mesh=%q source=%q",
+			preRunState.wsCfg.ActiveMesh, preRunState.wsCfg.ActiveMeshSource)
+	}
+
+	// Verify per-mesh brand override on mesh-a does not leak into mesh-b during `connect`.
+	t.Setenv("CUSTOM_MESH", "")
+	if _, err := executeCLIForTest("--config", wsPath, "connect", "mesh-a", "--no-verify"); err != nil {
+		t.Fatalf("connect mesh-a: %v", err)
+	}
+	if _, err := executeCLIForTest("--config", wsPath, "connect", "mesh-b", "--no-verify"); err != nil {
+		t.Fatalf("connect mesh-b: %v", err)
+	}
+	loadedB, err := config.LoadWorkstationConfigForMeshAndBrand(wsPath, "mesh-b", brand.Default())
+	if err != nil {
+		t.Fatalf("LoadWorkstationConfigForMeshAndBrand(mesh-b): %v", err)
+	}
+	if loadedB.Brand.TopicRoot != "customroot" {
+		t.Fatalf("expected mesh-b TopicRoot='customroot' without mesh-a leak, got %q", loadedB.Brand.TopicRoot)
+	}
+}
+
+func TestConnectCLIFlagPrecedenceMNSConflictsAndTimestamps(t *testing.T) {
+	// 1. CLI patch flags override environment variables during live MNS probing.
+	envBroker := startTestMeshBroker(t, "wrong-env-mesh", "rv64-coop-env")
+	flagBroker := startTestMeshBroker(t, "flag-mesh", "rv64-coop-flag")
+	deadDBURL := fmt.Sprintf("postgres://operator:secret@%s/edge_ledger", closedLocalTCPAddr(t))
+
+	dir := t.TempDir()
+	t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(dir, "current_mesh"))
+	t.Setenv("PIGEONS_BROKER_URL", envBroker)
+	t.Setenv("PIGEONS_DB_URL", deadDBURL)
+	t.Setenv("PIGEONS_RO_DB_URL", deadDBURL)
+
+	wsPath := filepath.Join(dir, "pigeons.toml")
+	if err := os.WriteFile(wsPath, []byte("operator = \"operator\"\n"), 0o600); err != nil {
+		t.Fatalf("write pigeons.toml: %v", err)
+	}
+
+	// Because PIGEONS_DB_URL / PIGEONS_RO_DB_URL are set in env while --broker is passed without --db,
+	// pass --allow-partial-verify so the dead env DB doesn't fail partial verification, while verifying
+	// that `--broker` beats `PIGEONS_BROKER_URL` (which points to wrong-env-mesh and would fail mismatch!).
+	out, err := executeCLIForTest(
+		"--config", wsPath,
+		"connect", "flag-mesh",
+		"--broker", flagBroker,
+		"--allow-partial-verify",
+	)
+	if err != nil {
+		t.Fatalf("expected --broker to override PIGEONS_BROKER_URL during MNS probe, got err=%v\n%s", err, out)
+	}
+	if !strings.Contains(out, "rv64-coop-flag") || !strings.Contains(out, flagBroker) {
+		t.Fatalf("expected output from flagBroker, got:\n%s", out)
+	}
+
+	// Verify patch fields override env fields in applyMeshProfilePatchToWorkstationConfig.
+	flagDB := "postgres://admin:pw@192.0.2.55:5432/edge_ledger"
+	flagRODB := "postgres://ro:pw@192.0.2.56:5432/edge_ledger"
+	flagUser := "flag-user"
+	flagPass := "flag-pass"
+	flagTopicRoot := "flagroot"
+	flagInsecure := true
+	envCfg := config.DefaultWorkstationConfig()
+	envCfg.BrokerURL = "tcp://192.0.2.1:1883"
+	envCfg.DatabaseURL = "postgres://env:pw@192.0.2.1:5432/edge_ledger"
+	envCfg.ReadOnlyDatabaseURL = "postgres://envro:pw@192.0.2.1:5432/edge_ledger"
+	envCfg.MQTTUsername = "env-user"
+	envCfg.MQTTPassword = "env-pass"
+	envCfg.Brand.TopicRoot = "envroot"
+
+	patchedCfg, err := applyMeshProfilePatchToWorkstationConfig(envCfg, brand.Default(), config.MeshProfilePatch{
+		DatabaseURL:           &flagDB,
+		MQTTUsername:          &flagUser,
+		MQTTPassword:          &flagPass,
+		TopicRoot:             &flagTopicRoot,
+		TLSInsecureSkipVerify: &flagInsecure,
+	})
+	if err != nil {
+		t.Fatalf("applyMeshProfilePatchToWorkstationConfig failed: %v", err)
+	}
+	if patchedCfg.DatabaseURL != flagDB || patchedCfg.ReadOnlyDatabaseURL != "" {
+		t.Fatalf("expected --db patch to set DatabaseURL and clear stale env RO URL, got db=%q ro=%q",
+			patchedCfg.DatabaseURL, patchedCfg.ReadOnlyDatabaseURL)
+	}
+	if patchedCfg.MQTTUsername != flagUser || patchedCfg.MQTTPassword != flagPass ||
+		patchedCfg.Brand.TopicRoot != flagTopicRoot || !patchedCfg.TLSInsecureSkipVerify {
+		t.Fatalf("expected CLI patch fields to override env values, got %+v", patchedCfg)
+	}
+	patchedWithRO, err := applyMeshProfilePatchToWorkstationConfig(envCfg, brand.Default(), config.MeshProfilePatch{
+		DatabaseURL:         &flagDB,
+		ReadOnlyDatabaseURL: &flagRODB,
+	})
+	if err != nil || patchedWithRO.ReadOnlyDatabaseURL != flagRODB {
+		t.Fatalf("expected explicit --ro-db to be preserved, got %q (err=%v)", patchedWithRO.ReadOnlyDatabaseURL, err)
+	}
+
+	// 2. Cross-source conflict detection (CoopNodeID / TopicRoot) across MQTT & Postgres.
+	cfgBoth := config.DefaultWorkstationConfig()
+	cfgBoth.BrokerURL = "tcp://127.0.0.1:1883"
+	cfgBoth.DatabaseURL = "postgres://op:pw@127.0.0.1:5432/edge_ledger"
+	now := time.Now().UTC()
+
+	summary, err := verifyRemoteMeshIdentityWithProbers(
+		context.Background(), cfgBoth, "prod-mesh", true, false,
+		func(context.Context, config.WorkstationConfig) (*core.MeshIdentity, error) {
+			return &core.MeshIdentity{MeshName: "prod-mesh", CoopNodeID: "coop-1", TopicRoot: "root-a", UpdatedAt: now}, nil
+		},
+		func(context.Context, config.WorkstationConfig) (*core.MeshIdentity, error) {
+			return &core.MeshIdentity{MeshName: "prod-mesh", CoopNodeID: "coop-1", TopicRoot: "root-a", UpdatedAt: now}, nil
+		},
+	)
+	if err != nil || !strings.Contains(summary, "verified via mqtt+postgres") {
+		t.Fatalf("expected matching MQTT+Postgres MNS to verify cleanly, got summary=%q err=%v", summary, err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		pgID    *core.MeshIdentity
+		pgErr   error
+		wantErr string
+	}{
+		{
+			name:    "conflicting_coop_node_id",
+			pgID:    &core.MeshIdentity{MeshName: "prod-mesh", CoopNodeID: "coop-2", TopicRoot: "root-a", UpdatedAt: now},
+			wantErr: "conflicting coop_node_id",
+		},
+		{
+			name:    "conflicting_topic_root",
+			pgID:    &core.MeshIdentity{MeshName: "prod-mesh", CoopNodeID: "coop-1", TopicRoot: "root-b", UpdatedAt: now},
+			wantErr: "conflicting topic_root",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := verifyRemoteMeshIdentityWithProbers(
+				context.Background(), cfgBoth, "prod-mesh", true, true,
+				func(context.Context, config.WorkstationConfig) (*core.MeshIdentity, error) {
+					return &core.MeshIdentity{MeshName: "prod-mesh", CoopNodeID: "coop-1", TopicRoot: "root-a", UpdatedAt: now}, nil
+				},
+				func(context.Context, config.WorkstationConfig) (*core.MeshIdentity, error) {
+					return tc.pgID, tc.pgErr
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q even with allowPartial=true, got %v", tc.wantErr, err)
+			}
+		})
+	}
+
+	// 3. Future UpdatedAt clock skew (>5m ahead) & stale Postgres ctd_mesh timestamp rejection.
+	futureSkewed := &core.MeshIdentity{
+		MeshName:   "prod-mesh",
+		CoopNodeID: "coop-1",
+		TopicRoot:  "pigeons",
+		UpdatedAt:  now.Add(defaultMNSMaxFutureSkew + time.Minute),
+	}
+	if err := validateMeshIdentity("postgres ctd_mesh", futureSkewed, now); err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("expected future Postgres ctd_mesh >5m ahead to fail, got %v", err)
+	}
+	stalePG := &core.MeshIdentity{
+		MeshName:   "prod-mesh",
+		CoopNodeID: "coop-1",
+		TopicRoot:  "pigeons",
+		UpdatedAt:  now.Add(-(defaultMNSRetainedMaxAge + time.Hour)),
+	}
+	if err := validateMeshIdentity("postgres ctd_mesh", stalePG, now); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale Postgres ctd_mesh to fail, got %v", err)
+	}
+	withinSkew := &core.MeshIdentity{
+		MeshName:   "prod-mesh",
+		CoopNodeID: "coop-1",
+		TopicRoot:  "pigeons",
+		UpdatedAt:  now.Add(2 * time.Minute),
+	}
+	if err := validateMeshIdentity("postgres ctd_mesh", withinSkew, now); err != nil {
+		t.Fatalf("expected +2m clock skew within 5m tolerance to pass, got %v", err)
+	}
+
+	// Live MQTT retained payload with future >5m UpdatedAt must also be rejected.
+	emb, err := broker.StartEmbedded(broker.EmbeddedOptions{ListenAddr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("StartEmbedded failed: %v", err)
+	}
+	t.Cleanup(emb.Close)
+	t.Setenv("PIGEONS_BROKER_URL", "")
+	t.Setenv("PIGEONS_DB_URL", "")
+	t.Setenv("PIGEONS_RO_DB_URL", "")
+	futureTOML := fmt.Sprintf("operator = \"operator\"\n[meshes.future-mesh]\nbroker_url = %q\n", emb.LocalClientURL())
+	futurePath := filepath.Join(dir, "future.toml")
+	if err := os.WriteFile(futurePath, []byte(futureTOML), 0o600); err != nil {
+		t.Fatalf("write future.toml: %v", err)
+	}
+	futureBytes, _ := json.Marshal(core.MeshIdentity{
+		MeshName:   "future-mesh",
+		CoopNodeID: "rv64-coop-future",
+		UpdatedAt:  time.Now().UTC().Add(10 * time.Minute),
+	})
+	publishRetainedMeshPayload(t, emb.LocalClientURL(), core.MeshTopic(), futureBytes)
+	if _, err := executeCLIForTest("--config", futurePath, "connect", "future-mesh"); err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("expected future retained MNS payload to be rejected, got: %v", err)
+	}
+
+	// 4. probeMQTTMeshIdentity honors parent ctx deadline and cancellation.
+	silentAddr, _ := startSilentAcceptListener(t)
+	probeCfg := config.DefaultWorkstationConfig()
+	probeCfg.BrokerURL = "tcp://" + silentAddr
+	pCtx, pCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer pCancel()
+	if _, err := probeMQTTMeshIdentity(pCtx, probeCfg); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected probeMQTTMeshIdentity to honor parent ctx deadline, got %v", err)
+	}
+	cCtx, cCancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cCancel()
+	}()
+	if _, err := probeMQTTMeshIdentity(cCtx, probeCfg); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected probeMQTTMeshIdentity to honor parent ctx cancel, got %v", err)
+	}
+}
+
+func TestReadOnlyStoreUsageAndCLICommandsPolish(t *testing.T) {
+	// 1. Verify read-only commands dial ReadOnlyDatabaseURL when configured, and fall back to DatabaseURL when empty.
+	opAddr, opHits := startAcceptAndCloseListener(t)
+	roAddr, roHits := startAcceptAndCloseListener(t)
+
+	dir := t.TempDir()
+	t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(dir, "current_mesh"))
+	wsPath := filepath.Join(dir, "ro-test.toml")
+	tomlContent := fmt.Sprintf(`operator = "operator"
+mesh_name = "ro-mesh"
+broker_url = "tcp://%s"
+database_url = "postgres://operator:pw@%s/edge_ledger"
+readonly_database_url = "postgres://pigeoncare_ro:pw@%s/edge_ledger"
+`, closedLocalTCPAddr(t), opAddr, roAddr)
+	if err := os.WriteFile(wsPath, []byte(tomlContent), 0o600); err != nil {
+		t.Fatalf("write ro-test.toml: %v", err)
+	}
+
+	for _, args := range [][]string{
+		{"--config", wsPath, "list"},
+		{"--config", wsPath, "node", "rv64-node-01"},
+		{"--config", wsPath, "ps"},
+		{"--config", wsPath, "coop", "status"},
+		{"--config", wsPath, "coop", "activity"},
+	} {
+		_, err := executeCLIForTest(args...)
+		if err == nil {
+			t.Fatalf("expected %v against accept-and-close listener to error", args)
+		}
+	}
+	if roHits.Load() < 5 {
+		t.Fatalf("expected read-only CLI commands to dial readonly_database_url (%s), got roHits=%d opHits=%d",
+			roAddr, roHits.Load(), opHits.Load())
+	}
+	if opHits.Load() != 0 {
+		t.Fatalf("expected read-only CLI commands NOT to dial operator database_url when readonly_database_url is set, got opHits=%d", opHits.Load())
+	}
+
+	opHits.Store(0)
+	fallbackCfg := config.DefaultWorkstationConfig()
+	fallbackCfg.DatabaseURL = "postgres://operator:pw@" + opAddr + "/edge_ledger"
+	fallbackCfg.ReadOnlyDatabaseURL = ""
+	if _, err := openReadStoreForConfig(context.Background(), fallbackCfg, "list"); err == nil {
+		t.Fatal("expected dial error on accept-and-close op listener")
+	}
+	if opHits.Load() == 0 {
+		t.Fatal("expected openReadStoreForConfig to fall back to DatabaseURL when ReadOnlyDatabaseURL is empty")
+	}
+
+	// 2. ps EOF handling & closing store before launching TUI.
+	if got := readSupportPromptResponse(strings.NewReader("")); got != "n" {
+		t.Fatalf("expected EOF on support prompt to return 'n', got %q", got)
+	}
+	if got := readSupportPromptResponse(strings.NewReader("\n")); got != "" {
+		t.Fatalf("expected empty newline on support prompt to return '', got %q", got)
+	}
+	if got := readSupportPromptResponse(strings.NewReader("y")); got != "y" {
+		t.Fatalf("expected 'y' without newline to return 'y', got %q", got)
+	}
+
+	degradedNodes := []db.NodeSummary{{
+		NodeID:    "rv64-node-01",
+		Arch:      "riscv64",
+		Tags:      []string{"compute"},
+		Component: "host-os",
+		LastSeen:  time.Now().UTC(),
+		Status:    "error",
+		IsHealthy: false,
+	}}
+	eofStore := &stubAgentSafeDB{clusterNodes: degradedNodes}
+	var eofOut bytes.Buffer
+	launched := false
+	err := runPSWithStore(
+		context.Background(), context.Background(), config.DefaultWorkstationConfig(),
+		strings.NewReader(""), &eofOut, false, true, eofStore,
+		func(context.Context, config.WorkstationConfig, tui.TabID, string, string, string) error {
+			launched = true
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runPSWithStore(EOF) failed: %v", err)
+	}
+	if launched {
+		t.Fatal("expected EOF on ps --add-support NOT to launch TUI")
+	}
+	if !eofStore.closed.Load() {
+		t.Fatal("expected ps to close store")
+	}
+
+	yesStore := &stubAgentSafeDB{clusterNodes: degradedNodes}
+	var yesOut bytes.Buffer
+	var closedBeforeLaunch bool
+	err = runPSWithStore(
+		context.Background(), context.Background(), config.DefaultWorkstationConfig(),
+		strings.NewReader("y\n"), &yesOut, false, true, yesStore,
+		func(context.Context, config.WorkstationConfig, tui.TabID, string, string, string) error {
+			closedBeforeLaunch = yesStore.closed.Load()
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runPSWithStore(y) failed: %v", err)
+	}
+	if !closedBeforeLaunch {
+		t.Fatal("expected ps to close store strictly BEFORE launching TUI")
+	}
+
+	// 3. tag empty node list and ValidateTopicToken enforcement.
+	for _, badArgs := range [][]string{
+		{"--config", wsPath, "tag", "compute-bench", ""},
+		{"--config", wsPath, "tag", "compute-bench", ",,,"},
+		{"--config", wsPath, "tag", "compute-bench", "{}"},
+		{"--config", wsPath, "tag", "bad/tag", "rv64-node-01"},
+		{"--config", wsPath, "tag", "bad+tag", "rv64-node-01"},
+		{"--config", wsPath, "tag", "bad#tag", "rv64-node-01"},
+		{"--config", wsPath, "tag", "compute-bench", "bad/node"},
+		{"--config", wsPath, "tag", "compute-bench", "bad+node"},
+		{"--config", wsPath, "tag", "compute-bench", "bad#node"},
+	} {
+		if _, err := executeCLIForTest(badArgs...); err == nil {
+			t.Fatalf("expected invalid tag command %v to fail validation", badArgs)
+		}
+	}
+
+	// 4. node help & tag output alignment.
+	nodeHelp, err := executeCLIForTest("--config", wsPath, "node", "--help")
+	if err != nil {
+		t.Fatalf("node --help failed: %v", err)
+	}
+	if !strings.Contains(nodeHelp, "node <node_id>") || !strings.Contains(nodeHelp, "tags") {
+		t.Fatalf("expected node --help to align <node_id> and tags description, got:\n%s", nodeHelp)
+	}
+	if _, err := executeCLIForTest("--config", wsPath, "node", "bad/node"); err == nil || !strings.Contains(err.Error(), "invalid node_id") {
+		t.Fatalf("expected invalid node_id to fail ValidateTopicToken, got: %v", err)
+	}
+
+	nodeStore := &stubAgentSafeDB{
+		queryFn: func(_ context.Context, sql string, _ ...any) ([]map[string]any, error) {
+			if strings.Contains(sql, "FROM ctd_nodes") {
+				return []map[string]any{{"tags": []string{"compute-bench", "riscv64"}}}, nil
+			}
+			return []map[string]any{{
+				"component":       "host-os",
+				"pillar":          "observer",
+				"status":          "ok",
+				"event_timestamp": time.Now().UTC(),
+				"metrics":         map[string]any{"cpu_temp_c": 42.5},
+			}}, nil
+		},
+	}
+	var nodeOut bytes.Buffer
+	if err := runNodeWithStore(context.Background(), &nodeOut, nodeStore, "rv64-node-01"); err != nil {
+		t.Fatalf("runNodeWithStore failed: %v", err)
+	}
+	if !strings.Contains(nodeOut.String(), "Tags: compute-bench,riscv64") {
+		t.Fatalf("expected node output to include node tags, got:\n%s", nodeOut.String())
+	}
+
+	// 5. coop status prints warning when count query returns an error.
+	coopStore := &stubAgentSafeDB{
+		meshID: &core.MeshIdentity{MeshName: "ro-mesh", CoopNodeID: "rv64-coop-01", TopicRoot: "pigeons"},
+		queryFn: func(_ context.Context, _ string, _ ...any) ([]map[string]any, error) {
+			return nil, errors.New("relation pmv_catalog does not exist")
+		},
+	}
+	var coopOut bytes.Buffer
+	coopCfg := config.DefaultWorkstationConfig()
+	coopCfg.ActiveMesh = "ro-mesh"
+	if err := queryAndPrintCoopStatus(context.Background(), &coopOut, coopCfg, coopStore); err != nil {
+		t.Fatalf("queryAndPrintCoopStatus returned error: %v", err)
+	}
+	if !strings.Contains(coopOut.String(), "[Ledger Warning]") || !strings.Contains(coopOut.String(), "pmv_catalog") {
+		t.Fatalf("expected coop status to print warning on count query error, got:\n%s", coopOut.String())
+	}
+	_ = io.Discard
 }

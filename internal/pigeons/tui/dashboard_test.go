@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncare"
+	"github.com/drewv-labs/carrierpigeons/internal/pigeonmath"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
@@ -293,5 +298,420 @@ func TestManagedChannelPrompterCloseTerminatesWaitForApprovalCmd(t *testing.T) {
 	dec, err := prompter(context.Background(), pigeoncare.ActionProposal{Title: "after-close"})
 	if dec != pigeoncare.DecisionDeny || !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected (DecisionDeny, context.Canceled) after close, got (%v, %v)", dec, err)
+	}
+}
+
+func TestDashboardQuitCancelsModelContextAndCtxPrompter(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
+	m := NewDashboardModel(DashboardOptions{
+		Context:    parentCtx,
+		Config:     config.DefaultWorkstationConfig(),
+		InitialTab: TabOverview,
+	})
+	modelCtx := m.baseContext()
+	if modelCtx.Err() != nil {
+		t.Fatalf("expected fresh model context to be active, got %v", modelCtx.Err())
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(DashboardModel)
+	if !um.quitting {
+		t.Fatal("expected quitting=true")
+	}
+	if !errors.Is(modelCtx.Err(), context.Canceled) {
+		t.Fatalf("expected quit() to cancel model-scoped ctx, got %v", modelCtx.Err())
+	}
+	if parentCtx.Err() != nil {
+		t.Fatalf("expected quit() not to cancel caller parentCtx, got %v", parentCtx.Err())
+	}
+	if cmd == nil {
+		t.Fatal("expected tea.Quit command")
+	}
+
+	// Verify waitForApprovalCmdWithContext unblocks cleanly on ctx cancel even if channel remains open.
+	openInbox := make(chan ApprovalPromptMsg)
+	waitCh := make(chan tea.Msg, 1)
+	go func() {
+		waitCh <- waitForApprovalCmdWithContext(modelCtx, openInbox)()
+	}()
+	select {
+	case msg := <-waitCh:
+		if msg != nil {
+			t.Fatalf("expected nil msg on canceled model ctx, got %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForApprovalCmdWithContext hung after model ctx cancel")
+	}
+
+	// Verify NewChannelPrompterWithContext closes inbox when ctx cancels.
+	pCtx, pCancel := context.WithCancel(context.Background())
+	prompter, inbox := NewChannelPrompterWithContext(pCtx)
+	pCancel()
+
+	select {
+	case _, ok := <-inbox:
+		if ok {
+			t.Fatal("expected NewChannelPrompterWithContext inbox to close after ctx cancel")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("NewChannelPrompterWithContext inbox did not close on ctx cancel")
+	}
+	if dec, err := prompter(context.Background(), pigeoncare.ActionProposal{Title: "after-cancel"}); dec != pigeoncare.DecisionDeny || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled ctx prompter to return (DecisionDeny, context.Canceled), got (%v, %v)", dec, err)
+	}
+}
+
+func TestDashboardApprovalStreamIDCorrelationAndLifecycleClear(t *testing.T) {
+	prompter, inbox, closePrompter := NewManagedChannelPrompter()
+	defer closePrompter()
+
+	m := NewDashboardModel(DashboardOptions{
+		Config:        config.DefaultWorkstationConfig(),
+		Care:          pigeoncare.NewService(pigeoncare.Options{Prompter: prompter}),
+		ApprovalInbox: inbox,
+		InitialTab:    TabOverview,
+	})
+
+	// Prompter attaches streamID from ctx into ApprovalPromptMsg.
+	replyDone := make(chan pigeoncare.ConfirmationDecision, 1)
+	go func() {
+		dec, _ := prompter(withApprovalStreamID(context.Background(), 99), pigeoncare.ActionProposal{Title: "correlated"})
+		replyDone <- dec
+	}()
+	var correlated ApprovalPromptMsg
+	select {
+	case correlated = <-inbox:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for correlated ApprovalPromptMsg")
+	}
+	if correlated.StreamID != 99 {
+		t.Fatalf("expected StreamID=99 from context, got %d", correlated.StreamID)
+	}
+	correlated.ReplyCh <- pigeoncare.DecisionDeny
+	<-replyDone
+
+	// Start stream 1 in TabPigeonCare.
+	m.activeTab = TabPigeonCare
+	for _, r := range "check thermals" {
+		u, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = u.(DashboardModel)
+	}
+	u, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = u.(DashboardModel)
+	if !m.waiting || m.activeStreamID != 1 {
+		t.Fatalf("expected active stream 1, got waiting=%v activeStreamID=%d", m.waiting, m.activeStreamID)
+	}
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+
+	// Cancel stream 1 via Esc -> activeStreamID becomes 2.
+	u, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = u.(DashboardModel)
+	m.activeTab = TabOverview
+
+	// Stale ApprovalPromptMsg from stream 1 must be denied immediately and re-arm waitForApprovalCmd.
+	staleReply := make(chan pigeoncare.ConfirmationDecision, 1)
+	u, cmd := m.Update(ApprovalPromptMsg{
+		StreamID: 1,
+		Proposal: pigeoncare.ActionProposal{Title: "stale-approval"},
+		ReplyCh:  staleReply,
+	})
+	m = u.(DashboardModel)
+	if m.pendingApproval != nil {
+		t.Fatal("expected stale ApprovalPromptMsg not to set pendingApproval")
+	}
+	if m.activeTab != TabOverview {
+		t.Fatalf("expected stale ApprovalPromptMsg not to switch tabs, got %v", m.activeTab)
+	}
+	if cmd == nil {
+		t.Fatal("expected stale ApprovalPromptMsg handling to re-arm waitForApprovalCmd")
+	}
+	select {
+	case dec := <-staleReply:
+		if dec != pigeoncare.DecisionDeny {
+			t.Fatalf("expected stale ApprovalPromptMsg to receive DecisionDeny, got %v", dec)
+		}
+	default:
+		t.Fatal("expected stale ApprovalPromptMsg ReplyCh to be denied immediately")
+	}
+
+	// Start stream 2 -> activeStreamID increments; matching ApprovalPromptMsg sets pendingApproval,
+	// and streamErrMsg / streamDoneMsg / quit() clear and deny pendingApproval cleanly.
+	for _, tc := range []struct {
+		name string
+		kind string
+	}{
+		{name: "stream_err", kind: "err"},
+		{name: "stream_done", kind: "done"},
+		{name: "quit", kind: "quit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			subM := NewDashboardModel(DashboardOptions{
+				Config:        config.DefaultWorkstationConfig(),
+				Care:          pigeoncare.NewService(pigeoncare.Options{Prompter: prompter}),
+				ApprovalInbox: inbox,
+				InitialTab:    TabPigeonCare,
+			})
+			subM.userInput = "run probe"
+			u, _ := subM.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			subM = u.(DashboardModel)
+			if subM.streamCancel != nil {
+				subM.streamCancel()
+				subM.streamCancel = nil
+			}
+			curID := subM.activeStreamID
+
+			activeReply := make(chan pigeoncare.ConfirmationDecision, 1)
+			u, _ = subM.Update(ApprovalPromptMsg{
+				StreamID: curID,
+				Proposal: pigeoncare.ActionProposal{Title: "active-approval"},
+				ReplyCh:  activeReply,
+			})
+			subM = u.(DashboardModel)
+			if subM.pendingApproval == nil {
+				t.Fatal("expected matching ApprovalPromptMsg to populate pendingApproval")
+			}
+
+			var finCmd tea.Cmd
+			switch tc.kind {
+			case "quit":
+				u, finCmd = subM.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+			case "err":
+				u, finCmd = subM.Update(streamErrMsg{streamID: curID, err: errors.New("boom")})
+			case "done":
+				u, finCmd = subM.Update(streamDoneMsg{streamID: curID})
+			}
+			subM = u.(DashboardModel)
+			if subM.pendingApproval != nil {
+				t.Fatalf("expected pendingApproval to be cleared on %s", tc.name)
+			}
+			select {
+			case dec := <-activeReply:
+				if dec != pigeoncare.DecisionDeny {
+					t.Fatalf("expected cleared pendingApproval on %s to receive DecisionDeny, got %v", tc.name, dec)
+				}
+			default:
+				t.Fatalf("expected cleared pendingApproval ReplyCh to be unblocked on %s", tc.name)
+			}
+			if tc.kind != "quit" && finCmd == nil {
+				t.Fatalf("expected %s clearing pendingApproval to re-arm waitForApprovalCmd", tc.name)
+			}
+			_ = llm.Message{}
+		})
+	}
+}
+
+type blockingDashboardStore struct {
+	mu           sync.Mutex
+	clusterGate  chan struct{}
+	clusterActive atomic.Int64
+	clusterCalls  atomic.Int64
+	clusterMax    atomic.Int64
+	nodes         []db.NodeSummary
+
+	mathGate   chan struct{}
+	mathActive atomic.Int64
+	mathCalls  atomic.Int64
+	mathMax    atomic.Int64
+	pmvs       []db.PMVRecord
+}
+
+func (b *blockingDashboardStore) recordClusterConcurrency() {
+	b.clusterCalls.Add(1)
+	cur := b.clusterActive.Add(1)
+	for {
+		prev := b.clusterMax.Load()
+		if cur <= prev || b.clusterMax.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
+}
+
+func (b *blockingDashboardStore) GetMeshIdentity(_ context.Context) (*core.MeshIdentity, error) {
+	return &core.MeshIdentity{MeshName: "test-mesh", CoopNodeID: "rv64-coop-01"}, nil
+}
+
+func (b *blockingDashboardStore) GetClusterStatus(ctx context.Context, _ time.Duration) ([]db.NodeSummary, error) {
+	b.recordClusterConcurrency()
+	defer b.clusterActive.Add(-1)
+	if b.clusterGate != nil {
+		select {
+		case <-b.clusterGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]db.NodeSummary, len(b.nodes))
+	copy(out, b.nodes)
+	return out, nil
+}
+
+func (b *blockingDashboardStore) ResolveNodes(_ context.Context, _ core.RunnerSelector) ([]string, error) {
+	return nil, nil
+}
+func (b *blockingDashboardStore) GetLineageDAG(_ context.Context, _ string, _ int) (*db.DAG, error) {
+	return nil, nil
+}
+func (b *blockingDashboardStore) GetLedgerActivity(_ context.Context, _ int) ([]db.LedgerActivity, error) {
+	return nil, nil
+}
+func (b *blockingDashboardStore) QueryReadOnlyMaps(ctx context.Context, sql string, _ ...any) ([]map[string]any, error) {
+	if strings.Contains(sql, "date_trunc('minute'") {
+		b.mathCalls.Add(1)
+		cur := b.mathActive.Add(1)
+		for {
+			prev := b.mathMax.Load()
+			if cur <= prev || b.mathMax.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		defer b.mathActive.Add(-1)
+		if b.mathGate != nil {
+			select {
+			case <-b.mathGate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return []map[string]any{{
+			"bucket":          time.Now().UTC().Truncate(time.Minute),
+			"live_nodes":      int64(1),
+			"observer_events": int64(2),
+			"runner_events":   int64(1),
+			"tracer_events":   int64(0),
+			"total_events":    int64(3),
+		}}, nil
+	}
+	return nil, nil
+}
+func (b *blockingDashboardStore) ExplainReadOnly(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (b *blockingDashboardStore) EnsureMathSchema(_ context.Context) error { return nil }
+func (b *blockingDashboardStore) SavePMVDraft(_ context.Context, rec db.PMVRecord) (*db.PMVRecord, error) {
+	return &rec, nil
+}
+func (b *blockingDashboardStore) UpdatePMVState(_ context.Context, _ db.PMVRecord) error { return nil }
+func (b *blockingDashboardStore) GetPMV(_ context.Context, _ string) (*db.PMVRecord, error) {
+	return nil, nil
+}
+func (b *blockingDashboardStore) ListPMVs(_ context.Context) ([]db.PMVRecord, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]db.PMVRecord(nil), b.pmvs...), nil
+}
+func (b *blockingDashboardStore) MaterializePMV(_ context.Context, _, _ string) error { return nil }
+func (b *blockingDashboardStore) DropPMV(_ context.Context, _ string) error          { return nil }
+func (b *blockingDashboardStore) Close()                                             {}
+
+func TestDashboardPollingInFlightAndMonotonicSequenceGuards(t *testing.T) {
+	gateOverview := make(chan struct{})
+	gateMath := make(chan struct{})
+	store := &blockingDashboardStore{
+		clusterGate: gateOverview,
+		mathGate:    gateMath,
+		nodes:       []db.NodeSummary{{NodeID: "node-initial", IsHealthy: true}},
+	}
+
+	m := NewDashboardModel(DashboardOptions{
+		Config: config.DefaultWorkstationConfig(),
+		Store:  store,
+	})
+
+	// 1. In-flight guard prevents concurrent overview/math polls from piling up.
+	ovCmd1 := m.fetchOverviewCmd()
+	mathCmd1 := m.fetchMathCmd()
+	if ovCmd1 == nil || mathCmd1 == nil {
+		t.Fatal("expected initial overview and math commands to be non-nil")
+	}
+
+	// While first polls have not completed, duplicate calls / ticks / 'r' must not launch concurrent polls.
+	if dup := m.fetchOverviewCmd(); dup != nil {
+		t.Fatal("expected concurrent fetchOverviewCmd while in-flight to return nil")
+	}
+	if dup := m.fetchMathCmd(); dup != nil {
+		t.Fatal("expected concurrent fetchMathCmd while in-flight to return nil")
+	}
+
+	var wg sync.WaitGroup
+	ovMsgCh := make(chan tea.Msg, 1)
+	mathMsgCh := make(chan tea.Msg, 1)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ovMsgCh <- ovCmd1()
+	}()
+	go func() {
+		defer wg.Done()
+		mathMsgCh <- mathCmd1()
+	}()
+
+	// Trigger extra ticks & manual refresh while goroutines are blocked on gates.
+	u, _ := m.Update(overviewTickMsg(time.Now()))
+	m = u.(DashboardModel)
+	u, _ = m.Update(mathTickMsg(time.Now()))
+	m = u.(DashboardModel)
+	u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = u.(DashboardModel)
+
+	close(gateOverview)
+	close(gateMath)
+	wg.Wait()
+
+	if store.clusterMax.Load() > 1 || store.mathMax.Load() > 1 {
+		t.Fatalf("expected max concurrent overview/math polls <= 1, got clusterMax=%d mathMax=%d",
+			store.clusterMax.Load(), store.mathMax.Load())
+	}
+
+	ovMsg := (<-ovMsgCh).(overviewDataMsg)
+	mathMsg := (<-mathMsgCh).(mathDataMsg)
+	if ovMsg.seq != 1 || mathMsg.seq != 1 {
+		t.Fatalf("expected seq=1 on initial polls, got overview=%d math=%d", ovMsg.seq, mathMsg.seq)
+	}
+
+	// 2. Monotonic sequence guard prevents stale poll results from overwriting newer state.
+	newerOverview := overviewDataMsg{
+		seq:   5,
+		nodes: []db.NodeSummary{{NodeID: "node-newer", IsHealthy: true}},
+	}
+	u, _ = m.Update(newerOverview)
+	m = u.(DashboardModel)
+	if len(m.nodes) != 1 || m.nodes[0].NodeID != "node-newer" {
+		t.Fatalf("expected newer overview state to apply, got %+v", m.nodes)
+	}
+
+	// Stale seq=1 (with error and older nodes) must be ignored!
+	u, _ = m.Update(overviewDataMsg{
+		seq:   1,
+		nodes: []db.NodeSummary{{NodeID: "node-stale", IsHealthy: true}},
+		err:   errors.New("stale error"),
+	})
+	m = u.(DashboardModel)
+	if len(m.nodes) != 1 || m.nodes[0].NodeID != "node-newer" {
+		t.Fatalf("stale overviewDataMsg overwrote newer nodes: %+v", m.nodes)
+	}
+	if strings.Contains(m.statusBanner, "stale error") {
+		t.Fatalf("stale overviewDataMsg overwrote statusBanner: %q", m.statusBanner)
+	}
+
+	// Same monotonic sequence guard for PigeonMath polling.
+	newerSnap := &pigeonmath.DashboardSnapshot{WindowMinutes: 60}
+	u, _ = m.Update(mathDataMsg{seq: 5, snap: newerSnap})
+	m = u.(DashboardModel)
+	if m.mathSnap == nil || m.mathSnap.WindowMinutes != 60 {
+		t.Fatalf("expected newer mathSnap WindowMinutes=60, got %+v", m.mathSnap)
+	}
+
+	staleSnap := &pigeonmath.DashboardSnapshot{WindowMinutes: 15}
+	u, _ = m.Update(mathDataMsg{seq: 1, snap: staleSnap, err: errors.New("stale math err")})
+	m = u.(DashboardModel)
+	if m.mathSnap == nil || m.mathSnap.WindowMinutes != 60 || m.mathErr != nil {
+		t.Fatalf("stale mathDataMsg overwrote newer state: snap=%+v err=%v", m.mathSnap, m.mathErr)
 	}
 }

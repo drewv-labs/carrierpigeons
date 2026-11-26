@@ -1,13 +1,26 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestCoopConfigValidateSecurityFailClosed(t *testing.T) {
@@ -802,5 +815,736 @@ func TestBrandIsolatedConfigAndStateConcurrency(t *testing.T) {
 
 	if brand.Active() != initialActive {
 		t.Fatalf("global brand.Active() mutated: got %+v, want %+v", brand.Active(), initialActive)
+	}
+}
+
+func TestCWDConfigNonAutoloadAndEtcBootstrapMerge(t *testing.T) {
+	t.Run("cwd_non_autoload", func(t *testing.T) {
+		fakeHome := t.TempDir()
+		fakeEtc := t.TempDir()
+		cwdDir := t.TempDir()
+
+		prevEtc := systemConfigRoot
+		systemConfigRoot = fakeEtc
+		t.Cleanup(func() { systemConfigRoot = prevEtc })
+
+		t.Setenv("HOME", fakeHome)
+		t.Setenv("PIGEONS_CONFIG", "")
+		t.Setenv("PIGEONEER_CONFIG", "")
+		t.Setenv("PIGEONCOOP_CONFIG", "")
+		t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(fakeHome, "current_mesh"))
+
+		if err := os.WriteFile(filepath.Join(cwdDir, "pigeons.toml"), []byte("operator = \"evil-cwd\"\n[meshes.cwd-only]\nbroker_url = \"tcp://192.0.2.99:1883\"\n"), 0o600); err != nil {
+			t.Fatalf("write cwd pigeons.toml: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(cwdDir, "pigeoneer.toml"), []byte("node_id = \"evil-cwd-edge\"\n"), 0o600); err != nil {
+			t.Fatalf("write cwd pigeoneer.toml: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(cwdDir, "pigeoncoop.toml"), []byte("mesh_name = \"evil-cwd-mesh\"\n"), 0o600); err != nil {
+			t.Fatalf("write cwd pigeoncoop.toml: %v", err)
+		}
+
+		origWD, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("Getwd: %v", err)
+		}
+		if err := os.Chdir(cwdDir); err != nil {
+			t.Fatalf("Chdir(%s): %v", cwdDir, err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+		baseWS, err := LoadBaseWorkstationConfig("")
+		if err != nil {
+			t.Fatalf("LoadBaseWorkstationConfig: %v", err)
+		}
+		if baseWS.ConfigPath != "" || baseWS.Operator == "evil-cwd" || len(baseWS.Meshes) != 0 {
+			t.Fatalf("expected CWD pigeons.toml NOT to autoload, got path=%q operator=%q meshes=%v", baseWS.ConfigPath, baseWS.Operator, baseWS.Meshes)
+		}
+
+		wsCfg, err := LoadWorkstationConfig("")
+		if err != nil {
+			t.Fatalf("LoadWorkstationConfig: %v", err)
+		}
+		if wsCfg.ConfigPath != "" || wsCfg.Operator == "evil-cwd" {
+			t.Fatalf("expected LoadWorkstationConfig NOT to autoload CWD pigeons.toml, got %+v", wsCfg)
+		}
+
+		edgeCfg, err := LoadEdgeConfig("")
+		if err != nil {
+			t.Fatalf("LoadEdgeConfig: %v", err)
+		}
+		if edgeCfg.NodeID == "evil-cwd-edge" {
+			t.Fatalf("expected LoadEdgeConfig NOT to autoload CWD pigeoneer.toml")
+		}
+
+		coopCfg, err := LoadCoopConfig("")
+		if err != nil {
+			t.Fatalf("LoadCoopConfig: %v", err)
+		}
+		if coopCfg.MeshName == "evil-cwd-mesh" {
+			t.Fatalf("expected LoadCoopConfig NOT to autoload CWD pigeoncoop.toml")
+		}
+
+		// Upsert without explicit path or *_CONFIG must write to ~/.config/<cli>/<cli>.toml, NOT CWD ./pigeons.toml.
+		userBroker := "tcp://192.0.2.55:1883"
+		savedPath, err := UpsertWorkstationMeshProfile("", "user-mesh", MeshProfilePatch{BrokerURL: &userBroker})
+		if err != nil {
+			t.Fatalf("UpsertWorkstationMeshProfile: %v", err)
+		}
+		wantUserPath := filepath.Join(fakeHome, ".config", "pigeons", "pigeons.toml")
+		if savedPath != wantUserPath {
+			t.Fatalf("expected upsert path %q, got %q", wantUserPath, savedPath)
+		}
+		cwdRaw, err := os.ReadFile(filepath.Join(cwdDir, "pigeons.toml"))
+		if err != nil || strings.Contains(string(cwdRaw), "user-mesh") {
+			t.Fatalf("expected CWD pigeons.toml to remain untouched, got err=%v raw=%q", err, string(cwdRaw))
+		}
+
+		// Explicit path and <BRAND>_CONFIG still load local files cleanly.
+		explicitWS, err := LoadWorkstationConfig(filepath.Join(cwdDir, "pigeons.toml"))
+		if err != nil || explicitWS.Operator != "evil-cwd" {
+			t.Fatalf("expected explicit path load to succeed, got op=%q err=%v", explicitWS.Operator, err)
+		}
+		t.Setenv("PIGEONS_CONFIG", filepath.Join(cwdDir, "pigeons.toml"))
+		envWS, err := LoadWorkstationConfig("")
+		if err != nil || envWS.Operator != "evil-cwd" {
+			t.Fatalf("expected PIGEONS_CONFIG load to succeed, got op=%q err=%v", envWS.Operator, err)
+		}
+	})
+
+	t.Run("etc_bootstrap_merge", func(t *testing.T) {
+		fakeHome := t.TempDir()
+		fakeEtc := t.TempDir()
+
+		prevEtc := systemConfigRoot
+		systemConfigRoot = fakeEtc
+		t.Cleanup(func() { systemConfigRoot = prevEtc })
+
+		t.Setenv("HOME", fakeHome)
+		t.Setenv("PIGEONS_CONFIG", "")
+		t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(fakeHome, "current_mesh"))
+
+		etcPath := filepath.Join(fakeEtc, "pigeons", "pigeons.toml")
+		if err := os.MkdirAll(filepath.Dir(etcPath), 0o755); err != nil {
+			t.Fatalf("mkdir fake etc: %v", err)
+		}
+		etcTOML := `# System-wide fleet defaults
+operator = "fleet-admin"
+
+[llm]
+provider = "ollama"
+model = "qwen2.5-coder"
+
+[meshes.prod-mesh]
+broker_url = "tls://192.0.2.10:8883"
+database_url = "postgres://pigeoncoop_admin:prod_pw@192.0.2.10:5432/edge_ledger"
+
+[meshes.shared-mesh]
+broker_url = "tcp://192.0.2.20:1883"
+database_url = "postgres://pigeoncoop_admin:shared_pw@192.0.2.20:5432/edge_ledger"
+`
+		if err := os.WriteFile(etcPath, []byte(etcTOML), 0o644); err != nil {
+			t.Fatalf("write etc pigeons.toml: %v", err)
+		}
+
+		// Confirm /etc is initially active.
+		baseBefore, err := LoadBaseWorkstationConfig("")
+		if err != nil || baseBefore.ConfigPath != etcPath {
+			t.Fatalf("expected active config %q, got %q (err=%v)", etcPath, baseBefore.ConfigPath, err)
+		}
+
+		// Bootstrap ~/.config/pigeons/pigeons.toml by adding a new mesh profile.
+		labBroker := "tcp://192.0.2.30:1883"
+		userPath, err := UpsertWorkstationMeshProfile("", "lab-mesh", MeshProfilePatch{BrokerURL: &labBroker})
+		if err != nil {
+			t.Fatalf("UpsertWorkstationMeshProfile bootstrap failed: %v", err)
+		}
+		wantUserPath := filepath.Join(fakeHome, ".config", "pigeons", "pigeons.toml")
+		if userPath != wantUserPath {
+			t.Fatalf("expected user path %q, got %q", wantUserPath, userPath)
+		}
+
+		rawUser, err := os.ReadFile(userPath)
+		if err != nil {
+			t.Fatalf("read bootstrapped user config: %v", err)
+		}
+		if !strings.Contains(string(rawUser), "# System-wide fleet defaults") {
+			t.Fatalf("expected /etc comments preserved in user config, got:\n%s", string(rawUser))
+		}
+
+		// All /etc base settings and profiles must still be active!
+		prodCfg, err := LoadWorkstationConfigForMesh("", "prod-mesh")
+		if err != nil {
+			t.Fatalf("LoadWorkstationConfigForMesh(prod-mesh) after bootstrap: %v", err)
+		}
+		if prodCfg.ConfigPath != wantUserPath || prodCfg.Operator != "fleet-admin" ||
+			prodCfg.BrokerURL != "tls://192.0.2.10:8883" ||
+			prodCfg.DatabaseURL != "postgres://pigeoncoop_admin:prod_pw@192.0.2.10:5432/edge_ledger" {
+			t.Fatalf("expected /etc base profile prod-mesh preserved after bootstrap, got %+v", prodCfg)
+		}
+
+		// Also verify updating an existing /etc profile on bootstrap merges its unpatched fields.
+		fakeHome2 := t.TempDir()
+		t.Setenv("HOME", fakeHome2)
+		updatedBroker := "tcp://192.0.2.21:1883"
+		if _, err := UpsertWorkstationMeshProfile("", "shared-mesh", MeshProfilePatch{BrokerURL: &updatedBroker}); err != nil {
+			t.Fatalf("UpsertWorkstationMeshProfile(shared-mesh): %v", err)
+		}
+		sharedCfg, err := LoadWorkstationConfigForMesh("", "shared-mesh")
+		if err != nil {
+			t.Fatalf("LoadWorkstationConfigForMesh(shared-mesh): %v", err)
+		}
+		if sharedCfg.BrokerURL != updatedBroker || sharedCfg.DatabaseURL != "postgres://pigeoncoop_admin:shared_pw@192.0.2.20:5432/edge_ledger" {
+			t.Fatalf("expected /etc shared-mesh database_url merged with patched broker_url, got broker=%q db=%q", sharedCfg.BrokerURL, sharedCfg.DatabaseURL)
+		}
+		if _, hasProd := sharedCfg.Meshes["prod-mesh"]; !hasProd {
+			t.Fatalf("expected /etc prod-mesh preserved alongside patched shared-mesh")
+		}
+	})
+}
+
+func TestPostgresDSNLoopbackAndCoopSecurityValidation(t *testing.T) {
+	t.Setenv("PGHOST", "")
+	t.Setenv("PGPORT", "")
+	t.Setenv("PGUSER", "")
+	t.Setenv("PGPASSWORD", "")
+	t.Setenv("PGDATABASE", "")
+	t.Setenv("PGSSLMODE", "")
+
+	loopbackCases := []string{
+		"postgres://pigeoncoop_admin:ctd_dev_password@127.0.0.1:5432/edge_ledger",
+		"postgres://pigeoncoop_admin:ctd_dev_password@localhost:5432/edge_ledger",
+		"postgres://pigeoncoop_admin:ctd_dev_password@[::1]:5432/edge_ledger",
+		"postgres://pigeoncoop_admin:ctd_dev_password@?host=127.0.0.1&dbname=edge_ledger",
+		"host=127.0.0.1 port=5432 user=pigeoncoop_admin password=ctd_dev_password dbname=edge_ledger",
+		"host=localhost dbname=edge_ledger",
+		"host=::1 port=5432 dbname=edge_ledger",
+		"host=/var/run/postgresql dbname=edge_ledger",
+	}
+	for _, dsn := range loopbackCases {
+		if !isURLHostLoopback(dsn) {
+			t.Fatalf("expected isURLHostLoopback(%q) == true", dsn)
+		}
+	}
+
+	remoteOrInvalidCases := []string{
+		"",
+		"://broken-dsn",
+		"postgres://pigeoncoop_admin:ctd_dev_password@192.0.2.20:5432/edge_ledger",
+		"postgres://pigeoncoop_admin:ctd_dev_password@?host=192.0.2.20&dbname=edge_ledger",
+		"postgres://pigeoncoop_admin:ctd_dev_password@127.0.0.1:5432,192.0.2.20:5432/edge_ledger",
+		"host=192.0.2.20 port=5432 user=pigeoncoop_admin password=ctd_dev_password dbname=edge_ledger",
+		"host=127.0.0.1,192.0.2.20 port=5432,5432 user=pigeoncoop_admin password=ctd_dev_password dbname=edge_ledger",
+	}
+	for _, dsn := range remoteOrInvalidCases {
+		if isURLHostLoopback(dsn) {
+			t.Fatalf("expected isURLHostLoopback(%q) == false", dsn)
+		}
+	}
+
+	// CoopConfig.ValidateSecurity must enforce default-password guard on libpq key=value,
+	// query ?host=, and multi-host DSNs just like URI DSNs.
+	for _, badRemote := range []string{
+		"host=192.0.2.20 port=5432 user=pigeoncoop_admin password=ctd_dev_password dbname=edge_ledger",
+		"host=192.0.2.20 port=5432 user=ctd_ingestor password=ctd_ingest_password dbname=edge_ledger",
+		"postgres://pigeoncoop_admin:ctd_dev_password@?host=192.0.2.20&dbname=edge_ledger",
+		"host=127.0.0.1,192.0.2.20 port=5432,5432 user=pigeoncoop_admin password=ctd_dev_password dbname=edge_ledger",
+		"postgres://pigeoncoop_admin:ctd_dev_password@127.0.0.1:5432,192.0.2.20:5432/edge_ledger",
+	} {
+		cfg := DefaultCoopConfig()
+		cfg.Database.URL = badRemote
+		if err := cfg.ValidateSecurity(); err == nil {
+			t.Fatalf("expected ValidateSecurity to reject remote DSN %q with default password", badRemote)
+		}
+	}
+
+	// Malformed DSN with password must fail closed without echoing the secret.
+	badCfg := DefaultCoopConfig()
+	badCfg.Database.URL = "postgres://admin:super_secret_pw@192.0.2.20:5432/edge_ledger?sslmode=bogus"
+	if err := badCfg.ValidateSecurity(); err == nil {
+		t.Fatal("expected ValidateSecurity to fail closed on invalid sslmode DSN")
+	} else if strings.Contains(err.Error(), "super_secret_pw") {
+		t.Fatalf("ValidateSecurity leaked password in error: %v", err)
+	}
+
+	// Valid remote libpq key=value with rotated password & loopback key=value with default password pass.
+	for _, goodDSN := range []string{
+		"host=192.0.2.20 port=5432 user=pigeoncoop_admin password=rotated_prod_secret dbname=edge_ledger sslmode=require",
+		"host=127.0.0.1 port=5432 user=pigeoncoop_admin password=ctd_dev_password dbname=edge_ledger",
+	} {
+		cfg := DefaultCoopConfig()
+		cfg.Database.URL = goodDSN
+		if err := cfg.ValidateSecurity(); err != nil {
+			t.Fatalf("expected ValidateSecurity to allow %q, got %v", goodDSN, err)
+		}
+	}
+
+	// Workstation RO derivation with libpq key=value DSN must clear loopback RO on remote host
+	// and never leak admin credentials into ReadOnlyDatabaseURL.
+	dir := t.TempDir()
+	t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(dir, "current_mesh"))
+	t.Setenv("PIGEONCARE_RO_PASSWORD", "")
+	t.Setenv("PIGEONS_RO_DB_URL", "")
+	t.Setenv("PIGEONCARE_DB_URL", "")
+	t.Setenv("PIGEONMCP_DB_URL", "")
+
+	wsPath := filepath.Join(dir, "pigeons.toml")
+	if err := os.WriteFile(wsPath, []byte(`readonly_database_url = "postgres://pigeoncare_ro:old@127.0.0.1:5432/edge_ledger"`+"\n"), 0o600); err != nil {
+		t.Fatalf("write pigeons.toml: %v", err)
+	}
+	t.Setenv("PIGEONS_DB_URL", "host=192.0.2.50 port=5432 user=pigeoncoop_admin password=admin_secret dbname=edge_ledger")
+	wsRemote, err := LoadWorkstationConfig(wsPath)
+	if err != nil {
+		t.Fatalf("LoadWorkstationConfig remote libpq: %v", err)
+	}
+	if wsRemote.ReadOnlyDatabaseURL != "" {
+		t.Fatalf("expected empty ReadOnlyDatabaseURL for remote libpq DSN without PIGEONCARE_RO_PASSWORD, got %q", wsRemote.ReadOnlyDatabaseURL)
+	}
+
+	t.Setenv("PIGEONS_DB_URL", "host=127.0.0.1 port=5432 user=pigeoncoop_admin password=admin_secret dbname=edge_ledger")
+	wsLoopbackSameTarget, err := LoadWorkstationConfig(wsPath)
+	if err != nil {
+		t.Fatalf("LoadWorkstationConfig loopback same-target libpq: %v", err)
+	}
+	if wsLoopbackSameTarget.ReadOnlyDatabaseURL != "postgres://pigeoncare_ro:old@127.0.0.1:5432/edge_ledger" {
+		t.Fatalf("expected explicit same-target ReadOnlyDatabaseURL preserved for loopback libpq, got %q", wsLoopbackSameTarget.ReadOnlyDatabaseURL)
+	}
+
+	t.Setenv("PIGEONS_DB_URL", "host=127.0.0.1 port=5432 user=pigeoncoop_admin password=admin_secret dbname=edge_ledger_local")
+	wsLoopback, err := LoadWorkstationConfig(wsPath)
+	if err != nil {
+		t.Fatalf("LoadWorkstationConfig loopback libpq: %v", err)
+	}
+	if wsLoopback.ReadOnlyDatabaseURL != "postgres://pigeoncare_ro:pigeoncare_readonly@127.0.0.1:5432/edge_ledger_local" {
+		t.Fatalf("expected derived pigeoncare_ro DSN for loopback libpq, got %q", wsLoopback.ReadOnlyDatabaseURL)
+	}
+	if strings.Contains(wsLoopback.ReadOnlyDatabaseURL, "admin_secret") {
+		t.Fatalf("derived ReadOnlyDatabaseURL leaked admin password: %q", wsLoopback.ReadOnlyDatabaseURL)
+	}
+
+	// Libpq key=value SSL settings (sslmode=verify-full, sslrootcert, etc.) must be preserved
+	// across RO derivation instead of silently downgrading TLS to prefer.
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "pg-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("MarshalECPrivateKey: %v", err)
+	}
+	caFile := filepath.Join(dir, "ca root.pem")
+	certFile := filepath.Join(dir, "client.crt")
+	keyFile := filepath.Join(dir, "client.key")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write caFile: %v", err)
+	}
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write certFile: %v", err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write keyFile: %v", err)
+	}
+
+	t.Setenv("PIGEONCARE_RO_PASSWORD", "ro_tls_secret")
+	libpqTLSDSN := "host=192.0.2.50 port=5432 user=pigeoncoop_admin password=admin_secret dbname=edge_ledger sslmode=verify-full sslrootcert='" + caFile + "' sslcert=" + certFile + " sslkey=" + keyFile + " sslsni=1"
+	gotLibpqTLS := deriveReadOnlyURL(libpqTLSDSN)
+	parsedLibpqRO, err := pgxpool.ParseConfig(gotLibpqTLS)
+	if err != nil {
+		t.Fatalf("pgxpool.ParseConfig(%q) failed: %v", gotLibpqTLS, err)
+	}
+	if parsedLibpqRO.ConnConfig.User != "pigeoncare_ro" ||
+		parsedLibpqRO.ConnConfig.Password != "ro_tls_secret" ||
+		parsedLibpqRO.ConnConfig.TLSConfig == nil ||
+		parsedLibpqRO.ConnConfig.TLSConfig.ServerName != "192.0.2.50" {
+		t.Fatalf("expected derived libpq RO DSN to retain verify-full TLS & pigeoncare_ro creds, got cfg=%+v (dsn=%q)", parsedLibpqRO.ConnConfig, gotLibpqTLS)
+	}
+	for _, wantParam := range []string{
+		"sslmode=verify-full",
+		"sslrootcert=" + strings.ReplaceAll(url.QueryEscape(caFile), "+", "%20"),
+		"sslcert=" + strings.ReplaceAll(url.QueryEscape(certFile), "+", "%20"),
+		"sslkey=" + strings.ReplaceAll(url.QueryEscape(keyFile), "+", "%20"),
+		"sslsni=1",
+	} {
+		if !strings.Contains(gotLibpqTLS, wantParam) {
+			t.Fatalf("deriveReadOnlyURL(%q) = %q, missing %q", libpqTLSDSN, gotLibpqTLS, wantParam)
+		}
+	}
+	if strings.Contains(gotLibpqTLS, "admin_secret") {
+		t.Fatalf("deriveReadOnlyURL leaked admin secret: %q", gotLibpqTLS)
+	}
+
+	// Non-existent sslrootcert in libpq DSN must still preserve sslmode=verify-full + sslrootcert when deriving RO URL.
+	missingCA := filepath.Join(dir, "missing-ca.pem")
+	libpqMissingCA := "host=192.0.2.50 port=5432 user=pigeoncoop_admin password=admin_secret dbname=edge_ledger sslmode=verify-full sslrootcert=" + missingCA
+	gotMissingCA := deriveReadOnlyURL(libpqMissingCA)
+	if !strings.Contains(gotMissingCA, "sslmode=verify-full") || !strings.Contains(gotMissingCA, "sslrootcert="+url.QueryEscape(missingCA)) {
+		t.Fatalf("expected deriveReadOnlyURL fallback to preserve sslmode=verify-full & sslrootcert, got %q", gotMissingCA)
+	}
+
+	// URI DSNs carrying ?user= / ?password= / ?passfile= query parameters must have those
+	// credential keys stripped during RO derivation while retaining TLS query parameters.
+	uriQueryCredDSN := "postgres://192.0.2.50:5432/edge_ledger?user=pigeoncoop_admin&password=admin_query_secret&passfile=/tmp/admin.pgpass&sslmode=verify-full&sslrootcert=" + strings.ReplaceAll(url.QueryEscape(caFile), "+", "%20")
+	gotURIQuery := deriveReadOnlyURL(uriQueryCredDSN)
+	if strings.Contains(gotURIQuery, "admin_query_secret") ||
+		strings.Contains(gotURIQuery, "pigeoncoop_admin") ||
+		strings.Contains(gotURIQuery, "passfile=") ||
+		strings.Contains(gotURIQuery, "password=") ||
+		strings.Contains(gotURIQuery, "user=") {
+		t.Fatalf("deriveReadOnlyURL leaked or retained credential query params: %q", gotURIQuery)
+	}
+	parsedURIRO, err := pgxpool.ParseConfig(gotURIQuery)
+	if err != nil {
+		t.Fatalf("pgxpool.ParseConfig(%q) failed: %v", gotURIQuery, err)
+	}
+	if parsedURIRO.ConnConfig.User != "pigeoncare_ro" ||
+		parsedURIRO.ConnConfig.Password != "ro_tls_secret" ||
+		parsedURIRO.ConnConfig.TLSConfig == nil {
+		t.Fatalf("expected URI RO DSN to use pigeoncare_ro and verify-full TLS, got %+v (dsn=%q)", parsedURIRO.ConnConfig, gotURIQuery)
+	}
+	t.Setenv("PIGEONCARE_RO_PASSWORD", "")
+}
+
+func TestApplyMeshProfileIsolation(t *testing.T) {
+	t.Setenv("PIGEONCARE_RO_PASSWORD", "")
+
+	base := DefaultWorkstationConfig()
+	base.Operator = "alice"
+	base.BrokerURL = "tls://192.0.2.1:8883"
+	base.MQTTUsername = "top-user"
+	base.MQTTPassword = "top-password"
+	base.TLSInsecureSkipVerify = true
+	base.MQTT = EdgeMQTTConfig{
+		Username:              "top-user",
+		Password:              "top-password",
+		TLSInsecureSkipVerify: true,
+	}
+	base.DatabaseURL = "postgres://top_admin:top_pw@192.0.2.1:5432/edge_ledger"
+	base.ReadOnlyDatabaseURL = "postgres://top_ro:top_ro_pw@192.0.2.1:5432/edge_ledger"
+
+	// 1. Overriding BrokerURL alone clears inherited MQTT creds, resets TLSInsecureSkipVerify=false,
+	//    and clears inherited DatabaseURL / ReadOnlyDatabaseURL while preserving operator/LLM/permissions.
+	brokerOnly := ApplyMeshProfile(base, "prod-broker", MeshProfileConfig{
+		BrokerURL: "tls://192.0.2.50:8883",
+	})
+	if brokerOnly.BrokerURL != "tls://192.0.2.50:8883" {
+		t.Fatalf("unexpected BrokerURL: %q", brokerOnly.BrokerURL)
+	}
+	if brokerOnly.MQTTUsername != "" || brokerOnly.MQTTPassword != "" ||
+		brokerOnly.MQTT.Username != "" || brokerOnly.MQTT.Password != "" {
+		t.Fatalf("expected inherited MQTT credentials cleared, got top=(%q,%q) section=(%q,%q)",
+			brokerOnly.MQTTUsername, brokerOnly.MQTTPassword, brokerOnly.MQTT.Username, brokerOnly.MQTT.Password)
+	}
+	if brokerOnly.TLSInsecureSkipVerify || brokerOnly.MQTT.TLSInsecureSkipVerify {
+		t.Fatalf("expected TLSInsecureSkipVerify reset to false, got top=%v section=%v",
+			brokerOnly.TLSInsecureSkipVerify, brokerOnly.MQTT.TLSInsecureSkipVerify)
+	}
+	if brokerOnly.EffectiveMQTTAuth().TLSInsecureSkipVerify || brokerOnly.EffectiveMQTTAuth().Username != "" {
+		t.Fatalf("expected EffectiveMQTTAuth isolated, got %+v", brokerOnly.EffectiveMQTTAuth())
+	}
+	if brokerOnly.DatabaseURL != "" || brokerOnly.ReadOnlyDatabaseURL != "" {
+		t.Fatalf("expected inherited DB URLs cleared, got db=%q ro=%q", brokerOnly.DatabaseURL, brokerOnly.ReadOnlyDatabaseURL)
+	}
+	if brokerOnly.Operator != "alice" || brokerOnly.LLM.Model == "" {
+		t.Fatalf("expected operator and LLM defaults preserved, got op=%q llm=%+v", brokerOnly.Operator, brokerOnly.LLM)
+	}
+
+	// 2. Overriding ReadOnlyDatabaseURL clears inherited DatabaseURL, MQTT creds, and TLSInsecureSkipVerify.
+	roOnly := ApplyMeshProfile(base, "ro-mesh", MeshProfileConfig{
+		ReadOnlyDatabaseURL: "postgres://ro:ro_pw@192.0.2.60:5432/edge_ledger",
+	})
+	if roOnly.DatabaseURL != "" || roOnly.ReadOnlyDatabaseURL != "postgres://ro:ro_pw@192.0.2.60:5432/edge_ledger" {
+		t.Fatalf("expected DatabaseURL cleared and ReadOnlyDatabaseURL applied, got db=%q ro=%q", roOnly.DatabaseURL, roOnly.ReadOnlyDatabaseURL)
+	}
+	if roOnly.MQTTUsername != "" || roOnly.MQTTPassword != "" || roOnly.TLSInsecureSkipVerify || roOnly.MQTT.TLSInsecureSkipVerify {
+		t.Fatalf("expected MQTT creds/TLS reset on DB override, got user=%q skip=%v", roOnly.MQTTUsername, roOnly.TLSInsecureSkipVerify)
+	}
+
+	// 3. Overriding DatabaseURL clears inherited RO URL, MQTT creds, and TLSInsecureSkipVerify.
+	dbOnly := ApplyMeshProfile(base, "db-mesh", MeshProfileConfig{
+		DatabaseURL: "postgres://admin:admin_pw@192.0.2.70:5432/edge_ledger",
+	})
+	if dbOnly.DatabaseURL != "postgres://admin:admin_pw@192.0.2.70:5432/edge_ledger" || dbOnly.ReadOnlyDatabaseURL != "" {
+		t.Fatalf("expected remote DatabaseURL applied and stale RO cleared, got db=%q ro=%q", dbOnly.DatabaseURL, dbOnly.ReadOnlyDatabaseURL)
+	}
+	if dbOnly.MQTTUsername != "" || dbOnly.MQTTPassword != "" || dbOnly.TLSInsecureSkipVerify {
+		t.Fatalf("expected MQTT creds/TLS reset on DatabaseURL override")
+	}
+
+	// 4. Profile with explicit own credentials & TLSInsecureSkipVerify retains its own values.
+	skipTrue := true
+	explicitProf := ApplyMeshProfile(base, "lab-tls", MeshProfileConfig{
+		BrokerURL:             "tls://192.0.2.80:8883",
+		MQTTUsername:          "lab-user",
+		MQTTPassword:          "lab-pw",
+		TLSInsecureSkipVerify: &skipTrue,
+	})
+	if explicitProf.MQTTUsername != "lab-user" || explicitProf.MQTTPassword != "lab-pw" ||
+		!explicitProf.TLSInsecureSkipVerify || !explicitProf.MQTT.TLSInsecureSkipVerify {
+		t.Fatalf("expected explicit profile creds/TLS preserved, got %+v", explicitProf.EffectiveMQTTAuth())
+	}
+
+	// 5. Profile that overrides neither BrokerURL nor DB URLs inherits top-level connection fields.
+	opOnly := ApplyMeshProfile(base, "op-only", MeshProfileConfig{Operator: "bob"})
+	if opOnly.Operator != "bob" || opOnly.MQTTUsername != "top-user" || opOnly.DatabaseURL != base.DatabaseURL || !opOnly.TLSInsecureSkipVerify {
+		t.Fatalf("expected non-endpoint profile to preserve inherited connection fields, got %+v", opOnly)
+	}
+}
+
+func TestCoopMQTTConfigMTLSFieldsAndEnvBindings(t *testing.T) {
+	dir := t.TempDir()
+	coopPath := filepath.Join(dir, "pigeoncoop.toml")
+	tomlContent := `
+mesh_name = "mtls-mesh"
+node_id = "coop-mtls-01"
+
+[mqtt]
+mode = "embedded"
+listen = "127.0.0.1:8883"
+tls_cert_file = "/etc/pigeons/server.crt"
+tls_key_file = "/etc/pigeons/server.key"
+tls_client_ca_file = "/etc/pigeons/client-ca.pem"
+tls_client_cert_file = "/etc/pigeons/self-client.crt"
+tls_client_key_file = "/etc/pigeons/self-client.key"
+require_client_cert = true
+`
+	if err := os.WriteFile(coopPath, []byte(tomlContent), 0o600); err != nil {
+		t.Fatalf("write pigeoncoop.toml: %v", err)
+	}
+
+	cfg, err := LoadCoopConfig(coopPath)
+	if err != nil {
+		t.Fatalf("LoadCoopConfig failed: %v", err)
+	}
+	if cfg.MQTT.TLSClientCAFile != "/etc/pigeons/client-ca.pem" ||
+		cfg.MQTT.TLSClientCertFile != "/etc/pigeons/self-client.crt" ||
+		cfg.MQTT.TLSClientKeyFile != "/etc/pigeons/self-client.key" ||
+		!cfg.MQTT.RequireClientCert {
+		t.Fatalf("unexpected decoded CoopMQTTConfig mTLS fields: %+v", cfg.MQTT)
+	}
+	if err := cfg.ValidateSecurity(); err != nil {
+		t.Fatalf("expected complete Coop mTLS config to pass ValidateSecurity, got %v", err)
+	}
+
+	// Partial/misconfigured mTLS must fail closed.
+	missingCA := cfg
+	missingCA.MQTT.TLSClientCAFile = ""
+	if err := missingCA.ValidateSecurity(); err == nil {
+		t.Fatal("expected require_client_cert=true without tls_client_ca_file to fail ValidateSecurity")
+	}
+	missingServerCert := cfg
+	missingServerCert.MQTT.TLSCertFile = ""
+	missingServerCert.MQTT.TLSKeyFile = ""
+	if err := missingServerCert.ValidateSecurity(); err == nil {
+		t.Fatal("expected require_client_cert=true without server tls_cert_file/tls_key_file to fail ValidateSecurity")
+	}
+	halfClientPair := cfg
+	halfClientPair.MQTT.TLSClientKeyFile = ""
+	if err := halfClientPair.ValidateSecurity(); err == nil {
+		t.Fatal("expected tls_client_cert_file without tls_client_key_file to fail ValidateSecurity")
+	}
+
+	// Verify env bindings (both PIGEONCOOP_* and custom brand prefix).
+	t.Setenv("PIGEONCOOP_MQTT_TLS_CLIENT_CA", "/tmp/env-client-ca.pem")
+	t.Setenv("PIGEONCOOP_MQTT_TLS_CLIENT_CERT", "/tmp/env-client.crt")
+	t.Setenv("PIGEONCOOP_MQTT_TLS_CLIENT_KEY", "/tmp/env-client.key")
+	t.Setenv("PIGEONCOOP_MQTT_REQUIRE_CLIENT_CERT", "false")
+
+	envCfg, err := LoadCoopConfig(coopPath)
+	if err != nil {
+		t.Fatalf("LoadCoopConfig with env failed: %v", err)
+	}
+	if envCfg.MQTT.TLSClientCAFile != "/tmp/env-client-ca.pem" ||
+		envCfg.MQTT.TLSClientCertFile != "/tmp/env-client.crt" ||
+		envCfg.MQTT.TLSClientKeyFile != "/tmp/env-client.key" ||
+		envCfg.MQTT.RequireClientCert {
+		t.Fatalf("unexpected env-overridden CoopMQTTConfig mTLS fields: %+v", envCfg.MQTT)
+	}
+
+	brandPath := filepath.Join(dir, "branded-coop.toml")
+	if err := os.WriteFile(brandPath, []byte("[brand]\nenv_prefix = \"ORBIT\"\n"), 0o600); err != nil {
+		t.Fatalf("write branded-coop.toml: %v", err)
+	}
+	t.Setenv("ORBIT_MQTT_TLS_CLIENT_CA", "/tmp/orbit-ca.pem")
+	t.Setenv("ORBIT_MQTT_TLS_CLIENT_CERT", "/tmp/orbit-client.crt")
+	t.Setenv("ORBIT_MQTT_TLS_CLIENT_KEY", "/tmp/orbit-client.key")
+	t.Setenv("ORBIT_MQTT_REQUIRE_CLIENT_CERT", "true")
+
+	brandCfg, err := LoadCoopConfig(brandPath)
+	if err != nil {
+		t.Fatalf("LoadCoopConfig branded env failed: %v", err)
+	}
+	if brandCfg.MQTT.TLSClientCAFile != "/tmp/orbit-ca.pem" ||
+		brandCfg.MQTT.TLSClientCertFile != "/tmp/orbit-client.crt" ||
+		brandCfg.MQTT.TLSClientKeyFile != "/tmp/orbit-client.key" ||
+		!brandCfg.MQTT.RequireClientCert {
+		t.Fatalf("unexpected branded env CoopMQTTConfig mTLS fields: %+v", brandCfg.MQTT)
+	}
+}
+
+func TestBrandMathSchemaValidationInLoaders(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(dir, "current_mesh"))
+
+	invalidSchemas := []string{
+		"bad-schema",
+		"123leading_digit",
+		"pigeonmath; DROP SCHEMA public",
+		"pigeon math",
+		" pigeonmath",
+		strings.Repeat("a", 64),
+	}
+	for _, bad := range invalidSchemas {
+		coopPath := filepath.Join(dir, "bad-coop-schema.toml")
+		if err := os.WriteFile(coopPath, []byte("[brand]\nmath_schema = \""+bad+"\"\n"), 0o600); err != nil {
+			t.Fatalf("write bad-coop-schema.toml: %v", err)
+		}
+		if _, err := LoadCoopConfig(coopPath); err == nil {
+			t.Fatalf("expected LoadCoopConfig to reject invalid math_schema %q", bad)
+		}
+
+		edgePath := filepath.Join(dir, "bad-edge-schema.toml")
+		if err := os.WriteFile(edgePath, []byte("node_id = \"rv64-edge-01\"\n[brand]\nmath_schema = \""+bad+"\"\n"), 0o600); err != nil {
+			t.Fatalf("write bad-edge-schema.toml: %v", err)
+		}
+		if _, err := LoadEdgeConfig(edgePath); err == nil {
+			t.Fatalf("expected LoadEdgeConfig to reject invalid math_schema %q", bad)
+		}
+
+		wsPath := filepath.Join(dir, "bad-ws-schema.toml")
+		if err := os.WriteFile(wsPath, []byte("[brand]\nmath_schema = \""+bad+"\"\n"), 0o600); err != nil {
+			t.Fatalf("write bad-ws-schema.toml: %v", err)
+		}
+		if _, err := LoadWorkstationConfig(wsPath); err == nil {
+			t.Fatalf("expected LoadWorkstationConfig to reject invalid math_schema %q", bad)
+		}
+
+		meshWSPath := filepath.Join(dir, "bad-mesh-ws-schema.toml")
+		if err := os.WriteFile(meshWSPath, []byte("[meshes.lab.brand]\nmath_schema = \""+bad+"\"\n"), 0o600); err != nil {
+			t.Fatalf("write bad-mesh-ws-schema.toml: %v", err)
+		}
+		if _, err := LoadBaseWorkstationConfig(meshWSPath); err == nil {
+			t.Fatalf("expected LoadBaseWorkstationConfig to reject invalid mesh math_schema %q", bad)
+		}
+
+		coopStruct := DefaultCoopConfig()
+		coopStruct.Brand.MathSchema = bad
+		if err := coopStruct.ValidateSecurity(); err == nil {
+			t.Fatalf("expected CoopConfig.ValidateSecurity to reject invalid math_schema %q", bad)
+		}
+
+		wsStruct := DefaultWorkstationConfig()
+		wsStruct.Brand.MathSchema = bad
+		if _, err := FinalizeWorkstationConfig(wsStruct); err == nil {
+			t.Fatalf("expected FinalizeWorkstationConfig to reject invalid math_schema %q", bad)
+		}
+	}
+
+	// Valid schemas (including 63-char max and leading underscore) must succeed.
+	for _, good := range []string{"pigeonmath", "_analytics_v2", strings.Repeat("a", 63)} {
+		wsPath := filepath.Join(dir, "good-ws-schema.toml")
+		if err := os.WriteFile(wsPath, []byte("[brand]\nmath_schema = \""+good+"\"\n"), 0o600); err != nil {
+			t.Fatalf("write good-ws-schema.toml: %v", err)
+		}
+		cfg, err := LoadWorkstationConfig(wsPath)
+		if err != nil {
+			t.Fatalf("expected LoadWorkstationConfig to accept valid math_schema %q, got %v", good, err)
+		}
+		if cfg.Brand.MathSchema != good {
+			t.Fatalf("expected MathSchema %q, got %q", good, cfg.Brand.MathSchema)
+		}
+	}
+}
+
+func TestWriteAtomicFile0600FsyncDurability(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "state")
+	target := filepath.Join(dir, "current_mesh")
+
+	if err := writeAtomicFile0600(target, []byte("mesh-one\n")); err != nil {
+		t.Fatalf("initial writeAtomicFile0600 failed: %v", err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected file mode 0600, got %o", info.Mode().Perm())
+	}
+
+	// Verify tmp.Sync() runs BEFORE os.Rename() and syncDir() runs AFTER os.Rename().
+	origSyncFile := syncFile
+	origSyncDir := syncDir
+	t.Cleanup(func() {
+		syncFile = origSyncFile
+		syncDir = origSyncDir
+	})
+
+	var order []string
+	syncFile = func(f *os.File) error {
+		order = append(order, "syncFile")
+		cur, readErr := os.ReadFile(target)
+		if readErr != nil || string(cur) != "mesh-one\n" {
+			t.Fatalf("expected old content before rename during syncFile, got %q (err=%v)", string(cur), readErr)
+		}
+		return origSyncFile(f)
+	}
+	syncDir = func(d string) error {
+		order = append(order, "syncDir")
+		if d != dir {
+			t.Fatalf("expected syncDir(%q), got %q", dir, d)
+		}
+		cur, readErr := os.ReadFile(target)
+		if readErr != nil || string(cur) != "mesh-two\n" {
+			t.Fatalf("expected committed content after rename during syncDir, got %q (err=%v)", string(cur), readErr)
+		}
+		return origSyncDir(d)
+	}
+
+	if err := writeAtomicFile0600(target, []byte("mesh-two\n")); err != nil {
+		t.Fatalf("second writeAtomicFile0600 failed: %v", err)
+	}
+	if len(order) != 2 || order[0] != "syncFile" || order[1] != "syncDir" {
+		t.Fatalf("unexpected sync call sequence: %v", order)
+	}
+
+	// Verify syncFile failure aborts commit, preserves prior target, and leaves no temp file.
+	syncFile = func(_ *os.File) error {
+		return errors.New("simulated disk sync error")
+	}
+	if err := writeAtomicFile0600(target, []byte("mesh-three\n")); err == nil {
+		t.Fatal("expected writeAtomicFile0600 to fail when syncFile fails")
+	}
+	cur, err := os.ReadFile(target)
+	if err != nil || string(cur) != "mesh-two\n" {
+		t.Fatalf("expected prior target preserved on sync failure, got %q (err=%v)", string(cur), err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", dir, err)
+	}
+	for _, ent := range entries {
+		if strings.Contains(ent.Name(), ".tmp-") {
+			t.Fatalf("unexpected leftover temp file %q after failed writeAtomicFile0600", ent.Name())
+		}
+	}
+
+	// Verify ignorable vs non-ignorable directory sync error classification.
+	if !isIgnorableDirSyncErr(errors.ErrUnsupported) || !isIgnorableDirSyncErr(syscall.EINVAL) {
+		t.Fatal("expected ErrUnsupported and EINVAL to be ignorable dir sync errors")
+	}
+	if isIgnorableDirSyncErr(syscall.EIO) {
+		t.Fatal("expected EIO NOT to be ignored during dir sync")
 	}
 }
