@@ -24,14 +24,25 @@ import (
 const (
 	maxCapturedStreamBytes  = 16 * 1024
 	maxEphemeralScriptBytes = 256 * 1024
-	sandboxPATH             = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	posixSandboxPATH        = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	defaultWindowsSystemDir = `C:\Windows`
+	defaultWindowsProgFiles = `C:\Program Files`
+	defaultWindowsProgX86   = `C:\Program Files (x86)`
+	defaultWindowsPATHEXT   = ".EXE;.COM;.BAT;.CMD"
 )
 
 var safeEnvKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 var blockedEnvKeys = map[string]struct{}{
 	"PATH":               {},
+	"PATHEXT":            {},
 	"HOME":               {},
+	"USERPROFILE":        {},
+	"APPDATA":            {},
+	"LOCALAPPDATA":       {},
+	"SYSTEMROOT":         {},
+	"WINDIR":             {},
+	"COMSPEC":            {},
 	"TMPDIR":             {},
 	"TMP":                {},
 	"TEMP":               {},
@@ -137,21 +148,208 @@ func normalizeAllowedInterpreters(raw []string) []string {
 	return out
 }
 
-func resolveSandboxInterpreter(interp string) (string, error) {
-	if interp == "" || interp == "." || interp == ".." || strings.ContainsAny(interp, `/\`) {
-		return "", fmt.Errorf("invalid interpreter name %q", interp)
+func isWindowsAbsPath(p string) bool {
+	if len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
+		return true
 	}
-	for _, dir := range strings.Split(sandboxPATH, ":") {
-		candidate := filepath.Join(dir, interp)
-		if runtime.GOOS == "windows" {
-			for _, winPath := range []string{candidate, candidate + ".exe"} {
-				if info, err := os.Stat(winPath); err == nil && !info.IsDir() {
-					return winPath, nil
+	if len(p) >= 3 && (p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/') && p[2] != '\\' && p[2] != '/' {
+		return true
+	}
+	return false
+}
+
+func normalizeWindowsDir(p string) string {
+	trimmed := strings.Trim(strings.TrimSpace(p), `"`)
+	if !isWindowsAbsPath(trimmed) {
+		return ""
+	}
+	norm := strings.ReplaceAll(trimmed, "/", `\`)
+	for len(norm) > 3 && strings.HasSuffix(norm, `\`) {
+		norm = strings.TrimSuffix(norm, `\`)
+	}
+	return norm
+}
+
+func windowsJoin(dir, leaf string) string {
+	normDir := strings.TrimRight(strings.ReplaceAll(dir, "/", `\`), `\`)
+	if len(normDir) == 2 && normDir[1] == ':' {
+		return normDir + `\` + leaf
+	}
+	return normDir + `\` + leaf
+}
+
+func windowsSystemRoot(getenv func(string) string) string {
+	if getenv != nil {
+		for _, key := range []string{"SystemRoot", "SYSTEMROOT", "WINDIR", "windir"} {
+			if dir := normalizeWindowsDir(getenv(key)); dir != "" {
+				return dir
+			}
+		}
+	}
+	return defaultWindowsSystemDir
+}
+
+func sandboxPathForOS(goos string, getenv func(string) string) string {
+	if goos != "windows" {
+		return posixSandboxPATH
+	}
+
+	sysRoot := windowsSystemRoot(getenv)
+	progFiles := defaultWindowsProgFiles
+	progX86 := defaultWindowsProgX86
+	if getenv != nil {
+		if v := normalizeWindowsDir(getenv("ProgramFiles")); v != "" {
+			progFiles = v
+		}
+		if v := normalizeWindowsDir(getenv("ProgramFiles(x86)")); v != "" {
+			progX86 = v
+		}
+	}
+
+	candidates := []string{
+		windowsJoin(sysRoot, "System32"),
+		sysRoot,
+		windowsJoin(sysRoot, `System32\Wbem`),
+		windowsJoin(sysRoot, `System32\WindowsPowerShell\v1.0`),
+		windowsJoin(progFiles, `PowerShell\7`),
+		windowsJoin(progFiles, `Git\usr\bin`),
+		windowsJoin(progFiles, `Git\bin`),
+	}
+	for _, pyVer := range []string{"Python314", "Python313", "Python312", "Python311", "Python310"} {
+		candidates = append(candidates, windowsJoin(progFiles, pyVer))
+	}
+	if runtime.GOOS == "windows" {
+		if matches, err := filepath.Glob(filepath.Join(progFiles, "Python3*")); err == nil && len(matches) > 0 {
+			slices.Sort(matches)
+			slices.Reverse(matches)
+			for _, m := range matches {
+				if norm := normalizeWindowsDir(m); norm != "" {
+					candidates = append(candidates, norm)
 				}
 			}
+		}
+	}
+	candidates = append(candidates,
+		windowsJoin(progX86, `Git\usr\bin`),
+		windowsJoin(progX86, `Git\bin`),
+	)
+
+	seen := make(map[string]struct{}, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, dir := range candidates {
+		norm := normalizeWindowsDir(dir)
+		if norm == "" {
 			continue
 		}
-		info, err := os.Stat(candidate)
+		lower := strings.ToLower(norm)
+		if _, exists := seen[lower]; !exists {
+			seen[lower] = struct{}{}
+			out = append(out, norm)
+		}
+	}
+	return strings.Join(out, ";")
+}
+
+func splitSandboxPathList(goos, pathList string) []string {
+	if goos == "windows" {
+		parts := strings.Split(pathList, ";")
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if norm := normalizeWindowsDir(part); norm != "" {
+				out = append(out, norm)
+			}
+		}
+		return out
+	}
+
+	parts := strings.Split(pathList, ":")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" || !strings.HasPrefix(trimmed, "/") {
+			continue
+		}
+		out = append(out, filepath.Clean(trimmed))
+	}
+	return out
+}
+
+func parseWindowsPATHEXT(pathext string) []string {
+	raw := strings.TrimSpace(pathext)
+	if raw == "" {
+		raw = defaultWindowsPATHEXT
+	}
+	parts := strings.Split(raw, ";")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		ext := strings.ToLower(strings.TrimSpace(p))
+		if ext == "" || !strings.HasPrefix(ext, ".") || strings.ContainsAny(ext, `/\:`) {
+			continue
+		}
+		if _, ok := seen[ext]; !ok {
+			seen[ext] = struct{}{}
+			out = append(out, ext)
+		}
+	}
+	if len(out) == 0 {
+		return []string{".exe", ".com", ".bat", ".cmd"}
+	}
+	return out
+}
+
+func windowsBaseName(p string) string {
+	idx := strings.LastIndexAny(p, `/\`)
+	if idx < 0 {
+		return p
+	}
+	return p[idx+1:]
+}
+
+func resolveSandboxInterpreterWithStat(
+	goos string,
+	pathList string,
+	pathext string,
+	interp string,
+	statFn func(string) (os.FileInfo, error),
+) (string, error) {
+	if interp == "" || interp == "." || interp == ".." || strings.ContainsAny(interp, `/\:`) || strings.ContainsRune(interp, 0) {
+		return "", fmt.Errorf("invalid interpreter name %q", interp)
+	}
+	if statFn == nil {
+		statFn = os.Stat
+	}
+
+	dirs := splitSandboxPathList(goos, pathList)
+	if goos == "windows" {
+		exts := parseWindowsPATHEXT(pathext)
+		hasExt := strings.Contains(interp, ".")
+		for _, dir := range dirs {
+			var names []string
+			if hasExt {
+				names = []string{interp}
+			} else {
+				names = make([]string, 0, len(exts)+1)
+				for _, ext := range exts {
+					names = append(names, interp+ext)
+				}
+				if strings.EqualFold(interp, "python3") && strings.HasPrefix(strings.ToLower(windowsBaseName(dir)), "python3") {
+					names = append(names, "python.exe")
+				}
+			}
+			for _, name := range names {
+				candidate := windowsJoin(dir, name)
+				if info, err := statFn(candidate); err == nil && !info.IsDir() {
+					return candidate, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("executable file not found in fixed sandbox PATH (%s)", pathList)
+	}
+
+	for _, dir := range dirs {
+		candidate := filepath.Join(dir, interp)
+		info, err := statFn(candidate)
 		if err != nil || info.IsDir() {
 			continue
 		}
@@ -159,7 +357,12 @@ func resolveSandboxInterpreter(interp string) (string, error) {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("executable file not found in fixed sandbox PATH (%s)", sandboxPATH)
+	return "", fmt.Errorf("executable file not found in fixed sandbox PATH (%s)", pathList)
+}
+
+func resolveSandboxInterpreter(interp string) (string, error) {
+	sandboxPath := sandboxPathForOS(runtime.GOOS, os.Getenv)
+	return resolveSandboxInterpreterWithStat(runtime.GOOS, sandboxPath, os.Getenv("PATHEXT"), interp, os.Stat)
 }
 
 func interpreterArgs(interp, scriptPath string) []string {
@@ -492,14 +695,25 @@ func (e *EphemeralRunner) Run(ctx context.Context, nodeID string, params map[str
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
+	sandboxPath := sandboxPathForOS(runtime.GOOS, os.Getenv)
 	cmd := exec.Command(interpBin, interpreterArgs(interp, scriptPath)...)
 	cmd.Dir = workDir
-	cmdEnv := make([]string, 0, 4+len(customEnv))
+	cmdEnv := make([]string, 0, 9+len(customEnv))
 	cmdEnv = append(cmdEnv,
-		"PATH="+sandboxPATH,
+		"PATH="+sandboxPath,
 		"HOME="+workDir,
 		"TMPDIR="+workDir,
 	)
+	if runtime.GOOS == "windows" {
+		sysRoot := windowsSystemRoot(os.Getenv)
+		cmdEnv = append(cmdEnv,
+			"SYSTEMROOT="+sysRoot,
+			"WINDIR="+sysRoot,
+			"USERPROFILE="+workDir,
+			"TMP="+workDir,
+			"TEMP="+workDir,
+		)
+	}
 	cmdEnv = append(cmdEnv, customEnv...)
 	cmdEnv = append(cmdEnv, "PIGEONS_NODE_ID="+nodeID)
 	cmd.Env = cmdEnv

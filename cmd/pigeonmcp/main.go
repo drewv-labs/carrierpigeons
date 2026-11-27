@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/BurntSushi/toml"
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
@@ -19,13 +20,22 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := runWithContext(ctx, os.Args[1:]); err != nil {
 		log.Fatalf("%v", err)
 	}
 }
 
 func run(args []string) error {
-	fs := flag.NewFlagSet("pigeonmcp", flag.ExitOnError)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runWithContext(ctx, args)
+}
+
+func runWithContext(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("pigeonmcp", flag.ContinueOnError)
 	var (
 		cfgPath            = fs.String("config", "", "Optional path to pigeons.toml")
 		meshFlag           = fs.String("mesh", "", "Select named mesh profile from pigeons.toml (overrides PIGEONS_MESH and current_mesh)")
@@ -44,7 +54,7 @@ func run(args []string) error {
 
 	wsCfg, err := config.LoadWorkstationConfigForMesh(*cfgPath, *meshFlag)
 	if err != nil {
-		return fmt.Errorf("failed loading config: %w", err)
+		return fmt.Errorf("failed loading config: %w", jsonutil.RedactError(err))
 	}
 	brand.SetActive(wsCfg.Brand)
 
@@ -77,8 +87,9 @@ func run(args []string) error {
 		return fmt.Errorf("%s configuration error: both --tls-cert and --tls-key must be provided together", wsCfg.Brand.MCPName)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	store, err := db.NewReadOnlyAgentStore(ctx, dsn, strings.ToLower(wsCfg.Brand.MCPName), db.ReadOnlyOptions{
 		AllowSuperuser: wsCfg.AllowSuperuserReadOnly,
@@ -87,7 +98,7 @@ func run(args []string) error {
 		EnvPrefix:      wsCfg.Brand.EnvPrefix,
 	})
 	if err != nil {
-		return fmt.Errorf("%s failed connecting to read-only ledger: %w", wsCfg.Brand.MCPName, err)
+		return fmt.Errorf("%s failed connecting to read-only ledger: %w", wsCfg.Brand.MCPName, jsonutil.RedactError(err, dsn))
 	}
 	defer store.Close()
 
@@ -121,7 +132,7 @@ func run(args []string) error {
 		return nil
 	}
 
-	if err := mcpserver.ServeStdio(srv); err != nil {
+	if err := mcpserver.ServeStdioContext(ctx, srv); err != nil {
 		return fmt.Errorf("%s stdio server error: %w", wsCfg.Brand.MCPName, err)
 	}
 	return nil

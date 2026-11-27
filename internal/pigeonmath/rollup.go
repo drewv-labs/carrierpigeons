@@ -40,16 +40,42 @@ func asInt(v any) int {
 		return int(n)
 	case int64:
 		return int(n)
+	case float32:
+		f := float64(n)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0
+		}
+		return int(f)
 	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return 0
+		}
 		return int(n)
 	default:
 		return 0
 	}
 }
 
+const dashboardRollupQuery = `
+	SELECT
+		date_trunc('minute', event_timestamp, 'UTC') AS bucket,
+		COUNT(DISTINCT node_id)::bigint AS live_nodes,
+		COUNT(*) FILTER (WHERE pillar = 'observer')::bigint AS observer_events,
+		COUNT(*) FILTER (WHERE pillar = 'runner')::bigint AS runner_events,
+		COUNT(*) FILTER (WHERE pillar = 'tracer')::bigint AS tracer_events,
+		COUNT(*)::bigint AS total_events
+	FROM telemetric_ledger
+	WHERE event_timestamp >= $1 AND event_timestamp < $2
+	GROUP BY 1
+	ORDER BY 1 DESC
+`
+
 // FetchDashboardSnapshot computes 1-minute time-series buckets for `#nodes` (`total`, `live`, `quiet`)
 // and `#CTD/min` (`observer`, `runner`, `tracer`, `total`) strictly via Read-Only ledger queries.
 func (e *Engine) FetchDashboardSnapshot(ctx context.Context, windowMinutes int) (*DashboardSnapshot, error) {
+	if e == nil || e.store == nil {
+		return nil, fmt.Errorf("pigeonmath store is not connected")
+	}
 	if windowMinutes <= 0 {
 		windowMinutes = 30
 	}
@@ -59,6 +85,7 @@ func (e *Engine) FetchDashboardSnapshot(ctx context.Context, windowMinutes int) 
 
 	now := time.Now().UTC().Truncate(time.Minute)
 	start := now.Add(-time.Duration(windowMinutes-1) * time.Minute)
+	end := now.Add(time.Minute)
 
 	cluster, err := e.store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
 	if err != nil {
@@ -66,21 +93,7 @@ func (e *Engine) FetchDashboardSnapshot(ctx context.Context, windowMinutes int) 
 	}
 	totalKnownNodes := len(cluster)
 
-	query := fmt.Sprintf(`
-		SELECT
-			date_trunc('minute', event_timestamp) AS bucket,
-			COUNT(DISTINCT node_id)::bigint AS live_nodes,
-			COUNT(*) FILTER (WHERE pillar = 'observer')::bigint AS observer_events,
-			COUNT(*) FILTER (WHERE pillar = 'runner')::bigint AS runner_events,
-			COUNT(*) FILTER (WHERE pillar = 'tracer')::bigint AS tracer_events,
-			COUNT(*)::bigint AS total_events
-		FROM telemetric_ledger
-		WHERE event_timestamp >= NOW() - INTERVAL '%d minutes'
-		GROUP BY 1
-		ORDER BY 1 ASC
-	`, windowMinutes)
-
-	rows, err := e.store.QueryReadOnlyMaps(ctx, query)
+	rows, err := e.store.QueryReadOnlyMaps(ctx, dashboardRollupQuery, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +134,10 @@ func (e *Engine) FetchDashboardSnapshot(ctx context.Context, windowMinutes int) 
 		}
 	}
 
-	views, _ := e.store.ListPMVs(ctx)
+	views, err := e.store.ListPMVs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list pigeonmath views: %w", err)
+	}
 
 	return &DashboardSnapshot{
 		CapturedAt:    time.Now().UTC(),
@@ -142,13 +158,16 @@ func Sparkline(values []float64, width int) string {
 	resampled := resampleSeries(values, width)
 	maxVal := 0.0
 	for _, v := range resampled {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
 		if v > maxVal {
 			maxVal = v
 		}
 	}
 	var sb strings.Builder
 	for _, v := range resampled {
-		if maxVal <= 0 || v <= 0 {
+		if math.IsNaN(v) || math.IsInf(v, 0) || maxVal <= 0 || v <= 0 {
 			sb.WriteRune('·')
 			continue
 		}
@@ -172,6 +191,9 @@ func RenderMultiLineGraph(values []float64, width, height int, unit string) stri
 
 	maxVal := 0.0
 	for _, v := range series {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
 		if v > maxVal {
 			maxVal = v
 		}
@@ -188,6 +210,14 @@ func RenderMultiLineGraph(values []float64, width, height int, unit string) stri
 
 		var rowBuf strings.Builder
 		for _, v := range series {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				if row == height-1 {
+					rowBuf.WriteRune('·')
+				} else {
+					rowBuf.WriteRune(' ')
+				}
+				continue
+			}
 			norm := v / ceilVal
 			switch {
 			case v <= 0 && row == height-1:

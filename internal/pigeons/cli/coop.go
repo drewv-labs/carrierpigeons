@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -17,7 +18,7 @@ import (
 
 var coopCmd = &cobra.Command{
 	Use:   "coop",
-	Short: "Manage PigeonCoop, schema migrations, RBAC roles, and ledger attribution activity",
+	Short: "Manage PigeonCoop, schema migrations, RBAC roles, retention pruning, and ledger attribution activity",
 }
 
 var coopStatusCmd = &cobra.Command{
@@ -44,7 +45,7 @@ var coopStatusCmd = &cobra.Command{
 		fmt.Fprintf(out, "[Workstation]  mesh=%s (source=%s)\n", activeMesh, activeSource)
 
 		brokerURL := resolveBrokerURLForConfig(cfg)
-		clientID := fmt.Sprintf("%s-coop-probe-%d", cfg.Brand.CLIName, os.Getpid())
+		clientID := fmt.Sprintf("%s-coop-probe-%d-%d", cfg.Brand.CLIName, os.Getpid(), time.Now().UnixNano())
 		if mClient, err := dialMQTTClientWithConfig(ctx, cfg, brokerURL, clientID, 3*time.Second); err != nil {
 			fmt.Fprintf(out, "[MQTT Broker]  DEGRADED (%v)\n", err)
 		} else {
@@ -209,14 +210,117 @@ var coopActivityCmd = &cobra.Command{
 	},
 }
 
+type ledgerPruner interface {
+	PruneLedgerBefore(ctx context.Context, cutoff time.Time, batchLimit int) (int64, error)
+}
+
+func parseRetentionDuration(raw string) (time.Duration, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, fmt.Errorf("missing required --older-than duration (e.g. 720h or 30d)")
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasSuffix(lower, "d") && len(lower) > 1 {
+		daysStr := strings.TrimSpace(lower[:len(lower)-1])
+		days, err := strconv.ParseInt(daysStr, 10, 64)
+		if err != nil || days <= 0 || days > 36500 {
+			return 0, fmt.Errorf("invalid --older-than duration %q: expected positive Go duration (e.g. 720h) or whole days (e.g. 30d)", raw)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid --older-than duration %q: expected positive duration (e.g. 24h, 720h, 30d)", raw)
+	}
+	return d, nil
+}
+
+func runCoopPruneWithStore(ctx context.Context, out io.Writer, store ledgerPruner, now time.Time, olderThan time.Duration, batchLimit int) (int64, error) {
+	if olderThan <= 0 {
+		return 0, fmt.Errorf("invalid --older-than duration %s: must be > 0", olderThan)
+	}
+	if batchLimit < 0 {
+		return 0, fmt.Errorf("invalid --batch-size %d: must be >= 0", batchLimit)
+	}
+	effectiveBatch := batchLimit
+	if effectiveBatch == 0 {
+		effectiveBatch = db.DefaultLedgerPruneBatchLimit
+	}
+	cutoff := now.UTC().Add(-olderThan)
+
+	var totalDeleted int64
+	batches := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+		deleted, err := store.PruneLedgerBefore(ctx, cutoff, effectiveBatch)
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += deleted
+		if deleted > 0 {
+			batches++
+		}
+		if deleted < int64(effectiveBatch) || deleted == 0 {
+			break
+		}
+	}
+
+	fmt.Fprintf(out, "[+] Pruned %d telemetric_ledger row(s) older than %s (cutoff=%s, batches=%d, batch_size=%d).\n",
+		totalDeleted, olderThan, cutoff.Format(time.RFC3339), batches, effectiveBatch)
+	return totalDeleted, nil
+}
+
+var coopPruneCmd = &cobra.Command{
+	Use:   "prune",
+	Short: "Prune telemetric_ledger rows older than a retention duration in bounded batches",
+	Example: `  pigeons coop prune --older-than 720h
+  pigeons coop prune --older-than 30d --batch-size 5000`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		f := cmd.Flags()
+		rawOlderThan, _ := f.GetString("older-than")
+		batchSize, _ := f.GetInt("batch-size")
+
+		olderThan, err := parseRetentionDuration(rawOlderThan)
+		if err != nil {
+			return err
+		}
+		if batchSize < 0 {
+			return fmt.Errorf("invalid --batch-size %d: must be >= 0", batchSize)
+		}
+
+		parentCtx := cmd.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 5*time.Minute)
+		defer cancel()
+
+		state := cliStateFromCommand(cmd)
+		store, err := openOperatorStoreForConfig(ctx, state.wsCfg)
+		if err != nil {
+			return fmt.Errorf("could not connect to operator ledger: %w", err)
+		}
+		defer store.Close()
+
+		_, err = runCoopPruneWithStore(ctx, cmd.OutOrStdout(), store, time.Now().UTC(), olderThan, batchSize)
+		return err
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(coopCmd)
 	coopCmd.AddCommand(coopStatusCmd)
 	coopCmd.AddCommand(coopMigrateCmd)
 	coopCmd.AddCommand(coopProvisionRolesCmd)
 	coopCmd.AddCommand(coopActivityCmd)
+	coopCmd.AddCommand(coopPruneCmd)
 
 	coopActivityCmd.Flags().IntP("limit", "n", 25, "Maximum attribution rows to display")
 	coopProvisionRolesCmd.Flags().String("ingest-password", "", "Password for ctd_ingestor role")
 	coopProvisionRolesCmd.Flags().String("readonly-password", "", "Password for pigeoncare_ro role")
+	coopPruneCmd.Flags().String("older-than", "", "Delete telemetric_ledger rows older than this duration (e.g. 24h, 720h, 30d)")
+	coopPruneCmd.Flags().Int("batch-size", db.DefaultLedgerPruneBatchLimit, "Maximum rows deleted per transaction batch")
 }

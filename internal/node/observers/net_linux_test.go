@@ -23,6 +23,14 @@ func TestLinuxProcNetDevSanitizationAndMetricOmission(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// eth0:0: alias interface containing a colon; must split on LastIndexByte(':') without corrupting eth0 counters.
+	if err := os.MkdirAll(filepath.Join(sysNet, "eth0:0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysNet, "eth0:0", "operstate"), []byte("up\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	// eth0.10: unknown operstate (valid VLAN interface, treated as active), corrupt rx_packets ("bad") -> omit rx_packets
 	if err := os.MkdirAll(filepath.Join(sysNet, "eth0.10"), 0o755); err != nil {
 		t.Fatal(err)
@@ -50,6 +58,7 @@ func TestLinuxProcNetDevSanitizationAndMetricOmission(t *testing.T) {
 		" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed",
 		"    lo: 1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0",
 		"  eth0: 2048 16 0 0 0 0 0 0 4096 32 0 0 0 0 0 0",
+		"eth0:0: 300 3 0 0 0 0 0 0 600 6 0 0 0 0 0 0",
 		"eth0.10: 512 bad 0 0 0 0 0 0 1024 8 0 0 0 0 0 0",
 		"ethdown: 999 9 0 0 0 0 0 0 999 9 0 0 0 0 0 0",
 		"eth+0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0",
@@ -68,8 +77,8 @@ func TestLinuxProcNetDevSanitizationAndMetricOmission(t *testing.T) {
 	emitProcNetDevSamplesFrom(procNetDev, sysNet, pub, "linux-node", false)
 
 	events := pub.snapshot()
-	if len(events) != 2 {
-		t.Fatalf("expected exactly 2 valid events (eth0 and eth0.10), got %d: %+v", len(events), events)
+	if len(events) != 3 {
+		t.Fatalf("expected exactly 3 valid events (eth0, eth0:0, eth0.10), got %d: %+v", len(events), events)
 	}
 
 	for _, ev := range events {
@@ -81,13 +90,16 @@ func TestLinuxProcNetDevSanitizationAndMetricOmission(t *testing.T) {
 	if events[0].Component != "net-eth0" {
 		t.Fatalf("expected first event net-eth0, got %q", events[0].Component)
 	}
-	if events[1].Component != "net-eth0.10" {
-		t.Fatalf("expected second event net-eth0.10, got %q", events[1].Component)
+	if events[1].Component != "net-eth0:0" || events[1].Metrics["rx_bytes"] != 300.0 || events[1].Metrics["tx_bytes"] != 600.0 {
+		t.Fatalf("expected second event net-eth0:0 with rx=300 tx=600, got %q %+v", events[1].Component, events[1].Metrics)
 	}
-	if _, hasRxPkts := events[1].Metrics["rx_packets"]; hasRxPkts {
-		t.Fatalf("expected unparseable rx_packets on eth0.10 to be omitted, got %v", events[1].Metrics["rx_packets"])
+	if events[2].Component != "net-eth0.10" {
+		t.Fatalf("expected third event net-eth0.10, got %q", events[2].Component)
 	}
-	if events[1].Metrics["rx_bytes"] != 512.0 || events[1].Metrics["tx_bytes"] != 1024.0 || events[1].Metrics["tx_packets"] != 8.0 {
-		t.Fatalf("unexpected metrics on eth0.10: %+v", events[1].Metrics)
+	if _, hasRxPkts := events[2].Metrics["rx_packets"]; hasRxPkts {
+		t.Fatalf("expected unparseable rx_packets on eth0.10 to be omitted, got %v", events[2].Metrics["rx_packets"])
+	}
+	if events[2].Metrics["rx_bytes"] != 512.0 || events[2].Metrics["tx_bytes"] != 1024.0 || events[2].Metrics["tx_packets"] != 8.0 {
+		t.Fatalf("unexpected metrics on eth0.10: %+v", events[2].Metrics)
 	}
 }

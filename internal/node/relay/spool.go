@@ -12,8 +12,17 @@ const (
 	DefaultMaxSpoolBytes = 16 << 20 // 16 MiB bound for memory-constrained SBCs
 )
 
+// SpoolItem carries a pre-marshaled CTD wire frame alongside its resolved MQTT topic and source payload.
+type SpoolItem struct {
+	Payload *core.CTDPayload
+	Topic   string
+	Raw     []byte
+}
+
 type spoolEntry struct {
 	payload *core.CTDPayload
+	topic   string
+	raw     []byte
 	bytes   int64
 }
 
@@ -52,12 +61,9 @@ func NewRingSpoolWithByteLimit(capacity int, maxBytes int64) *RingSpool {
 	}
 }
 
-func payloadByteSize(p *core.CTDPayload) int64 {
+func estimatePayloadByteSize(p *core.CTDPayload) int64 {
 	if p == nil {
 		return 0
-	}
-	if raw, err := json.Marshal(p); err == nil && len(raw) > 0 {
-		return int64(len(raw))
 	}
 	est := int64(128 + len(p.NodeID) + len(p.Component) + len(p.Status) + len(p.EventID))
 	for k, v := range p.Params {
@@ -69,11 +75,47 @@ func payloadByteSize(p *core.CTDPayload) int64 {
 	return est
 }
 
+func marshalPayloadEntry(p *core.CTDPayload, topic string) ([]byte, string, int64) {
+	if p == nil {
+		return nil, topic, 0
+	}
+	if topic == "" {
+		topic = p.RoutingTopic("")
+	}
+	if raw, err := json.Marshal(p); err == nil && len(raw) > 0 {
+		return raw, topic, int64(len(raw))
+	}
+	return nil, topic, estimatePayloadByteSize(p)
+}
+
 // Push appends p to the tail of the ring buffer, evicting oldest elements if slot or byte capacity is full.
 // Returns true if an older event had to be evicted (or p was dropped due to exceeding MaxBytes).
 func (r *RingSpool) Push(p *core.CTDPayload) bool {
 	evicted, _ := r.PushSized(p, 0)
 	return evicted
+}
+
+// PushRaw appends a pre-marshaled CTD wire frame and resolved MQTT topic into the ring buffer without re-marshaling.
+// Returns (evicted, accepted). When closed or when serialized bytes exceed maxBytes, accepted is false.
+func (r *RingSpool) PushRaw(p *core.CTDPayload, topic string, raw []byte) (evicted bool, accepted bool) {
+	if p == nil && len(raw) == 0 {
+		return false, false
+	}
+	var itemBytes int64
+	if len(raw) > 0 {
+		itemBytes = int64(len(raw))
+		if topic == "" && p != nil {
+			topic = p.RoutingTopic("")
+		}
+	} else {
+		raw, topic, itemBytes = marshalPayloadEntry(p, topic)
+	}
+	return r.pushEntry(spoolEntry{
+		payload: p,
+		topic:   topic,
+		raw:     raw,
+		bytes:   itemBytes,
+	})
 }
 
 // PushSized appends p with a known serialized byte size, enforcing both slot and byte caps and rejecting pushes once closed.
@@ -82,24 +124,38 @@ func (r *RingSpool) PushSized(p *core.CTDPayload, sizeBytes int64) (evicted bool
 	if p == nil {
 		return false, false
 	}
-	itemBytes := sizeBytes
+	var (
+		raw       []byte
+		topic     string
+		itemBytes = sizeBytes
+	)
 	if itemBytes <= 0 {
-		itemBytes = payloadByteSize(p)
+		raw, topic, itemBytes = marshalPayloadEntry(p, "")
+	} else {
+		topic = p.RoutingTopic("")
 	}
+	return r.pushEntry(spoolEntry{
+		payload: p,
+		topic:   topic,
+		raw:     raw,
+		bytes:   itemBytes,
+	})
+}
 
+func (r *RingSpool) pushEntry(entry spoolEntry) (evicted bool, accepted bool) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		return false, false
 	}
-	if itemBytes > r.maxBytes {
+	if entry.bytes > r.maxBytes {
 		r.dropped++
 		r.mu.Unlock()
 		return true, false
 	}
 
 	capLen := len(r.buf)
-	for r.count > 0 && (r.count >= capLen || r.curBytes+itemBytes > r.maxBytes) {
+	for r.count > 0 && (r.count >= capLen || r.curBytes+entry.bytes > r.maxBytes) {
 		oldest := r.buf[r.head]
 		r.buf[r.head] = spoolEntry{}
 		r.head = (r.head + 1) % capLen
@@ -110,9 +166,9 @@ func (r *RingSpool) PushSized(p *core.CTDPayload, sizeBytes int64) (evicted bool
 	}
 
 	tail := (r.head + r.count) % capLen
-	r.buf[tail] = spoolEntry{payload: p, bytes: itemBytes}
+	r.buf[tail] = entry
 	r.count++
-	r.curBytes += itemBytes
+	r.curBytes += entry.bytes
 	r.mu.Unlock()
 
 	select {
@@ -122,21 +178,34 @@ func (r *RingSpool) PushSized(p *core.CTDPayload, sizeBytes int64) (evicted bool
 	return evicted, true
 }
 
-// PrependBatch re-inserts undelivered items at the head of the ring buffer in their original FIFO order
-// without evicting newer elements already buffered in the spool. If slot or byte capacity is insufficient,
-// only the oldest items from `items` are dropped and counted toward Dropped().
-func (r *RingSpool) PrependBatch(items []*core.CTDPayload) {
+// PrependRawBatch re-inserts undelivered pre-marshaled items at the head of the ring buffer in their original FIFO order
+// without re-marshaling or evicting newer elements already buffered in the spool.
+func (r *RingSpool) PrependRawBatch(items []SpoolItem) {
 	if len(items) == 0 {
 		return
 	}
 	entries := make([]spoolEntry, 0, len(items))
-	for _, p := range items {
-		if p != nil {
-			entries = append(entries, spoolEntry{
-				payload: p,
-				bytes:   payloadByteSize(p),
-			})
+	for _, item := range items {
+		if item.Payload == nil && len(item.Raw) == 0 {
+			continue
 		}
+		raw := item.Raw
+		topic := item.Topic
+		var itemBytes int64
+		if len(raw) > 0 {
+			itemBytes = int64(len(raw))
+			if topic == "" && item.Payload != nil {
+				topic = item.Payload.RoutingTopic("")
+			}
+		} else {
+			raw, topic, itemBytes = marshalPayloadEntry(item.Payload, topic)
+		}
+		entries = append(entries, spoolEntry{
+			payload: item.Payload,
+			topic:   topic,
+			raw:     raw,
+			bytes:   itemBytes,
+		})
 	}
 	if len(entries) == 0 {
 		return
@@ -171,6 +240,21 @@ func (r *RingSpool) PrependBatch(items []*core.CTDPayload) {
 	}
 }
 
+// PrependBatch re-inserts undelivered items at the head of the ring buffer in their original FIFO order
+// without evicting newer elements already buffered in the spool. If slot or byte capacity is insufficient,\n// only the oldest items from `items` are dropped and counted toward Dropped().
+func (r *RingSpool) PrependBatch(items []*core.CTDPayload) {
+	if len(items) == 0 {
+		return
+	}
+	rawItems := make([]SpoolItem, 0, len(items))
+	for _, p := range items {
+		if p != nil {
+			rawItems = append(rawItems, SpoolItem{Payload: p})
+		}
+	}
+	r.PrependRawBatch(rawItems)
+}
+
 // PopBlocking blocks until at least one event is available or stopCh is closed.
 func (r *RingSpool) PopBlocking(stopCh <-chan struct{}) (*core.CTDPayload, bool) {
 	batch, ok := r.PopBatchBlocking(1, stopCh)
@@ -180,8 +264,9 @@ func (r *RingSpool) PopBlocking(stopCh <-chan struct{}) (*core.CTDPayload, bool)
 	return batch[0], true
 }
 
-// PopBatchBlocking blocks until at least one event is available (or stopCh/spool closes) and pops up to maxItems in FIFO order.
-func (r *RingSpool) PopBatchBlocking(maxItems int, stopCh <-chan struct{}) ([]*core.CTDPayload, bool) {
+// PopRawBatchBlocking blocks until at least one event is available (or stopCh/spool closes)
+// and pops up to maxItems pre-marshaled SpoolItems in FIFO order.
+func (r *RingSpool) PopRawBatchBlocking(maxItems int, stopCh <-chan struct{}) ([]SpoolItem, bool) {
 	if maxItems <= 0 {
 		maxItems = 1
 	}
@@ -192,11 +277,15 @@ func (r *RingSpool) PopBatchBlocking(maxItems int, stopCh <-chan struct{}) ([]*c
 			if n > maxItems {
 				n = maxItems
 			}
-			out := make([]*core.CTDPayload, n)
+			out := make([]SpoolItem, n)
 			capLen := len(r.buf)
 			for i := range n {
 				entry := r.buf[r.head]
-				out[i] = entry.payload
+				out[i] = SpoolItem{
+					Payload: entry.payload,
+					Topic:   entry.topic,
+					Raw:     entry.raw,
+				}
 				r.curBytes -= entry.bytes
 				r.buf[r.head] = spoolEntry{} // release reference for GC
 				r.head = (r.head + 1) % capLen
@@ -226,14 +315,32 @@ func (r *RingSpool) PopBatchBlocking(maxItems int, stopCh <-chan struct{}) ([]*c
 	}
 }
 
-func (r *RingSpool) drainLocked() []*core.CTDPayload {
+// PopBatchBlocking blocks until at least one event is available (or stopCh/spool closes) and pops up to maxItems in FIFO order.
+func (r *RingSpool) PopBatchBlocking(maxItems int, stopCh <-chan struct{}) ([]*core.CTDPayload, bool) {
+	rawBatch, ok := r.PopRawBatchBlocking(maxItems, stopCh)
+	if !ok {
+		return nil, false
+	}
+	out := make([]*core.CTDPayload, len(rawBatch))
+	for i, item := range rawBatch {
+		out[i] = item.Payload
+	}
+	return out, true
+}
+
+func (r *RingSpool) drainRawLocked() []SpoolItem {
 	if r.count == 0 {
 		return nil
 	}
-	out := make([]*core.CTDPayload, r.count)
+	out := make([]SpoolItem, r.count)
 	capLen := len(r.buf)
 	for i := range r.count {
-		out[i] = r.buf[r.head].payload
+		entry := r.buf[r.head]
+		out[i] = SpoolItem{
+			Payload: entry.payload,
+			Topic:   entry.topic,
+			Raw:     entry.raw,
+		}
 		r.buf[r.head] = spoolEntry{}
 		r.head = (r.head + 1) % capLen
 	}
@@ -242,11 +349,23 @@ func (r *RingSpool) drainLocked() []*core.CTDPayload {
 	return out
 }
 
+func payloadsFromSpoolItems(items []SpoolItem) []*core.CTDPayload {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]*core.CTDPayload, len(items))
+	for i, item := range items {
+		out[i] = item.Payload
+	}
+	return out
+}
+
 // DrainAll atomically extracts all currently buffered events in FIFO order.
 func (r *RingSpool) DrainAll() []*core.CTDPayload {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.drainLocked()
+	raw := r.drainRawLocked()
+	r.mu.Unlock()
+	return payloadsFromSpoolItems(raw)
 }
 
 // Close marks the spool closed under r.mu so subsequent pushes are rejected and waiting consumers unblock.
@@ -260,17 +379,22 @@ func (r *RingSpool) Close() {
 	}
 }
 
-// CloseAndDrain atomically marks the spool closed and drains all buffered events under r.mu so no late push can be stranded.
-func (r *RingSpool) CloseAndDrain() []*core.CTDPayload {
+// CloseAndDrainRaw atomically marks the spool closed and drains all buffered pre-marshaled SpoolItems under r.mu.
+func (r *RingSpool) CloseAndDrainRaw() []SpoolItem {
 	r.mu.Lock()
 	r.closed = true
-	out := r.drainLocked()
+	out := r.drainRawLocked()
 	r.mu.Unlock()
 	select {
 	case r.notify <- struct{}{}:
 	default:
 	}
 	return out
+}
+
+// CloseAndDrain atomically marks the spool closed and drains all buffered events under r.mu so no late push can be stranded.
+func (r *RingSpool) CloseAndDrain() []*core.CTDPayload {
+	return payloadsFromSpoolItems(r.CloseAndDrainRaw())
 }
 
 // IsClosed reports whether Close or CloseAndDrain has been called on the spool.

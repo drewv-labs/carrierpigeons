@@ -48,13 +48,8 @@ var disconnectCmd = &cobra.Command{
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		state := cliStateFromCommand(cmd)
-		cfgPath, _ := persistentConfigFlags(cmd)
-		targetBrand := state.baseBrand
-		if baseCfg, bErr := config.LoadBaseWorkstationConfigForBrand(cfgPath, state.baseBrand); bErr == nil {
-			targetBrand = baseCfg.Brand
-		}
-		prev, _ := config.ReadCurrentMeshForBrand(targetBrand)
-		if err := config.ClearCurrentMeshForBrand(targetBrand); err != nil {
+		prev, _ := config.ReadCurrentMeshForBrand(state.baseBrand)
+		if err := config.ClearCurrentMeshForBrand(state.baseBrand); err != nil {
 			return err
 		}
 		out := cmd.OutOrStdout()
@@ -237,7 +232,7 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 
 	rawTarget := strings.TrimSpace(args[0])
 	if rawTarget == "-" {
-		prev, err := config.ReadPreviousMeshForBrand(baseCfg.Brand)
+		prev, err := config.ReadPreviousMeshForBrand(state.baseBrand)
 		if err != nil {
 			return err
 		}
@@ -319,13 +314,13 @@ func runConnectMesh(cmd *cobra.Command, args []string) error {
 
 	var savedConfigPath string
 	if !patch.IsEmpty() {
-		savedConfigPath, err = config.UpsertWorkstationMeshProfileForBrand(cfgPath, baseCfg.Brand, targetMesh, patch)
+		savedConfigPath, err = config.UpsertWorkstationMeshProfileForBrand(cfgPath, state.baseBrand, targetMesh, patch)
 		if err != nil {
 			return err
 		}
 	}
 
-	statePath, err := config.WriteCurrentMeshForBrand(baseCfg.Brand, targetMesh)
+	statePath, err := config.WriteCurrentMeshForBrand(state.baseBrand, targetMesh)
 	if err != nil {
 		return err
 	}
@@ -386,15 +381,18 @@ func verifyRemoteMeshIdentityWithProbers(
 	wg.Wait()
 	close(results)
 
+	expectedTopicRoot := strings.Trim(strings.TrimSpace(cfg.Brand.MergeWithDefaults().TopicRoot), "/")
+
 	var (
-		verifiedSources []string
-		coopNode        string
-		coopNodeSource  string
-		topicRoot       string
-		topicRootSource string
-		probeErrors     []string
-		mismatchErr     error
-		conflictErr     error
+		verifiedSources      []string
+		coopNode             string
+		coopNodeSource       string
+		topicRoot            string
+		topicRootSource      string
+		probeErrors          []string
+		mismatchErr          error
+		conflictErr          error
+		topicRootMismatchErr error
 	)
 
 	var collected []probeResult
@@ -444,6 +442,12 @@ func verifyRemoteMeshIdentityWithProbers(
 						topicRootSource, topicRoot, r.source, gotTopicRoot,
 					)
 				}
+				if expectedTopicRoot != "" && gotTopicRoot != expectedTopicRoot && topicRootMismatchErr == nil {
+					topicRootMismatchErr = fmt.Errorf(
+						"MNS verification failed via %s: remote %s registered topic_root=%q, expected %q (refusing to switch working mesh)",
+						r.source, cfg.Brand.CoopName, gotTopicRoot, expectedTopicRoot,
+					)
+				}
 			}
 			verifiedSources = append(verifiedSources, r.source)
 			continue
@@ -460,6 +464,9 @@ func verifyRemoteMeshIdentityWithProbers(
 	}
 	if conflictErr != nil {
 		return "", conflictErr
+	}
+	if topicRootMismatchErr != nil {
+		return "", topicRootMismatchErr
 	}
 
 	if len(verifiedSources) == 0 {
@@ -707,9 +714,14 @@ func runMeshList(cmd *cobra.Command, _ []string) error {
 		if eff.ActiveMeshSource != "" {
 			activeSource = eff.ActiveMeshSource
 		}
-	} else if stateMesh, _ := config.ReadCurrentMeshForBrand(baseCfg.Brand); stateMesh != "" {
-		activeName = stateMesh
-		activeSource = "state (unconfigured!)"
+	} else {
+		if strings.TrimSpace(meshName) != "" {
+			return effErr
+		}
+		if stateMesh, _ := config.ReadCurrentMeshForBrand(state.baseBrand); stateMesh != "" {
+			activeName = stateMesh
+			activeSource = "state (unconfigured!)"
+		}
 	}
 
 	out := cmd.OutOrStdout()

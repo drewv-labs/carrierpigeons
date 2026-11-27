@@ -268,6 +268,7 @@ func TestPolicyGateRejectsInvalidEphemeralProposals(t *testing.T) {
 				Kind:        ActionEphemeralRunner,
 				Title:       "bad interp",
 				Interpreter: "..",
+				ScriptBody:  "echo hi\n",
 				Selectors:   core.RunnerSelector{Nodes: []string{"node-01"}},
 			},
 		},
@@ -277,6 +278,16 @@ func TestPolicyGateRejectsInvalidEphemeralProposals(t *testing.T) {
 				Kind:        ActionEphemeralRunner,
 				Title:       "empty body and hash",
 				Interpreter: "sh",
+				Selectors:   core.RunnerSelector{Nodes: []string{"node-01"}},
+			},
+		},
+		{
+			name: "empty_script_with_valid_sha256",
+			proposal: ActionProposal{
+				Kind:        ActionEphemeralRunner,
+				Title:       "empty body with hash",
+				Interpreter: "sh",
+				SHA256:      runner.ComputeScriptSHA256("echo hi\n"),
 				Selectors:   core.RunnerSelector{Nodes: []string{"node-01"}},
 			},
 		},
@@ -307,6 +318,7 @@ func TestPolicyGateRejectsInvalidEphemeralProposals(t *testing.T) {
 				Kind:        ActionEphemeralRunner,
 				Title:       "bad hex hash",
 				Interpreter: "sh",
+				ScriptBody:  "echo hi\n",
 				SHA256:      "not-a-valid-sha256",
 				Selectors:   core.RunnerSelector{Nodes: []string{"node-01"}},
 			},
@@ -325,5 +337,62 @@ func TestPolicyGateRejectsInvalidEphemeralProposals(t *testing.T) {
 	}
 	if prompts.Load() != 0 {
 		t.Fatalf("expected invalid ephemeral proposals to fail validation before prompting, got prompts=%d", prompts.Load())
+	}
+}
+
+func TestPolicyGateRejectsUnknownKindAndNormalizesAlwaysAllowEntries(t *testing.T) {
+	var prompts atomic.Int32
+	gate := NewPolicyGate(config.PermissionConfig{Mode: "yolo"}, func(_ context.Context, _ ActionProposal) (ConfirmationDecision, error) {
+		prompts.Add(1)
+		return DecisionAlwaysAllow, nil
+	})
+
+	for _, badKind := range []ActionKind{"", "arbitrary_exec", "drop_ledger"} {
+		if err := gate.Authorize(context.Background(), ActionProposal{
+			Kind:  badKind,
+			Title: "bad kind",
+		}); err == nil {
+			t.Fatalf("expected YOLO mode to reject unsupported proposal kind %q", badKind)
+		}
+	}
+	if prompts.Load() != 0 {
+		t.Fatalf("expected invalid kinds to fail before prompting, got prompts=%d", prompts.Load())
+	}
+
+	gate.SetMode(ModeDefault)
+	if err := gate.Authorize(context.Background(), ActionProposal{
+		Kind:   ActionStandardRunner,
+		Title:  "run bench",
+		Runner: "  BenchRnr  ",
+	}); err != nil {
+		t.Fatalf("initial standard runner Authorize failed: %v", err)
+	}
+	if err := gate.Authorize(context.Background(), ActionProposal{
+		Kind:   ActionStandardRunner,
+		Title:  "run bench again",
+		Runner: "benchrnr",
+	}); err != nil {
+		t.Fatalf("normalized standard runner AlwaysAllow lookup failed: %v", err)
+	}
+	if prompts.Load() != 1 {
+		t.Fatalf("expected trimmed runner AlwaysAllow to skip re-prompt, got prompts=%d", prompts.Load())
+	}
+
+	if err := gate.Authorize(context.Background(), ActionProposal{
+		Kind:     ActionCreatePMV,
+		Title:    "create view",
+		ViewName: "  Cooling_Headroom  ",
+	}); err != nil {
+		t.Fatalf("initial PMV Authorize failed: %v", err)
+	}
+	if err := gate.Authorize(context.Background(), ActionProposal{
+		Kind:     ActionCreatePMV,
+		Title:    "update view",
+		ViewName: "pmv_cooling_headroom",
+	}); err != nil {
+		t.Fatalf("normalized PMV AlwaysAllow lookup failed: %v", err)
+	}
+	if prompts.Load() != 2 {
+		t.Fatalf("expected normalized PMV AlwaysAllow to skip re-prompt, got prompts=%d", prompts.Load())
 	}
 }

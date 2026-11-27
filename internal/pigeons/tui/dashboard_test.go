@@ -506,18 +506,20 @@ func TestDashboardApprovalStreamIDCorrelationAndLifecycleClear(t *testing.T) {
 }
 
 type blockingDashboardStore struct {
-	mu           sync.Mutex
-	clusterGate  chan struct{}
-	clusterActive atomic.Int64
-	clusterCalls  atomic.Int64
-	clusterMax    atomic.Int64
-	nodes         []db.NodeSummary
+	mu              sync.Mutex
+	overviewEntered chan struct{}
+	clusterGate     chan struct{}
+	clusterActive   atomic.Int64
+	clusterCalls    atomic.Int64
+	clusterMax      atomic.Int64
+	nodes           []db.NodeSummary
 
-	mathGate   chan struct{}
-	mathActive atomic.Int64
-	mathCalls  atomic.Int64
-	mathMax    atomic.Int64
-	pmvs       []db.PMVRecord
+	mathEntered chan struct{}
+	mathGate    chan struct{}
+	mathActive  atomic.Int64
+	mathCalls   atomic.Int64
+	mathMax     atomic.Int64
+	pmvs        []db.PMVRecord
 }
 
 func (b *blockingDashboardStore) recordClusterConcurrency() {
@@ -531,13 +533,13 @@ func (b *blockingDashboardStore) recordClusterConcurrency() {
 	}
 }
 
-func (b *blockingDashboardStore) GetMeshIdentity(_ context.Context) (*core.MeshIdentity, error) {
-	return &core.MeshIdentity{MeshName: "test-mesh", CoopNodeID: "rv64-coop-01"}, nil
-}
-
-func (b *blockingDashboardStore) GetClusterStatus(ctx context.Context, _ time.Duration) ([]db.NodeSummary, error) {
-	b.recordClusterConcurrency()
-	defer b.clusterActive.Add(-1)
+func (b *blockingDashboardStore) GetMeshIdentity(ctx context.Context) (*core.MeshIdentity, error) {
+	if b.overviewEntered != nil {
+		select {
+		case b.overviewEntered <- struct{}{}:
+		default:
+		}
+	}
 	if b.clusterGate != nil {
 		select {
 		case <-b.clusterGate:
@@ -545,6 +547,12 @@ func (b *blockingDashboardStore) GetClusterStatus(ctx context.Context, _ time.Du
 			return nil, ctx.Err()
 		}
 	}
+	return &core.MeshIdentity{MeshName: "test-mesh", CoopNodeID: "rv64-coop-01"}, nil
+}
+
+func (b *blockingDashboardStore) GetClusterStatus(_ context.Context, _ time.Duration) ([]db.NodeSummary, error) {
+	b.recordClusterConcurrency()
+	defer b.clusterActive.Add(-1)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]db.NodeSummary, len(b.nodes))
@@ -572,6 +580,12 @@ func (b *blockingDashboardStore) QueryReadOnlyMaps(ctx context.Context, sql stri
 			}
 		}
 		defer b.mathActive.Add(-1)
+		if b.mathEntered != nil {
+			select {
+			case b.mathEntered <- struct{}{}:
+			default:
+			}
+		}
 		if b.mathGate != nil {
 			select {
 			case <-b.mathGate:
@@ -607,16 +621,20 @@ func (b *blockingDashboardStore) ListPMVs(_ context.Context) ([]db.PMVRecord, er
 	return append([]db.PMVRecord(nil), b.pmvs...), nil
 }
 func (b *blockingDashboardStore) MaterializePMV(_ context.Context, _, _ string) error { return nil }
-func (b *blockingDashboardStore) DropPMV(_ context.Context, _ string) error          { return nil }
-func (b *blockingDashboardStore) Close()                                             {}
+func (b *blockingDashboardStore) DropPMV(_ context.Context, _ string) error           { return nil }
+func (b *blockingDashboardStore) Close()                                              {}
 
 func TestDashboardPollingInFlightAndMonotonicSequenceGuards(t *testing.T) {
 	gateOverview := make(chan struct{})
 	gateMath := make(chan struct{})
+	overviewEntered := make(chan struct{}, 1)
+	mathEntered := make(chan struct{}, 1)
 	store := &blockingDashboardStore{
-		clusterGate: gateOverview,
-		mathGate:    gateMath,
-		nodes:       []db.NodeSummary{{NodeID: "node-initial", IsHealthy: true}},
+		overviewEntered: overviewEntered,
+		clusterGate:     gateOverview,
+		mathEntered:     mathEntered,
+		mathGate:        gateMath,
+		nodes:           []db.NodeSummary{{NodeID: "node-initial", IsHealthy: true}},
 	}
 
 	m := NewDashboardModel(DashboardOptions{
@@ -651,6 +669,9 @@ func TestDashboardPollingInFlightAndMonotonicSequenceGuards(t *testing.T) {
 		defer wg.Done()
 		mathMsgCh <- mathCmd1()
 	}()
+
+	<-overviewEntered
+	<-mathEntered
 
 	// Trigger extra ticks & manual refresh while goroutines are blocked on gates.
 	u, _ := m.Update(overviewTickMsg(time.Now()))

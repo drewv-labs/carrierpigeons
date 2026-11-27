@@ -1,6 +1,7 @@
 package observers
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -187,9 +188,13 @@ func discoverThermalTopology(sysRoot string, now time.Time) *cachedThermalTopolo
 		tempInputs, _ := filepath.Glob(filepath.Join(hwDir, "temp*_input"))
 		slices.Sort(tempInputs)
 		for _, tPath := range tempInputs {
+			faultPath := hwmonFaultPathForInput(tPath)
+			if faultPath != "" && !pathExists(faultPath) {
+				faultPath = ""
+			}
 			topo.sensors = append(topo.sensors, cachedThermalSensor{
 				tempPath:  tPath,
-				faultPath: hwmonFaultPathForInput(tPath),
+				faultPath: faultPath,
 				prio:      chipPrio,
 			})
 		}
@@ -198,19 +203,19 @@ func discoverThermalTopology(sysRoot string, now time.Time) *cachedThermalTopolo
 	return topo
 }
 
-func (c *sysfsDiscoveryCache) getThermals(sysRoot string, forceRefresh bool) *cachedThermalTopology {
+func (c *sysfsDiscoveryCache) getThermals(sysRoot string, forceRefresh bool) (*cachedThermalTopology, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := c.now()
 	if !forceRefresh {
 		if entry, ok := c.thermals[sysRoot]; ok && !entry.dirty && now.Sub(entry.discoveredAt) < sysfsDiscoveryTTL {
-			return entry
+			return entry, false
 		}
 	}
 	entry := discoverThermalTopology(sysRoot, now)
 	c.thermals[sysRoot] = entry
-	return entry
+	return entry, true
 }
 
 func (c *sysfsDiscoveryCache) markThermalsDirty(sysRoot string) {
@@ -223,6 +228,7 @@ func (c *sysfsDiscoveryCache) markThermalsDirty(sysRoot string) {
 
 func discoverCoolingTopology(sysRoot string, now time.Time) *cachedCoolingTopology {
 	topo := &cachedCoolingTopology{discoveredAt: now}
+	seenKeys := make(map[string]bool)
 
 	hwmonDirs, _ := filepath.Glob(filepath.Join(sysRoot, "class", "hwmon", "hwmon*"))
 	slices.Sort(hwmonDirs)
@@ -257,7 +263,13 @@ func discoverCoolingTopology(sysRoot string, now time.Time) *cachedCoolingTopolo
 			sensorKey := chip + ":fan" + idxStr
 			if normLabel != "" {
 				sensorKey = chip + ":" + normLabel
+				if seenKeys[sensorKey] {
+					sensorKey = sensorKey + ":fan" + idxStr
+				}
+			} else if seenKeys[sensorKey] {
+				sensorKey = sensorKey + ":fan" + idxStr
 			}
+			seenKeys[sensorKey] = true
 
 			pwmPath := filepath.Join(hwDir, "pwm"+idxStr)
 			topo.fans = append(topo.fans, cachedFanSensor{
@@ -304,19 +316,19 @@ func discoverCoolingTopology(sysRoot string, now time.Time) *cachedCoolingTopolo
 	return topo
 }
 
-func (c *sysfsDiscoveryCache) getCoolings(sysRoot string, forceRefresh bool) *cachedCoolingTopology {
+func (c *sysfsDiscoveryCache) getCoolings(sysRoot string, forceRefresh bool) (*cachedCoolingTopology, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := c.now()
 	if !forceRefresh {
 		if entry, ok := c.coolings[sysRoot]; ok && !entry.dirty && now.Sub(entry.discoveredAt) < sysfsDiscoveryTTL {
-			return entry
+			return entry, false
 		}
 	}
 	entry := discoverCoolingTopology(sysRoot, now)
 	c.coolings[sysRoot] = entry
-	return entry
+	return entry, true
 }
 
 func (c *sysfsDiscoveryCache) markCoolingsDirty(sysRoot string) {
@@ -339,14 +351,16 @@ func (c *sysfsDiscoveryCache) observeThermals(sysRoot string, event *core.CTDPay
 		return
 	}
 
-	readPass := func(topo *cachedThermalTopology) (bestTemp float64, bestPrio int, readErr bool) {
+	readPass := func(topo *cachedThermalTopology) (bestTemp float64, bestPrio int, missingErr bool) {
 		for _, s := range topo.sensors {
 			if isHwmonTempFault(s.faultPath) {
 				continue
 			}
 			raw, err := os.ReadFile(s.tempPath)
 			if err != nil {
-				readErr = true
+				if errors.Is(err, os.ErrNotExist) {
+					missingErr = true
+				}
 				continue
 			}
 			tempC, ok := parseSysfsMillidegreeTemp(raw)
@@ -358,17 +372,17 @@ func (c *sysfsDiscoveryCache) observeThermals(sysRoot string, event *core.CTDPay
 				bestTemp = tempC
 			}
 		}
-		return bestTemp, bestPrio, readErr
+		return bestTemp, bestPrio, missingErr
 	}
 
-	topo := c.getThermals(sysRoot, false)
-	bestTemp, bestPrio, readErr := readPass(topo)
-	if readErr {
-		topo = c.getThermals(sysRoot, true)
-		bestTemp, bestPrio, readErr = readPass(topo)
-		if readErr {
-			c.markThermalsDirty(sysRoot)
-		}
+	topo, refreshed := c.getThermals(sysRoot, false)
+	bestTemp, bestPrio, missingErr := readPass(topo)
+	if missingErr && !refreshed {
+		topo, _ = c.getThermals(sysRoot, true)
+		bestTemp, bestPrio, missingErr = readPass(topo)
+	}
+	if missingErr {
+		c.markThermalsDirty(sysRoot)
 	}
 
 	if bestPrio > 0 {
@@ -389,13 +403,15 @@ func (c *sysfsDiscoveryCache) observeCooling(sysRoot string, event *core.CTDPayl
 		return
 	}
 
-	readPass := func(topo *cachedCoolingTopology) (bestCPU *fanCandidate, bestPWMOnly *float64, fansRPM map[string]int, coolingFallback *float64, readErr bool) {
+	readPass := func(topo *cachedCoolingTopology) (bestCPU *fanCandidate, bestPWMOnly *float64, fansRPM map[string]int, coolingFallback *float64, missingErr bool) {
 		fansRPM = make(map[string]int)
 
 		for _, f := range topo.fans {
 			rpmBytes, err := os.ReadFile(f.inputPath)
 			if err != nil {
-				readErr = true
+				if errors.Is(err, os.ErrNotExist) {
+					missingErr = true
+				}
 				continue
 			}
 			rpm, err := strconv.Atoi(strings.TrimSpace(string(rpmBytes)))
@@ -408,10 +424,10 @@ func (c *sysfsDiscoveryCache) observeCooling(sysRoot string, event *core.CTDPayl
 				hasPWM bool
 			)
 			if f.hasPWMFile {
-				var pwmReadErr bool
-				pwmPct, hasPWM, pwmReadErr = readHwmonPWMPctChecked(f.pwmPath)
-				if pwmReadErr {
-					readErr = true
+				var pwmMissing bool
+				pwmPct, hasPWM, pwmMissing = readHwmonPWMPctChecked(f.pwmPath)
+				if pwmMissing {
+					missingErr = true
 				}
 			}
 
@@ -438,9 +454,9 @@ func (c *sysfsDiscoveryCache) observeCooling(sysRoot string, event *core.CTDPayl
 		}
 
 		for _, pwmPath := range topo.pwmOnlyPaths {
-			pct, ok, pwmReadErr := readHwmonPWMPctChecked(pwmPath)
-			if pwmReadErr {
-				readErr = true
+			pct, ok, pwmMissing := readHwmonPWMPctChecked(pwmPath)
+			if pwmMissing {
+				missingErr = true
 				continue
 			}
 			if ok && bestPWMOnly == nil {
@@ -453,9 +469,9 @@ func (c *sysfsDiscoveryCache) observeCooling(sysRoot string, event *core.CTDPayl
 		if bestCPU == nil || !bestCPU.hasPWM {
 			if bestPWMOnly == nil {
 				for _, cdev := range topo.coolingDevices {
-					pct, ok, devReadErr := readCoolingDevicePct(cdev)
-					if devReadErr {
-						readErr = true
+					pct, ok, devMissing := readCoolingDevicePct(cdev)
+					if devMissing {
+						missingErr = true
 						continue
 					}
 					if ok {
@@ -467,17 +483,17 @@ func (c *sysfsDiscoveryCache) observeCooling(sysRoot string, event *core.CTDPayl
 			}
 		}
 
-		return bestCPU, bestPWMOnly, fansRPM, coolingFallback, readErr
+		return bestCPU, bestPWMOnly, fansRPM, coolingFallback, missingErr
 	}
 
-	topo := c.getCoolings(sysRoot, false)
-	bestCPU, bestPWMOnly, fansRPM, coolingFallback, readErr := readPass(topo)
-	if readErr {
-		topo = c.getCoolings(sysRoot, true)
-		bestCPU, bestPWMOnly, fansRPM, coolingFallback, readErr = readPass(topo)
-		if readErr {
-			c.markCoolingsDirty(sysRoot)
-		}
+	topo, refreshed := c.getCoolings(sysRoot, false)
+	bestCPU, bestPWMOnly, fansRPM, coolingFallback, missingErr := readPass(topo)
+	if missingErr && !refreshed {
+		topo, _ = c.getCoolings(sysRoot, true)
+		bestCPU, bestPWMOnly, fansRPM, coolingFallback, missingErr = readPass(topo)
+	}
+	if missingErr {
+		c.markCoolingsDirty(sysRoot)
 	}
 
 	hasPWMMetric := false
@@ -488,7 +504,8 @@ func (c *sysfsDiscoveryCache) observeCooling(sysRoot string, event *core.CTDPayl
 			event.AddMetric("cpu_fan_pwm_pct", bestCPU.pwmPct)
 			hasPWMMetric = true
 		}
-	} else if bestPWMOnly != nil {
+	}
+	if !hasPWMMetric && bestPWMOnly != nil {
 		event.AddMetric("cpu_fan_pwm_pct", *bestPWMOnly)
 		hasPWMMetric = true
 	}
@@ -569,7 +586,7 @@ func isBetterCPUCandidate(cand, cur *fanCandidate) bool {
 func readHwmonPWMPctChecked(pwmPath string) (float64, bool, bool) {
 	raw, err := os.ReadFile(pwmPath)
 	if err != nil {
-		return 0, false, true
+		return 0, false, errors.Is(err, os.ErrNotExist)
 	}
 	val, ok := parseFiniteFloat(string(raw))
 	if !ok || val < 0 {
@@ -586,7 +603,7 @@ func readCoolingDevicePct(cdev cachedCoolingDevice) (float64, bool, bool) {
 	curBytes, errCur := os.ReadFile(cdev.curStatePath)
 	maxBytes, errMax := os.ReadFile(cdev.maxStatePath)
 	if errCur != nil || errMax != nil {
-		return 0, false, true
+		return 0, false, errors.Is(errCur, os.ErrNotExist) || errors.Is(errMax, os.ErrNotExist)
 	}
 
 	cur, okCur := parseFiniteFloat(string(curBytes))

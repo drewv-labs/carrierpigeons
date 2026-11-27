@@ -166,10 +166,11 @@ func RegistryNames() []string {
 
 // Envelope defines the wire protocol for MQTT control dispatches to an individual node.
 type Envelope struct {
-	RequestID string         `json:"request_id,omitempty"`
-	Action    string         `json:"action"` // "start" or "abort"
-	Runner    string         `json:"runner"`
-	Params    map[string]any `json:"params,omitempty"`
+	RequestID       string         `json:"request_id,omitempty"`
+	TargetRequestID string         `json:"target_request_id,omitempty"`
+	Action          string         `json:"action"` // "start" or "abort"
+	Runner          string         `json:"runner"`
+	Params          map[string]any `json:"params,omitempty"`
 }
 
 // Validate ensures the payload has the minimum required routing data.

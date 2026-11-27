@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -35,29 +36,34 @@ func cleanSelectorTokens(raw []string, lowercase bool) []string {
 	return out
 }
 
-func parseRunnerKeyValueParams(pairs []string) map[string]any {
+func parseRunnerKeyValueParams(pairs []string) (map[string]any, error) {
 	params := make(map[string]any)
 	for _, pair := range pairs {
 		idx := strings.IndexByte(pair, '=')
 		if idx <= 0 {
-			continue
+			return nil, fmt.Errorf("invalid --param %q: expected key=value", pair)
 		}
 		k := strings.TrimSpace(pair[:idx])
 		v := strings.TrimSpace(pair[idx+1:])
 		if k == "" {
-			continue
+			return nil, fmt.Errorf("invalid --param %q: empty parameter key", pair)
 		}
-		if b, err := strconv.ParseBool(v); err == nil {
-			params[k] = b
-		} else if i, err := strconv.Atoi(v); err == nil {
+		if i, err := strconv.Atoi(v); err == nil {
 			params[k] = i
+		} else if v == "true" {
+			params[k] = true
+		} else if v == "false" {
+			params[k] = false
 		} else if f, err := strconv.ParseFloat(v, 64); err == nil {
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil, fmt.Errorf("invalid --param %q: non-finite float value %q is not allowed", pair, v)
+			}
 			params[k] = f
 		} else {
 			params[k] = v
 		}
 	}
-	return params
+	return params, nil
 }
 
 func isPauseRunnerName(name string) bool {
@@ -66,12 +72,15 @@ func isPauseRunnerName(name string) bool {
 }
 
 func buildRunnerRequest(runnerName, operator string, all bool, nodes, tags, kvPairs []string, durationSec int) (core.RunnerRequestCTD, error) {
+	if durationSec < 0 {
+		return core.RunnerRequestCTD{}, fmt.Errorf("invalid --secs %d: must be >= 0", durationSec)
+	}
 	trimmedRunner := strings.TrimSpace(runnerName)
-	params := parseRunnerKeyValueParams(kvPairs)
+	params, err := parseRunnerKeyValueParams(kvPairs)
+	if err != nil {
+		return core.RunnerRequestCTD{}, err
+	}
 	if isPauseRunnerName(trimmedRunner) {
-		if durationSec < 0 {
-			durationSec = 0
-		}
 		if _, exists := params["duration_sec"]; !exists {
 			params["duration_sec"] = durationSec
 		}

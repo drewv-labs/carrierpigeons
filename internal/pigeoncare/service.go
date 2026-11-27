@@ -3,14 +3,13 @@ package pigeoncare
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
-	"reflect"
-	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeonmath"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
@@ -21,16 +20,13 @@ import (
 )
 
 const (
-	maxToolOutputBytes  = 256 * 1024 // 256 KiB serialized tool output cap
-	toolTruncationMark  = "\n...[output truncated at 256 KiB]"
-	maxJSONWalkDepth    = 64
-)
-
-var (
-	timeType       = reflect.TypeOf(time.Time{})
-	rawMsgType     = reflect.TypeOf(json.RawMessage(nil))
-	jsonNumberType = reflect.TypeOf(json.Number(""))
-	anyType        = reflect.TypeOf((*any)(nil)).Elem()
+	maxToolOutputBytes         = 256 * 1024 // 256 KiB serialized tool output cap
+	toolTruncationMark         = "\n...[output truncated at 256 KiB]"
+	defaultReadToolTimeout     = 10 * time.Second
+	defaultPMVToolTimeout      = 60 * time.Second
+	defaultDispatchToolTimeout = 10 * time.Second
+	defaultEphemeralTimeoutSec = 30
+	maxEphemeralTimeoutSec     = 300
 )
 
 // RequestDispatcher transmits a RunnerRequestCTD to PigeonCoop over MQTT (`pigeons/requests/runner`).
@@ -237,13 +233,29 @@ func (s *Service) Definitions() []map[string]any {
 	}
 }
 
+func withBoundedTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 func toStringSlice(raw any) []string {
 	switch v := raw.(type) {
 	case []string:
-		return v
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
 	case []any:
 		out := make([]string, 0, len(v))
 		for _, item := range v {
+			if item == nil {
+				continue
+			}
 			if s := strings.TrimSpace(fmt.Sprint(item)); s != "" {
 				out = append(out, s)
 			}
@@ -253,9 +265,137 @@ func toStringSlice(raw any) []string {
 		if strings.TrimSpace(v) == "" {
 			return nil
 		}
-		return strings.Split(v, ",")
+		parts := strings.Split(v, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if s := strings.TrimSpace(p); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
 	default:
 		return nil
+	}
+}
+
+func normalizeAllowedInterpreter(raw string) (string, error) {
+	norm := runner.NormalizeInterpreter(raw)
+	switch norm {
+	case "sh", "bash", "python3":
+		return norm, nil
+	default:
+		return "", fmt.Errorf("interpreter %q is not allowed (permitted: sh, bash, python3)", strings.TrimSpace(raw))
+	}
+}
+
+func parseEphemeralTimeoutSec(args map[string]any) (int, error) {
+	raw, exists := args["timeout_sec"]
+	if !exists || raw == nil {
+		return defaultEphemeralTimeoutSec, nil
+	}
+	parseFloatTimeout := func(f float64) (int, error) {
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, errors.New("timeout_sec must be a finite number")
+		}
+		if f <= 0 {
+			return 0, errors.New("timeout_sec must be positive")
+		}
+		if f > float64(math.MaxInt32) {
+			return 0, errors.New("timeout_sec is out of range")
+		}
+		n := int(f)
+		if n < 1 {
+			n = 1
+		}
+		if n > maxEphemeralTimeoutSec {
+			n = maxEphemeralTimeoutSec
+		}
+		return n, nil
+	}
+	switch v := raw.(type) {
+	case float64:
+		return parseFloatTimeout(v)
+	case float32:
+		return parseFloatTimeout(float64(v))
+	case int:
+		if v <= 0 {
+			return 0, errors.New("timeout_sec must be positive")
+		}
+		return min(v, maxEphemeralTimeoutSec), nil
+	case int64:
+		if v <= 0 {
+			return 0, errors.New("timeout_sec must be positive")
+		}
+		if v > int64(maxEphemeralTimeoutSec) {
+			return maxEphemeralTimeoutSec, nil
+		}
+		return int(v), nil
+	case int32:
+		if v <= 0 {
+			return 0, errors.New("timeout_sec must be positive")
+		}
+		return min(int(v), maxEphemeralTimeoutSec), nil
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return 0, errors.New("timeout_sec must be a valid number")
+		}
+		return parseFloatTimeout(f)
+	default:
+		return 0, errors.New("timeout_sec must be an integer between 1 and 300")
+	}
+}
+
+func validateSelectorTokens(sel core.RunnerSelector) error {
+	for _, node := range sel.Nodes {
+		if err := core.ValidateTopicToken(node); err != nil {
+			return fmt.Errorf("invalid target node %q: must match ^[a-zA-Z0-9._:-]{1,128}$", node)
+		}
+	}
+	for _, tag := range sel.Tags {
+		if err := core.ValidateTopicToken(tag); err != nil {
+			return fmt.Errorf("invalid target tag %q: must match ^[a-zA-Z0-9._:-]{1,128}$", tag)
+		}
+	}
+	return nil
+}
+
+func classifyDBError(prefix string, err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return prefix + ": request timed out"
+	case errors.Is(err, context.Canceled):
+		return prefix + ": request canceled"
+	case errors.Is(err, db.ErrReadOnlyByteLimitExceeded):
+		return prefix + ": query result exceeded maximum byte limit"
+	default:
+		return prefix + ": upstream database operation failed"
+	}
+}
+
+func classifyPMVError(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "PMV certification failed: request timed out"
+	case errors.Is(err, context.Canceled):
+		return "PMV certification failed: request canceled"
+	case errors.Is(err, db.ErrReadOnlyByteLimitExceeded):
+		return "PMV certification failed: sample probe exceeded maximum byte limit"
+	case strings.Contains(err.Error(), "certification failed closed"):
+		return "PMV certification failed: candidate SQL rejected by certification check"
+	default:
+		return "PMV certification failed: upstream database or optimizer error"
+	}
+}
+
+func classifyDispatchError(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "Failed dispatching RunnerRequestCTD: request timed out"
+	case errors.Is(err, context.Canceled):
+		return "Failed dispatching RunnerRequestCTD: request canceled"
+	default:
+		return "Failed dispatching RunnerRequestCTD: upstream broker dispatch failed"
 	}
 }
 
@@ -273,7 +413,7 @@ func formatRowMetrics(raw any) string {
 	case string:
 		return v
 	default:
-		b, err := json.Marshal(sanitizeJSONValue(v))
+		b, err := json.Marshal(jsonutil.SanitizeValue(v))
 		if err != nil {
 			return `{"error":"unserializable metrics"}`
 		}
@@ -292,25 +432,36 @@ func (s *Service) Execute(ctx context.Context, name string, args map[string]any)
 func (s *Service) executeRaw(ctx context.Context, name string, args map[string]any) string {
 	switch name {
 	case "get_cluster_status":
-		summaries, err := s.store.GetClusterStatus(ctx, config.DefaultHealthyWindow)
+		tCtx, cancel := withBoundedTimeout(ctx, defaultReadToolTimeout)
+		defer cancel()
+
+		summaries, err := s.store.GetClusterStatus(tCtx, config.DefaultHealthyWindow)
 		if err != nil {
-			return fmt.Sprintf("Database error: %v", err)
+			return classifyDBError("Database error", err)
 		}
 		if len(summaries) == 0 {
 			return "No nodes registered in the CTD Ledger yet."
 		}
-		raw, err := json.MarshalIndent(sanitizeJSONValue(summaries), "", "  ")
+		raw, err := json.MarshalIndent(jsonutil.SanitizeValue(summaries), "", "  ")
 		if err != nil {
-			return fmt.Sprintf("Error: failed to serialize cluster status: %v", err)
+			return "Error: failed to serialize cluster status"
 		}
 		return string(raw)
 
 	case "get_node_telemetry":
 		nodeID, _ := args["node_id"].(string)
-		if strings.TrimSpace(nodeID) == "" {
+		nodeID = strings.TrimSpace(nodeID)
+		if nodeID == "" {
 			return "Error: Missing required argument 'node_id'"
 		}
-		rows, err := s.store.QueryReadOnlyMaps(ctx, `
+		if err := core.ValidateTopicToken(nodeID); err != nil {
+			return "Error: Invalid argument 'node_id': must match ^[a-zA-Z0-9._:-]{1,128}$"
+		}
+
+		tCtx, cancel := withBoundedTimeout(ctx, defaultReadToolTimeout)
+		defer cancel()
+
+		rows, err := s.store.QueryReadOnlyMaps(tCtx, `
 			SELECT component, status, metrics, event_timestamp
 			FROM telemetric_ledger
 			WHERE node_id = $1
@@ -318,7 +469,7 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 			LIMIT 8
 		`, nodeID)
 		if err != nil {
-			return fmt.Sprintf("Read-only ledger error: %v", err)
+			return classifyDBError("Read-only ledger error", err)
 		}
 		if len(rows) == 0 {
 			return "No recent telemetry found for " + nodeID
@@ -338,10 +489,18 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 
 	case "analyze_latest_benchmark":
 		nodeID, _ := args["node_id"].(string)
-		if strings.TrimSpace(nodeID) == "" {
+		nodeID = strings.TrimSpace(nodeID)
+		if nodeID == "" {
 			return "Error: Missing required argument 'node_id'"
 		}
-		rows, err := s.store.QueryReadOnlyMaps(ctx, `
+		if err := core.ValidateTopicToken(nodeID); err != nil {
+			return "Error: Invalid argument 'node_id': must match ^[a-zA-Z0-9._:-]{1,128}$"
+		}
+
+		tCtx, cancel := withBoundedTimeout(ctx, defaultReadToolTimeout)
+		defer cancel()
+
+		rows, err := s.store.QueryReadOnlyMaps(tCtx, `
 			WITH latest_run AS (
 				SELECT
 					metrics->>'run_id' AS run_id,
@@ -375,7 +534,7 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 			LIMIT 250
 		`, nodeID)
 		if err != nil {
-			return fmt.Sprintf("Read-only ledger query failed: %v", err)
+			return classifyDBError("Read-only ledger query failed", err)
 		}
 		if len(rows) == 0 {
 			return "No observer telemetry recorded during the latest runner window for " + nodeID
@@ -395,16 +554,24 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 
 	case "query_readonly_ledger":
 		sqlQuery, _ := args["sql"].(string)
-		rows, err := s.store.QueryReadOnlyMaps(ctx, sqlQuery)
+		cleanedSQL, err := db.ValidateSelectOnlySQL(sqlQuery)
 		if err != nil {
-			return fmt.Sprintf("Read-only SQL rejected/failed: %v", err)
+			return "Read-only SQL rejected: " + jsonutil.SanitizeExternalErrorText(err.Error())
+		}
+
+		tCtx, cancel := withBoundedTimeout(ctx, defaultReadToolTimeout)
+		defer cancel()
+
+		rows, err := s.store.QueryReadOnlyMaps(tCtx, cleanedSQL)
+		if err != nil {
+			return classifyDBError("Read-only SQL failed", err)
 		}
 		if len(rows) > 50 {
 			rows = rows[:50]
 		}
-		raw, err := json.MarshalIndent(sanitizeJSONValue(rows), "", "  ")
+		raw, err := json.MarshalIndent(jsonutil.SanitizeValue(rows), "", "  ")
 		if err != nil {
-			return fmt.Sprintf("Error: failed to serialize ledger query results: %v", err)
+			return "Error: failed to serialize ledger query results"
 		}
 		return string(raw)
 
@@ -413,25 +580,36 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 		rawSQL, _ := args["sql"].(string)
 		normName, err := db.NormalizePMVName(viewName)
 		if err != nil {
-			return fmt.Sprintf("Invalid view_name: %v", err)
+			return "Invalid view_name: " + jsonutil.SanitizeExternalErrorText(err.Error())
+		}
+		cleanedSQL, err := db.ValidateSelectOnlySQL(rawSQL)
+		if err != nil {
+			return "Invalid sql: " + jsonutil.SanitizeExternalErrorText(err.Error())
 		}
 
 		proposal := ActionProposal{
 			Kind:     ActionCreatePMV,
 			Title:    fmt.Sprintf("Create %s view %s.%s", s.brand.MathName, s.brand.MathSchema, normName),
 			ViewName: normName,
-			RawSQL:   rawSQL,
+			RawSQL:   cleanedSQL,
 		}
 		if err := s.gate.Authorize(ctx, proposal); err != nil {
-			return fmt.Sprintf("Permission denied: %v", err)
+			return "Permission denied: " + jsonutil.SanitizeExternalErrorText(err.Error())
 		}
 
-		rec, err := s.math.SubmitAndCertifyPMV(ctx, strings.ToLower(s.brand.AgentName), normName, rawSQL, s.plainLLM)
+		tCtx, cancel := withBoundedTimeout(ctx, defaultPMVToolTimeout)
+		defer cancel()
+
+		rec, err := s.math.SubmitAndCertifyPMV(tCtx, strings.ToLower(s.brand.AgentName), normName, cleanedSQL, s.plainLLM)
 		if err != nil {
-			return fmt.Sprintf("PMV certification failed: %v", err)
+			return classifyPMVError(err)
+		}
+		notes := ""
+		if rec.AgentNotes != "" {
+			notes = jsonutil.SanitizeExternalErrorText(rec.AgentNotes)
 		}
 		return fmt.Sprintf("Certified %s.%s (status=%s): %s",
-			s.brand.MathSchema, rec.ViewName, rec.Status, rec.AgentNotes)
+			s.brand.MathSchema, rec.ViewName, rec.Status, notes)
 
 	case "dispatch_ephemeral_runner":
 		if s.dispatcher == nil {
@@ -441,19 +619,19 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 		if strings.TrimSpace(scriptBody) == "" {
 			return "Error: Missing required argument 'script_body'"
 		}
-		interp, _ := args["interpreter"].(string)
-		if strings.TrimSpace(interp) == "" {
-			interp = "sh"
+		rawInterp, _ := args["interpreter"].(string)
+		interp, err := normalizeAllowedInterpreter(rawInterp)
+		if err != nil {
+			return "Error: Invalid argument 'interpreter': " + jsonutil.SanitizeExternalErrorText(err.Error())
 		}
 		title, _ := args["title"].(string)
-		if strings.TrimSpace(title) == "" {
+		title = strings.TrimSpace(title)
+		if title == "" {
 			title = fmt.Sprintf("Ephemeral %s diagnostic runner", interp)
 		}
-		timeoutSec := 30
-		if tFloat, ok := args["timeout_sec"].(float64); ok && int(tFloat) > 0 {
-			timeoutSec = int(tFloat)
-		} else if tInt, ok := args["timeout_sec"].(int); ok && tInt > 0 {
-			timeoutSec = tInt
+		timeoutSec, err := parseEphemeralTimeoutSec(args)
+		if err != nil {
+			return "Error: Invalid argument 'timeout_sec': " + err.Error()
 		}
 
 		sel := core.RunnerSelector{
@@ -462,6 +640,13 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 		}
 		if sel.IsEmpty() {
 			return "Error: Specify at least one target in 'nodes' or 'tags'"
+		}
+		if err := validateSelectorTokens(sel); err != nil {
+			return "Error: " + jsonutil.SanitizeExternalErrorText(err.Error())
+		}
+		const runnerName = "ephemeral"
+		if err := core.ValidateTopicToken(runnerName); err != nil {
+			return "Error: Invalid runner token"
 		}
 
 		spec := runner.EphemeralSpec{
@@ -474,7 +659,7 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 		proposal := ActionProposal{
 			Kind:        ActionEphemeralRunner,
 			Title:       title,
-			Runner:      "ephemeral",
+			Runner:      runnerName,
 			Selectors:   sel,
 			Interpreter: spec.Interpreter,
 			ScriptBody:  spec.ScriptBody,
@@ -482,20 +667,24 @@ func (s *Service) executeRaw(ctx context.Context, name string, args map[string]a
 			TimeoutSec:  spec.TimeoutSec,
 		}
 		if err := s.gate.Authorize(ctx, proposal); err != nil {
-			return fmt.Sprintf("Ephemeral runner blocked: %v", err)
+			return "Ephemeral runner blocked: " + jsonutil.SanitizeExternalErrorText(err.Error())
 		}
 
 		req := core.RunnerRequestCTD{
 			RequestID:   fmt.Sprintf("care-%d", time.Now().UTC().UnixNano()),
 			Action:      "start",
-			Runner:      "ephemeral",
+			Runner:      runnerName,
 			Selectors:   sel,
 			Params:      spec.ToParams(),
 			RequestedBy: strings.ToLower(s.brand.AgentName),
 			RequestedAt: time.Now().UTC(),
 		}
-		if err := s.dispatcher(ctx, req); err != nil {
-			return fmt.Sprintf("Failed dispatching RunnerRequestCTD: %v", err)
+
+		tCtx, cancel := withBoundedTimeout(ctx, defaultDispatchToolTimeout)
+		defer cancel()
+
+		if err := s.dispatcher(tCtx, req); err != nil {
+			return classifyDispatchError(err)
 		}
 		return fmt.Sprintf("Dispatched ephemeral runner (request_id=%s, sha256=%s) to selectors nodes=%v tags=%v",
 			req.RequestID, spec.SHA256[:12], sel.Nodes, sel.Tags)
@@ -517,432 +706,7 @@ func capUTF8Output(s string, maxBytes int, marker string) string {
 		return s
 	}
 	if len(marker) >= maxBytes {
-		return truncateValidUTF8(marker, maxBytes)
+		return jsonutil.TruncateValidUTF8(marker, maxBytes)
 	}
-	return truncateValidUTF8(s, maxBytes-len(marker)) + marker
-}
-
-func truncateValidUTF8(s string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	if len(s) <= maxBytes {
-		return s
-	}
-	cut := maxBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	for cut > 0 {
-		r, size := utf8.DecodeLastRuneInString(s[:cut])
-		if r != utf8.RuneError || size != 1 {
-			break
-		}
-		cut--
-	}
-	return s[:cut]
-}
-
-// sanitizeJSONValue recursively replaces non-finite floats (NaN, +Inf, -Inf) with JSON-safe nil
-// without mutating caller-owned maps, slices, or structs.
-func sanitizeJSONValue(v any) any {
-	if v == nil {
-		return nil
-	}
-	sv, changed := sanitizeReflectValue(reflect.ValueOf(v), 0)
-	if !changed {
-		return v
-	}
-	if !sv.IsValid() {
-		return nil
-	}
-	return sv.Interface()
-}
-
-func isNonFiniteFloat(f float64) bool {
-	return math.IsNaN(f) || math.IsInf(f, 0)
-}
-
-func canHoldNil(t reflect.Type) bool {
-	switch t.Kind() {
-	case reflect.Interface, reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
-		return true
-	default:
-		return false
-	}
-}
-
-func sanitizeReflectValue(v reflect.Value, depth int) (reflect.Value, bool) {
-	if !v.IsValid() || depth > maxJSONWalkDepth {
-		return v, false
-	}
-	if v.Type() == timeType || v.Type() == rawMsgType {
-		return v, false
-	}
-
-	if v.Type() == jsonNumberType {
-		s := strings.TrimSpace(v.String())
-		if f, err := strconv.ParseFloat(s, 64); err == nil && isNonFiniteFloat(f) {
-			return reflect.Value{}, true
-		}
-		return v, false
-	}
-
-	switch v.Kind() {
-	case reflect.Float32, reflect.Float64:
-		if isNonFiniteFloat(v.Float()) {
-			return reflect.Value{}, true
-		}
-		return v, false
-
-	case reflect.Interface:
-		if v.IsNil() {
-			return v, false
-		}
-		elem, changed := sanitizeReflectValue(v.Elem(), depth+1)
-		if !changed {
-			return v, false
-		}
-		if !elem.IsValid() {
-			return reflect.Zero(v.Type()), true
-		}
-		if elem.Type().AssignableTo(v.Type()) {
-			out := reflect.New(v.Type()).Elem()
-			out.Set(elem)
-			return out, true
-		}
-		return v, false
-
-	case reflect.Pointer:
-		if v.IsNil() {
-			return v, false
-		}
-		elem, changed := sanitizeReflectValue(v.Elem(), depth+1)
-		if !changed {
-			return v, false
-		}
-		if !elem.IsValid() {
-			return reflect.Zero(v.Type()), true
-		}
-		if elem.Type().AssignableTo(v.Type().Elem()) {
-			ptr := reflect.New(v.Type().Elem())
-			ptr.Elem().Set(elem)
-			return ptr, true
-		}
-		return elem, true
-
-	case reflect.Map:
-		if v.IsNil() || v.Len() == 0 {
-			return v, false
-		}
-		elemType := v.Type().Elem()
-		outElemType := elemType
-		type kv struct {
-			k reflect.Value
-			v reflect.Value
-		}
-		var entries []kv
-		changed := false
-
-		iter := v.MapRange()
-		for iter.Next() {
-			mk := iter.Key()
-			mv := iter.Value()
-			sv, c := sanitizeReflectValue(mv, depth+1)
-			if c {
-				changed = true
-				if !sv.IsValid() && !canHoldNil(outElemType) {
-					outElemType = anyType
-				} else if sv.IsValid() && !sv.Type().AssignableTo(outElemType) {
-					outElemType = anyType
-				}
-			}
-			entries = append(entries, kv{k: mk, v: sv})
-		}
-		if !changed {
-			return v, false
-		}
-		out := reflect.MakeMapWithSize(reflect.MapOf(v.Type().Key(), outElemType), len(entries))
-		for _, e := range entries {
-			if !e.v.IsValid() {
-				out.SetMapIndex(e.k, reflect.Zero(outElemType))
-				continue
-			}
-			if e.v.Type().AssignableTo(outElemType) {
-				out.SetMapIndex(e.k, e.v)
-				continue
-			}
-			wrapped := reflect.New(outElemType).Elem()
-			wrapped.Set(e.v)
-			out.SetMapIndex(e.k, wrapped)
-		}
-		return out, true
-
-	case reflect.Slice:
-		if v.IsNil() || v.Len() == 0 || v.Type().Elem().Kind() == reflect.Uint8 {
-			return v, false
-		}
-		return sanitizeSequence(v, depth)
-
-	case reflect.Array:
-		if v.Len() == 0 || v.Type().Elem().Kind() == reflect.Uint8 {
-			return v, false
-		}
-		return sanitizeSequence(v, depth)
-
-	case reflect.Struct:
-		t := v.Type()
-		n := v.NumField()
-		sanitizedFields := make(map[int]reflect.Value)
-		changed := false
-		needsMap := false
-		for i := 0; i < n; i++ {
-			sf := t.Field(i)
-			fv := v.Field(i)
-			isEmbeddedStruct := sf.Anonymous && isStructOrPtrToStruct(fv.Type())
-			if !sf.IsExported() && !isEmbeddedStruct {
-				continue
-			}
-			if _, _, _, skip := parseJSONTag(sf.Tag.Get("json")); skip {
-				continue
-			}
-			sv, c := sanitizeReflectValue(fv, depth+1)
-			if !c {
-				continue
-			}
-			changed = true
-			sanitizedFields[i] = sv
-			if !sf.IsExported() || (!sv.IsValid() && !canHoldNil(fv.Type())) || (sv.IsValid() && !sv.Type().AssignableTo(fv.Type())) {
-				needsMap = true
-			}
-		}
-		if !changed {
-			return v, false
-		}
-		if needsMap {
-			return reflect.ValueOf(structToJSONMap(v, sanitizedFields)), true
-		}
-		out := reflect.New(t).Elem()
-		out.Set(v)
-		for i, sv := range sanitizedFields {
-			dst := out.Field(i)
-			if !sv.IsValid() {
-				dst.SetZero()
-			} else {
-				dst.Set(sv)
-			}
-		}
-		return out, true
-
-	default:
-		return v, false
-	}
-}
-
-func sanitizeSequence(v reflect.Value, depth int) (reflect.Value, bool) {
-	n := v.Len()
-	elemType := v.Type().Elem()
-	outElemType := elemType
-	items := make([]reflect.Value, n)
-	changed := false
-
-	for i := 0; i < n; i++ {
-		sv, c := sanitizeReflectValue(v.Index(i), depth+1)
-		if c {
-			changed = true
-			if !sv.IsValid() && !canHoldNil(outElemType) {
-				outElemType = anyType
-			} else if sv.IsValid() && !sv.Type().AssignableTo(outElemType) {
-				outElemType = anyType
-			}
-		}
-		items[i] = sv
-	}
-	if !changed {
-		return v, false
-	}
-
-	if v.Kind() == reflect.Array && outElemType == elemType {
-		out := reflect.New(v.Type()).Elem()
-		for i, item := range items {
-			if !item.IsValid() {
-				out.Index(i).SetZero()
-			} else {
-				out.Index(i).Set(item)
-			}
-		}
-		return out, true
-	}
-
-	out := reflect.MakeSlice(reflect.SliceOf(outElemType), n, n)
-	for i, item := range items {
-		if !item.IsValid() {
-			continue
-		}
-		out.Index(i).Set(item)
-	}
-	return out, true
-}
-
-func parseJSONTag(tag string) (name string, omitEmpty, omitZero, skip bool) {
-	if tag == "-" {
-		return "", false, false, true
-	}
-	parts := strings.Split(tag, ",")
-	name = parts[0]
-	for _, opt := range parts[1:] {
-		switch opt {
-		case "omitempty":
-			omitEmpty = true
-		case "omitzero":
-			omitZero = true
-		}
-	}
-	return name, omitEmpty, omitZero, false
-}
-
-func isEmptyJSONReflectValue(v reflect.Value) bool {
-	if !v.IsValid() {
-		return true
-	}
-	switch v.Kind() {
-	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
-		return v.Len() == 0
-	case reflect.Bool:
-		return !v.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return v.Int() == 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return v.Uint() == 0
-	case reflect.Float32, reflect.Float64:
-		return v.Float() == 0
-	case reflect.Interface, reflect.Pointer:
-		return v.IsNil()
-	}
-	return false
-}
-
-func structToJSONMap(v reflect.Value, sanitizedFields map[int]reflect.Value) map[string]any {
-	out := make(map[string]any, v.NumField())
-	t := v.Type()
-
-	type embeddedEntry struct {
-		val reflect.Value
-	}
-	var embedded []embeddedEntry
-
-	for i := 0; i < v.NumField(); i++ {
-		sf := t.Field(i)
-		fv := v.Field(i)
-		isEmbeddedStruct := sf.Anonymous && isStructOrPtrToStruct(fv.Type())
-		if !sf.IsExported() && !isEmbeddedStruct {
-			continue
-		}
-		tagName, omitEmpty, omitZero, skip := parseJSONTag(sf.Tag.Get("json"))
-		if skip {
-			continue
-		}
-		sv, hasSanitized := sanitizedFields[i]
-
-		if sf.Anonymous && tagName == "" {
-			eff := fv
-			if hasSanitized {
-				eff = sv
-			}
-			if eff.IsValid() && eff.Kind() == reflect.Pointer {
-				if eff.IsNil() {
-					continue
-				}
-				eff = eff.Elem()
-			}
-			if eff.IsValid() && (eff.Kind() == reflect.Struct || eff.Kind() == reflect.Map) {
-				embedded = append(embedded, embeddedEntry{val: eff})
-				continue
-			}
-		}
-		if !sf.IsExported() {
-			if hasSanitized && sv.IsValid() && sv.CanInterface() {
-				if tagName == "" {
-					tagName = sf.Name
-				}
-				out[tagName] = sv.Interface()
-			} else if isEmbeddedStruct {
-				eff := fv
-				if eff.Kind() == reflect.Pointer {
-					if eff.IsNil() {
-						continue
-					}
-					eff = eff.Elem()
-				}
-				if tagName == "" {
-					tagName = sf.Name
-				}
-				out[tagName] = structToJSONMap(eff, nil)
-			}
-			continue
-		}
-
-		if tagName == "" {
-			tagName = sf.Name
-		}
-		if omitEmpty && !hasSanitized && isEmptyJSONReflectValue(fv) {
-			continue
-		}
-		if omitEmpty && hasSanitized && sv.IsValid() && isEmptyJSONReflectValue(sv) && !isNonFiniteReflectFloat(fv) {
-			continue
-		}
-		if omitZero && !hasSanitized && fv.IsZero() {
-			continue
-		}
-
-		if !hasSanitized {
-			out[tagName] = fv.Interface()
-			continue
-		}
-		if !sv.IsValid() {
-			out[tagName] = nil
-			continue
-		}
-		out[tagName] = sv.Interface()
-	}
-
-	for _, emb := range embedded {
-		var embMap map[string]any
-		switch emb.val.Kind() {
-		case reflect.Map:
-			if emb.val.Type().Key().Kind() == reflect.String {
-				embMap = make(map[string]any, emb.val.Len())
-				iter := emb.val.MapRange()
-				for iter.Next() {
-					embMap[iter.Key().String()] = iter.Value().Interface()
-				}
-			}
-		case reflect.Struct:
-			embMap = structToJSONMap(emb.val, nil)
-		}
-		for k, val := range embMap {
-			if _, exists := out[k]; !exists {
-				out[k] = val
-			}
-		}
-	}
-
-	return out
-}
-
-func isStructOrPtrToStruct(t reflect.Type) bool {
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	return t.Kind() == reflect.Struct
-}
-
-func isNonFiniteReflectFloat(v reflect.Value) bool {
-	if !v.IsValid() {
-		return false
-	}
-	if v.Kind() == reflect.Float32 || v.Kind() == reflect.Float64 {
-		return isNonFiniteFloat(v.Float())
-	}
-	return false
+	return jsonutil.TruncateValidUTF8(s, maxBytes-len(marker)) + marker
 }

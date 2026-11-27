@@ -65,17 +65,46 @@ Transitioning beyond passive logging, CarrierPigeons pairs continuous hardware o
 * **Selector Router & Ntfy Watchdog:** Resolves `RunnerRequestCTD` targets across `--all`, `--node`, and `--tag` unions, records provenance edges in `ctd_traces`, and dispatches Ntfy alerts on LWT state transitions.
 
 🎛️ **Pigeons (`cmd/pigeons` / `pkg/controlplane`) — Workstation CLI & 4-Tab TUI Control Plane**
-*Installed strictly on operator laptops/workstations to manage the mesh:*
-* **Chained Runner Dispatch -> Live TUI:**
+*Installed strictly on operator laptops/workstations to manage one or more isolated meshes:*
+* **Multi-Mesh Switching (MNS):** Switch active meshes (`cwd`-style) with live MQTT/PostgreSQL MNS identity and `topic_root` verification, or override per command with `--mesh <name>`:
   ```sh
-  pigeons run SyntheticComputeRnr --node=rv64-compute-01 --node=rv64-vision-02 --tag={compute-bench}
+  pigeons connect compute-mesh --broker tcp://192.0.2.10:1883 --db postgres://operator:pass@192.0.2.10:5432/edge_ledger
+  pigeons mesh list            # Inspect configured [meshes.*] profiles & active working mesh
+  pigeons mesh current         # Print active working mesh name for shell prompts/scripts
+  pigeons connect -            # Toggle back to the previous working mesh
+  pigeons disconnect           # Clear persisted working mesh state
+  pigeons --mesh sensor-mesh ps
   ```
-  Publishes a `RunnerRequestCTD` to `PigeonCoop` and boots directly into the interactive **`RunnerManager`** TUI tab.
-* **Hub-Authoritative Node Tagging:**
+* **Fleet Inspection & Hub-Authoritative Tagging:**
   ```sh
+  pigeons ps                   # Fleet liveness & health check (-v for metrics, --add-support for PigeonCare triage)
+  pigeons list --tag riscv64   # List registered nodes filtered by tag
+  pigeons node rv64-compute-01 # Inspect latest telemetry & tags for a single node
   pigeons tag databroker rv64-coop-01
   ```
-* **4-Tab Interactive TUI (`pigeons tui`):** `1:Fleet Overview`, `2:RunnerManager`, `3:PigeonMath`, and `4:PigeonCare`.
+* **Runner Dispatch, Benchmark & Targeted Abort:**
+  ```sh
+  pigeons run SyntheticComputeRnr --node=rv64-compute-01 --node=rv64-vision-02 --tag={compute-bench}
+  pigeons runner benchmark rv64-compute-01 --secs 60 --system
+  pigeons runner abort SyntheticComputeRnr --node=rv64-compute-01 --request-id=req-123456
+  pigeons runner abort PauseRnr --all
+  ```
+* **Coop Operations & Ledger Retention:**
+  ```sh
+  pigeons coop status          # Verify MNS identity, MQTT broker, CTD Ledger, and PMV counts
+  pigeons coop migrate         # Idempotently apply CTD Ledger, MNS, Node, Trace, and PigeonMath schemas
+  pigeons coop provision-roles # Provision least-privilege ctd_ingestor and pigeoncare_ro RBAC roles
+  pigeons coop activity        # Audit CTD Ledger write/update actor attribution
+  pigeons coop prune --older-than 720h --batch-size 5000
+  ```
+* **4-Tab Interactive TUI (`pigeons tui`), PigeonMath & PigeonCare:**
+  ```sh
+  pigeons tui                                # 1:Fleet Overview, 2:RunnerManager, 3:PigeonMath, 4:PigeonCare
+  pigeons math list                          # List certified pigeonmath.pmv_* views
+  pigeons math inspect pmv_thermal_rollup    # Show raw intent, tuned SQL, and certification status
+  pigeons math create thermal_rollup "SELECT node_id, AVG((metrics->>'cpu_temp_c')::float) FROM telemetric_ledger GROUP BY 1"
+  pigeons care --mode default                # Launch PigeonCare SRE tab ('default', 'auto_edit', or 'yolo')
+  ```
 
 📐 **PigeonMath (`internal/pigeonmath`) — Analytics TUI & Certified `pmv_*` View Engine**
 * **`btop`-Inspired TUI Telemetry Graphs:** Auto-refreshing 1-minute aggregated time-series plots tracking `#nodes` (`Total`, `Live`, `Quiet`) and `#CTD/min` (`Observer`, `Runner`, `Tracer`).

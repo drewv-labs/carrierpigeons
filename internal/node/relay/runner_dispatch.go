@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,32 @@ type activeRun struct {
 	requestID string
 	cancel    context.CancelFunc
 	aborting  bool
+}
+
+func handleAbort(mu *sync.Mutex, activeRunners map[string]*activeRun, nodeID, runnerKey string, env runner.Envelope) {
+	targetReqID := strings.TrimSpace(env.TargetRequestID)
+	mu.Lock()
+	entry, active := activeRunners[runnerKey]
+	if !active {
+		mu.Unlock()
+		log.Printf("[Runner Dispatch] Abort ignored: %q (%s) is not currently running.", env.Runner, runnerKey)
+		return
+	}
+	if targetReqID != "" && entry.requestID != targetReqID {
+		activeReqID := entry.requestID
+		mu.Unlock()
+		log.Printf("[Runner Dispatch] Abort ignored: %q (%s) target_request_id mismatch (target=%q, active=%q).", env.Runner, runnerKey, targetReqID, activeReqID)
+		return
+	}
+	alreadyAborting := entry.aborting
+	entry.aborting = true
+	cancelFn := entry.cancel
+	mu.Unlock()
+
+	if !alreadyAborting {
+		log.Printf("[Runner Dispatch] ABORT SIGNAL RECEIVED: Killing %q (%s) on %s", env.Runner, runnerKey, nodeID)
+	}
+	cancelFn()
 }
 
 func (c *MQTTClient) lookupRunner(name string) (runner.Runner, string, bool) {
@@ -130,28 +157,7 @@ func (c *MQTTClient) ListenForRunners(parentCtx context.Context, nodeID string, 
 		task, runnerKey, exists := c.lookupRunner(env.Runner)
 
 		if action == "abort" {
-			mu.Lock()
-			entry, active := activeRunners[runnerKey]
-			if !active {
-				mu.Unlock()
-				log.Printf("[Runner Dispatch] Abort ignored: %q (%s) is not currently running.", env.Runner, runnerKey)
-				return
-			}
-			if env.RequestID != "" && entry.requestID != env.RequestID {
-				activeReqID := entry.requestID
-				mu.Unlock()
-				log.Printf("[Runner Dispatch] Abort ignored: %q (%s) request_id mismatch (abort=%q, active=%q).", env.Runner, runnerKey, env.RequestID, activeReqID)
-				return
-			}
-			alreadyAborting := entry.aborting
-			entry.aborting = true
-			cancelFn := entry.cancel
-			mu.Unlock()
-
-			if !alreadyAborting {
-				log.Printf("[Runner Dispatch] ABORT SIGNAL RECEIVED: Killing %q (%s) on %s", env.Runner, runnerKey, nodeID)
-			}
-			cancelFn()
+			handleAbort(&mu, activeRunners, nodeID, runnerKey, env)
 			return
 		}
 

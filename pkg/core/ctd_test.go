@@ -137,6 +137,44 @@ func TestNormalizeTagsAndRunnerRequestValidate(t *testing.T) {
 		t.Fatalf("expected valid RunnerRequestCTD, got %v", err)
 	}
 
+	rawStart, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal start RunnerRequestCTD failed: %v", err)
+	}
+	if strings.Contains(string(rawStart), "target_request_id") {
+		t.Fatalf("expected empty TargetRequestID to be omitted on wire, got %s", string(rawStart))
+	}
+
+	abortReq := RunnerRequestCTD{
+		RequestID:       "req-abort-002",
+		TargetRequestID: "req-001",
+		Action:          "abort",
+		Runner:          "SyntheticComputeRnr",
+		Selectors:       RunnerSelector{Nodes: []string{"rv64-compute-01"}},
+		RequestedBy:     "operator",
+		RequestedAt:     time.Now().UTC(),
+	}
+	if err := abortReq.Validate(); err != nil {
+		t.Fatalf("expected valid abort RunnerRequestCTD, got %v", err)
+	}
+	rawAbort, err := json.Marshal(abortReq)
+	if err != nil {
+		t.Fatalf("marshal abort RunnerRequestCTD failed: %v", err)
+	}
+	var decodedAbort RunnerRequestCTD
+	if err := json.Unmarshal(rawAbort, &decodedAbort); err != nil {
+		t.Fatalf("unmarshal abort RunnerRequestCTD failed: %v", err)
+	}
+	if decodedAbort.RequestID != "req-abort-002" || decodedAbort.TargetRequestID != "req-001" {
+		t.Fatalf("unexpected decoded abort RunnerRequestCTD: %+v", decodedAbort)
+	}
+
+	missingTransportID := abortReq
+	missingTransportID.RequestID = ""
+	if err := missingTransportID.Validate(); err == nil {
+		t.Fatal("expected abort RunnerRequestCTD without unique transport RequestID to fail validation")
+	}
+
 	emptySel := req
 	emptySel.Selectors = RunnerSelector{}
 	if err := emptySel.Validate(); err == nil {

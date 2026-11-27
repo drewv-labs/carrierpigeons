@@ -10,14 +10,19 @@ import (
 )
 
 func buildAbortRunnerRequest(runnerName, operator string, all bool, flagNodes, positionalNodes, tags []string) (core.RunnerRequestCTD, error) {
+	return buildAbortRunnerRequestWithTarget(runnerName, operator, "", all, flagNodes, positionalNodes, tags)
+}
+
+func buildAbortRunnerRequestWithTarget(runnerName, operator, targetRequestID string, all bool, flagNodes, positionalNodes, tags []string) (core.RunnerRequestCTD, error) {
 	combinedNodes := make([]string, 0, len(flagNodes)+len(positionalNodes))
 	combinedNodes = append(combinedNodes, flagNodes...)
 	combinedNodes = append(combinedNodes, positionalNodes...)
 
 	req := core.RunnerRequestCTD{
-		RequestID: fmt.Sprintf("abort-%d", time.Now().UTC().UnixNano()),
-		Action:    "abort",
-		Runner:    strings.TrimSpace(runnerName),
+		RequestID:       fmt.Sprintf("abort-%d", time.Now().UTC().UnixNano()),
+		TargetRequestID: strings.TrimSpace(targetRequestID),
+		Action:          "abort",
+		Runner:          strings.TrimSpace(runnerName),
 		Selectors: core.RunnerSelector{
 			All:   all,
 			Nodes: cleanSelectorTokens(combinedNodes, false),
@@ -34,7 +39,7 @@ var runnerAbortCmd = &cobra.Command{
 	Short: "Send a stop/abort signal to an active runner (or resume PauseRnr) via PigeonCoop RunnerRequestCTD",
 	Example: `  pigeons runner abort PauseRnr --all
   pigeons runner abort PauseRnr rv64-compute-01
-  pigeons runner abort SyntheticComputeRnr --tag=compute-bench`,
+  pigeons runner abort SyntheticComputeRnr --tag=compute-bench --request-id=req-123456`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		state := cliStateFromCommand(cmd)
@@ -43,8 +48,9 @@ var runnerAbortCmd = &cobra.Command{
 		all, _ := f.GetBool("all")
 		nodes, _ := f.GetStringArray("node")
 		tags, _ := f.GetStringArray("tag")
+		targetReqID, _ := f.GetString("request-id")
 
-		req, err := buildAbortRunnerRequest(args[0], cfg.Operator, all, nodes, args[1:], tags)
+		req, err := buildAbortRunnerRequestWithTarget(args[0], cfg.Operator, targetReqID, all, nodes, args[1:], tags)
 		if err != nil {
 			return err
 		}
@@ -54,8 +60,13 @@ var runnerAbortCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Fprintf(cmd.OutOrStdout(), "[+] Submitted abort RunnerRequestCTD %s for %q -> (all=%v, nodes=%v, tags=%v)\n",
-			req.RequestID, req.Runner, req.Selectors.All, req.Selectors.Nodes, req.Selectors.Tags)
+		if req.TargetRequestID != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "[+] Submitted abort RunnerRequestCTD %s (target_request_id=%s) for %q -> (all=%v, nodes=%v, tags=%v)\n",
+				req.RequestID, req.TargetRequestID, req.Runner, req.Selectors.All, req.Selectors.Nodes, req.Selectors.Tags)
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "[+] Submitted abort RunnerRequestCTD %s for %q -> (all=%v, nodes=%v, tags=%v)\n",
+				req.RequestID, req.Runner, req.Selectors.All, req.Selectors.Nodes, req.Selectors.Tags)
+		}
 		return nil
 	},
 }
@@ -65,4 +76,5 @@ func init() {
 	runnerAbortCmd.Flags().Bool("all", false, "Abort runner across all active nodes in the mesh")
 	runnerAbortCmd.Flags().StringArray("node", nil, "Target node ID (repeatable, or pass node IDs positionally)")
 	runnerAbortCmd.Flags().StringArray("tag", nil, "Target node tag (repeatable)")
+	runnerAbortCmd.Flags().String("request-id", "", "Optional target runner request_id to abort (defaults to active run on target node)")
 }

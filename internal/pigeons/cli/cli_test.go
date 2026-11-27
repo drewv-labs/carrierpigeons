@@ -1038,6 +1038,7 @@ func TestDialMQTTClientWithConfigTimeoutCleanupAndTLSValidation(t *testing.T) {
 func TestBrandCloningStateBrandAndEnvMeshSource(t *testing.T) {
 	dir := t.TempDir()
 	customMeshFile := filepath.Join(dir, "custom_current_mesh")
+	t.Setenv("PIGEONS_CURRENT_MESH_FILE", filepath.Join(dir, "pigeons_current_mesh"))
 	t.Setenv("CUSTOM_CURRENT_MESH_FILE", customMeshFile)
 	t.Setenv("CUSTOM_MESH", "env-mesh")
 
@@ -1196,6 +1197,7 @@ func TestConnectCLIFlagPrecedenceMNSConflictsAndTimestamps(t *testing.T) {
 
 	// 2. Cross-source conflict detection (CoopNodeID / TopicRoot) across MQTT & Postgres.
 	cfgBoth := config.DefaultWorkstationConfig()
+	cfgBoth.Brand.TopicRoot = "root-a"
 	cfgBoth.BrokerURL = "tcp://127.0.0.1:1883"
 	cfgBoth.DatabaseURL = "postgres://op:pw@127.0.0.1:5432/edge_ledger"
 	now := time.Now().UTC()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -23,25 +24,26 @@ import (
 )
 
 const (
-	telemetryWorkerCount     = 4
-	telemetryQueueCap        = 4096
-	defaultTelemetryMaxBytes = 16 << 20 // 16 MiB decode queue byte budget
-	controlWorkerCount       = 4
-	controlQueueCap          = 256
-	runnerReqWorkerCount     = 2
-	runnerReqQueueCap        = 256
-	traceInsertWorkers       = 8
-	ntfyMaxConcurrency       = 8
-	subscribeWaitTimeout     = 5 * time.Second
-	subscribeRetryBase       = 250 * time.Millisecond
-	subscribeRetryMax        = 5 * time.Second
-	runnerPublishTimeout     = 3 * time.Second
-	defaultMNSRefresh        = 1 * time.Hour
-	defaultShutdownGrace     = 5 * time.Second
-	shutdownPostCancelWait   = 500 * time.Millisecond
-	defaultReqDedupMax       = 4096
-	defaultReqDedupTTL       = 10 * time.Minute
-	defaultStaleNodeInterval = 1 * time.Minute
+	telemetryWorkerCount      = 4
+	telemetryQueueCap         = 4096
+	defaultTelemetryMaxBytes  = 16 << 20 // 16 MiB decode queue byte budget
+	controlWorkerCount        = 4
+	controlQueueCap           = 256
+	runnerReqWorkerCount      = 2
+	runnerReqQueueCap         = 256
+	traceInsertWorkers        = 8
+	ntfyMaxConcurrency        = 8
+	subscribeWaitTimeout      = 5 * time.Second
+	subscribeRetryBase        = 250 * time.Millisecond
+	subscribeRetryMax         = 5 * time.Second
+	runnerPublishTimeout      = 3 * time.Second
+	defaultMNSRefresh         = 1 * time.Hour
+	defaultMNSUpsertTimeout   = 5 * time.Second
+	defaultShutdownGrace      = 5 * time.Second
+	shutdownPostCancelWait    = 500 * time.Millisecond
+	defaultReqDedupMax        = 4096
+	defaultReqDedupTTL        = 10 * time.Minute
+	defaultStaleNodeInterval  = 1 * time.Minute
 	defaultStaleNodeThreshold = 3 * time.Minute
 )
 
@@ -94,6 +96,11 @@ type ClusterStatusLedger interface {
 // TraceBatchLedger is an optional extension enabling single-roundtrip trace batch persistence.
 type TraceBatchLedger interface {
 	InsertTraces(ctx context.Context, traces []core.TraceEdge) error
+}
+
+// MeshIdentityLedger is an optional extension enabling periodic MNS heartbeat refreshes in PostgreSQL.
+type MeshIdentityLedger interface {
+	UpsertMeshIdentity(ctx context.Context, identity core.MeshIdentity) error
 }
 
 // SubscriberOptions configures Coop's MQTT ingestion, MNS announcement, Ntfy alerting, TLS, and COPY batching parameters.
@@ -234,6 +241,8 @@ type Subscriber struct {
 	onConnectClosed    bool
 	onConnectWG        sync.WaitGroup
 	onConnectGen       atomic.Uint64
+	mnsCtx             context.Context
+	mnsCancel          context.CancelFunc
 	mnsRefreshInterval time.Duration
 	mnsStop            chan struct{}
 	mnsWG              sync.WaitGroup
@@ -243,6 +252,7 @@ type Subscriber struct {
 	reaperWG           sync.WaitGroup
 	staleNodeInterval  time.Duration
 	staleNodeThreshold time.Duration
+	handlerMu          sync.RWMutex
 	telemetryQueue     chan rawTelemetryMsg
 	telemetryStop      chan struct{}
 	telemetryWG        sync.WaitGroup
@@ -357,6 +367,7 @@ func (s *Subscriber) handleOnConnect(client mqtt.Client, allSubs []subTarget, re
 	// can verify the remote PigeonCoop's registered mesh name before switching profiles.
 	s.publishMeshIdentity(client)
 }
+
 // NewSubscriber creates a new MQTT listener with default batching and Ntfy settings.
 func NewSubscriber(brokerURL string, ledger Ledger) (*Subscriber, error) {
 	return NewSubscriberWithOptions(SubscriberOptions{
@@ -425,6 +436,7 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 
 	ntfyCtx, ntfyCancel := context.WithCancel(context.Background())
 	workCtx, workCancel := context.WithCancel(context.Background())
+	mnsCtx, mnsCancel := context.WithCancel(workCtx)
 	reaperCtx, reaperCancel := context.WithCancel(workCtx)
 	mnsInterval := cfg.MNSRefreshInterval
 	if mnsInterval <= 0 {
@@ -462,6 +474,8 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 		ntfyCancel:         ntfyCancel,
 		workCtx:            workCtx,
 		workCancel:         workCancel,
+		mnsCtx:             mnsCtx,
+		mnsCancel:          mnsCancel,
 		mnsRefreshInterval: mnsInterval,
 		mnsStop:            make(chan struct{}),
 		reaperCtx:          reaperCtx,
@@ -551,15 +565,18 @@ func NewSubscriberWithOptions(cfg SubscriberOptions, ledger Ledger) (*Subscriber
 		sub.onConnectMu.Lock()
 		sub.onConnectClosed = true
 		sub.onConnectMu.Unlock()
+		mnsCancel()
 		reaperCancel()
 		workCancel()
 		close(sub.mnsStop)
 		close(sub.reaperStop)
+		sub.handlerMu.Lock()
 		close(sub.telemetryStop)
-		sub.telemetryWG.Wait()
 		close(sub.ctrlStop)
-		sub.ctrlWG.Wait()
 		close(sub.runnerReqStop)
+		sub.handlerMu.Unlock()
+		sub.telemetryWG.Wait()
+		sub.ctrlWG.Wait()
 		sub.runnerReqWG.Wait()
 		sub.onConnectWG.Wait()
 		sub.ntfyWG.Wait()
@@ -590,16 +607,27 @@ func (s *Subscriber) workContext() context.Context {
 	return context.Background()
 }
 
-func (s *Subscriber) publishMeshIdentity(client mqtt.Client) {
-	if client == nil {
-		return
+func (s *Subscriber) mnsContext() context.Context {
+	if s.mnsCtx != nil {
+		return s.mnsCtx
 	}
-	rawIdentity, err := json.Marshal(core.MeshIdentity{
+	return s.workContext()
+}
+
+func (s *Subscriber) publishMeshIdentity(client mqtt.Client) {
+	s.publishMeshIdentityRecord(client, core.MeshIdentity{
 		MeshName:   s.meshName,
 		CoopNodeID: s.coopNodeID,
 		TopicRoot:  s.topicRoot,
 		UpdatedAt:  time.Now().UTC(),
 	})
+}
+
+func (s *Subscriber) publishMeshIdentityRecord(client mqtt.Client, id core.MeshIdentity) {
+	if client == nil {
+		return
+	}
+	rawIdentity, err := json.Marshal(id)
 	if err != nil {
 		return
 	}
@@ -609,18 +637,44 @@ func (s *Subscriber) publishMeshIdentity(client mqtt.Client) {
 	}
 }
 
+func (s *Subscriber) refreshMeshIdentity() {
+	id := core.MeshIdentity{
+		MeshName:   s.meshName,
+		CoopNodeID: s.coopNodeID,
+		TopicRoot:  s.topicRoot,
+		UpdatedAt:  time.Now().UTC(),
+	}
+	if s.ledger != nil {
+		if ml, ok := s.ledger.(MeshIdentityLedger); ok && s.mnsContext().Err() == nil {
+			ctx, cancel := context.WithTimeout(s.mnsContext(), defaultMNSUpsertTimeout)
+			err := ml.UpsertMeshIdentity(ctx, id)
+			cancel()
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("[Coop Broker] Failed refreshing MNS identity in ledger [mesh=%s]: %v", s.meshName, err)
+			}
+		}
+	}
+	if s.client != nil && s.client.IsConnected() {
+		s.publishMeshIdentityRecord(s.client, id)
+	}
+}
+
 func (s *Subscriber) mnsRefreshLoop() {
 	defer s.mnsWG.Done()
-	ticker := time.NewTicker(s.mnsRefreshInterval)
+	interval := s.mnsRefreshInterval
+	if interval <= 0 {
+		interval = defaultMNSRefresh
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-s.mnsStop:
 			return
+		case <-s.mnsContext().Done():
+			return
 		case <-ticker.C:
-			if s.client != nil && s.client.IsConnected() {
-				s.publishMeshIdentity(s.client)
-			}
+			s.refreshMeshIdentity()
 		}
 	}
 }
@@ -718,8 +772,11 @@ func (s *Subscriber) controlShardKey(topic string) string {
 func (s *Subscriber) enqueueControl(handler func(topic string, payload []byte)) mqtt.MessageHandler {
 	return func(_ mqtt.Client, msg mqtt.Message) {
 		topic := msg.Topic()
+		s.handlerMu.RLock()
+		defer s.handlerMu.RUnlock()
 		select {
 		case <-s.ctrlStop:
+			s.controlDropped.Add(1)
 			return
 		default:
 		}
@@ -743,8 +800,11 @@ func (s *Subscriber) enqueueControl(handler func(topic string, payload []byte)) 
 // on ctrlQueues cannot starve or drop operator runner start/abort commands.
 func (s *Subscriber) handleRunnerRequest(client mqtt.Client, msg mqtt.Message) {
 	topic := msg.Topic()
+	s.handlerMu.RLock()
+	defer s.handlerMu.RUnlock()
 	select {
 	case <-s.runnerReqStop:
+		s.runnerReqDropped.Add(1)
 		return
 	default:
 	}
@@ -769,8 +829,11 @@ func (s *Subscriber) effectiveTelemetryMaxBytes() int64 {
 // handleTelemetry decouples MQTT reception from JSON envelope decoding and batcher ingestion
 // so Paho callback dispatchers never block under burst load, while bounding buffered RAM.
 func (s *Subscriber) handleTelemetry(_ mqtt.Client, msg mqtt.Message) {
+	s.handlerMu.RLock()
+	defer s.handlerMu.RUnlock()
 	select {
 	case <-s.telemetryStop:
+		s.telemetryDropped.Add(1)
 		return
 	default:
 	}
@@ -962,6 +1025,12 @@ func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload 
 		log.Printf("[Coop Router] Invalid RunnerRequestCTD request_id dropped: %v", err)
 		return
 	}
+	if req.TargetRequestID != "" {
+		if err := core.ValidateTopicToken(req.TargetRequestID); err != nil {
+			log.Printf("[Coop Router] Invalid RunnerRequestCTD target_request_id dropped: %v", err)
+			return
+		}
+	}
 
 	action := req.Action
 	if action == "" {
@@ -975,10 +1044,11 @@ func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload 
 	}
 
 	env := runner.Envelope{
-		RequestID: req.RequestID,
-		Action:    action,
-		Runner:    req.Runner,
-		Params:    req.Params,
+		RequestID:       req.RequestID,
+		TargetRequestID: req.TargetRequestID,
+		Action:          action,
+		Runner:          req.Runner,
+		Params:          req.Params,
 	}
 	rawEnv, err := json.Marshal(env)
 	if err != nil {
@@ -1038,18 +1108,22 @@ func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload 
 	s.completeRequestDedup(dedupEntry)
 
 	reqArtifactID := "runner-request:" + req.RequestID
+	artMeta := map[string]string{
+		"runner":           req.Runner,
+		"action":           action,
+		"requested_by":     req.RequestedBy,
+		"targets":          strings.Join(succeededTargets, ","),
+		"resolved_targets": strings.Join(targets, ","),
+	}
+	if req.TargetRequestID != "" {
+		artMeta["target_request_id"] = req.TargetRequestID
+	}
 	artCtx, artCancel := context.WithTimeout(s.workContext(), 5*time.Second)
 	if err := s.ledger.UpsertArtifact(artCtx, core.Artifact{
-		ID:     reqArtifactID,
-		Kind:   "runner_request",
-		NodeID: s.coopNodeID,
-		Meta: map[string]string{
-			"runner":           req.Runner,
-			"action":           action,
-			"requested_by":     req.RequestedBy,
-			"targets":          strings.Join(succeededTargets, ","),
-			"resolved_targets": strings.Join(targets, ","),
-		},
+		ID:        reqArtifactID,
+		Kind:      "runner_request",
+		NodeID:    s.coopNodeID,
+		Meta:      artMeta,
 		CreatedAt: time.Now().UTC(),
 	}); err != nil {
 		log.Printf("[Coop Router] Failed upserting request artifact %s: %v", reqArtifactID, err)
@@ -1064,6 +1138,9 @@ func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload 
 		AddParam("request_id", req.RequestID).
 		AddParam("action", action).
 		AddParam("requested_by", req.RequestedBy)
+	if req.TargetRequestID != "" {
+		reqEvent.AddParam("target_request_id", req.TargetRequestID)
+	}
 	if len(targets) == 0 {
 		reqEvent.UpdateStatus("request-empty")
 	} else if len(succeededTargets) == 0 {
@@ -1077,16 +1154,20 @@ func (s *Subscriber) processRunnerRequest(client mqtt.Client, _ string, payload 
 		now := time.Now().UTC()
 		edges := make([]core.TraceEdge, 0, len(succeededTargets))
 		for _, targetNode := range succeededTargets {
+			traceMeta := map[string]string{
+				"runner": req.Runner,
+				"action": action,
+			}
+			if req.TargetRequestID != "" {
+				traceMeta["target_request_id"] = req.TargetRequestID
+			}
 			edges = append(edges, core.TraceEdge{
-				SourceID: reqArtifactID,
-				Verb:     "dispatched_to",
-				TargetID: "node:" + targetNode,
-				NodeID:   targetNode,
-				RunID:    req.RequestID,
-				Meta: map[string]string{
-					"runner": req.Runner,
-					"action": action,
-				},
+				SourceID:  reqArtifactID,
+				Verb:      "dispatched_to",
+				TargetID:  "node:" + targetNode,
+				NodeID:    targetNode,
+				RunID:     req.RequestID,
+				Meta:      traceMeta,
 				Timestamp: now,
 			})
 		}
@@ -1130,8 +1211,8 @@ func (s *Subscriber) RunnerRequestDroppedCount() uint64 {
 	return s.runnerReqDropped.Load()
 }
 
-// Disconnect stops periodic loops, joins telemetry/control/runner workers (canceling workCtx on grace expiration)
-// before waiting for Ntfy alerts, closing the COPY batcher, publishing OFFLINE MNS state, and disconnecting MQTT.
+// Disconnect stops periodic loops, publishes OFFLINE MNS state, and disconnects MQTT so Paho stops sending
+// QoS 1 PUBACKs before closing handler queues, joining workers, waiting for Ntfy alerts, and draining the COPY batcher.
 func (s *Subscriber) Disconnect() {
 	s.closeOnce.Do(func() {
 		if s.reaperCancel != nil {
@@ -1142,6 +1223,9 @@ func (s *Subscriber) Disconnect() {
 		}
 		s.reaperWG.Wait()
 
+		if s.mnsCancel != nil {
+			s.mnsCancel()
+		}
 		if s.mnsStop != nil {
 			close(s.mnsStop)
 		}
@@ -1152,6 +1236,17 @@ func (s *Subscriber) Disconnect() {
 		s.onConnectMu.Unlock()
 		s.onConnectWG.Wait()
 
+		if s.client != nil {
+			if s.client.IsConnected() && s.topicRoot != "" {
+				if rawLWT, err := s.marshalMeshOfflinePayload(); err == nil {
+					if err := waitTokenTimeout(s.client.Publish(s.brand.MeshTopic(), 1, true, rawLWT), 1*time.Second); err != nil {
+						log.Printf("[Coop Broker] Failed publishing offline MNS state to %s: %v", s.brand.MeshTopic(), err)
+					}
+				}
+			}
+			s.client.Disconnect(250)
+		}
+
 		if s.ntfyCancel != nil {
 			s.ntfyCancel()
 		}
@@ -1159,6 +1254,7 @@ func (s *Subscriber) Disconnect() {
 		s.ntfyClosed = true
 		s.ntfyMu.Unlock()
 
+		s.handlerMu.Lock()
 		if s.telemetryStop != nil {
 			close(s.telemetryStop)
 		}
@@ -1168,6 +1264,8 @@ func (s *Subscriber) Disconnect() {
 		if s.runnerReqStop != nil {
 			close(s.runnerReqStop)
 		}
+		s.handlerMu.Unlock()
+
 		s.telemetryWG.Wait()
 
 		workersDone := make(chan struct{})
@@ -1204,17 +1302,6 @@ func (s *Subscriber) Disconnect() {
 		s.ntfyWG.Wait()
 		if s.batcher != nil {
 			s.batcher.Close()
-		}
-
-		if s.client != nil {
-			if s.client.IsConnected() && s.topicRoot != "" {
-				if rawLWT, err := s.marshalMeshOfflinePayload(); err == nil {
-					if err := waitTokenTimeout(s.client.Publish(s.brand.MeshTopic(), 1, true, rawLWT), 1*time.Second); err != nil {
-						log.Printf("[Coop Broker] Failed publishing offline MNS state to %s: %v", s.brand.MeshTopic(), err)
-					}
-				}
-			}
-			s.client.Disconnect(250)
 		}
 	})
 }

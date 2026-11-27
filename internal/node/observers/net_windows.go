@@ -20,8 +20,8 @@ var (
 )
 
 const (
-	mibIfTypeLoopback      = 24
-	ifOperStatusUp         = 1 // RFC 2863 IF_OPER_STATUS IfOperStatusUp in MIB_IF_ROW2
+	mibIfTypeLoopback      = winMibIfTypeLoopback
+	ifOperStatusUp         = winIfOperStatusUp
 	ifMaxStringSize        = 256
 	ifMaxPhysAddressLength = 32
 )
@@ -111,13 +111,10 @@ func emitWindowsNetSamples(pub core.TelemetryPublisher, nodeID string) {
 
 	for i := range rows {
 		row := &rows[i]
-		if row.Type == mibIfTypeLoopback {
-			continue
+		if row.InterfaceAndOperStatusFlags&0x02 != 0 {
+			continue // Skip NDIS lightweight filter rows (FilterInterface bit)
 		}
-		if row.OperStatus != ifOperStatusUp {
-			continue
-		}
-		if row.InOctets == 0 && row.OutOctets == 0 {
+		if !isEligibleWindowsNetRow(row.Type, row.OperStatus, row.InterfaceAndOperStatusFlags, row.InOctets, row.OutOctets) {
 			continue
 		}
 

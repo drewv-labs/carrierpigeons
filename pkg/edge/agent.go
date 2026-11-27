@@ -41,11 +41,12 @@ type Options struct {
 // Agent encapsulates the MQTT-driven Observer + Runner runtime with variable-size ring spooling.
 // It powers standalone Pigeoneer daemons, implicit self-reporting inside PigeonCoop, and downstream SDK appliances.
 type Agent struct {
-	cfg       config.EdgeConfig
-	opts      Options
-	obsReg    *observer.Registry
-	runnerReg *runner.Registry
-	pauseCtrl *observer.PauseController
+	cfg             config.EdgeConfig
+	opts            Options
+	obsReg          *observer.Registry
+	runnerReg       *runner.Registry
+	pauseCtrl       *observer.PauseController
+	startConfigured func(context.Context, string, core.TelemetryPublisher, config.ObserversConfig, time.Duration, *observer.Registry, *sync.WaitGroup) []string
 
 	mu        sync.Mutex
 	starting  bool
@@ -95,11 +96,12 @@ func New(cfg config.EdgeConfig, opts ...Options) *Agent {
 	}
 
 	return &Agent{
-		cfg:       cfg,
-		opts:      opt,
-		obsReg:    obsReg,
-		runnerReg: runnerReg,
-		pauseCtrl: pauseCtrl,
+		cfg:             cfg,
+		opts:            opt,
+		obsReg:          obsReg,
+		runnerReg:       runnerReg,
+		pauseCtrl:       pauseCtrl,
+		startConfigured: observers.StartConfiguredWithRegistryAndWaitGroup,
 	}
 }
 
@@ -243,7 +245,11 @@ func (a *Agent) startObserversLocked(ctx context.Context, r *relay.MQTTClient) [
 	}
 
 	if remCfg != (config.ObserversConfig{}) {
-		subActive := observers.StartConfiguredWithRegistry(ctx, a.cfg.NodeID, r, remCfg, a.cfg.ParsedPollInterval(), observer.NewRegistry())
+		launcher := a.startConfigured
+		if launcher == nil {
+			launcher = observers.StartConfiguredWithRegistryAndWaitGroup
+		}
+		subActive := launcher(ctx, a.cfg.NodeID, r, remCfg, a.cfg.ParsedPollInterval(), observer.NewRegistry(), &a.obsWG)
 		active = append(active, subActive...)
 	}
 

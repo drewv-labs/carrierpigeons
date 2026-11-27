@@ -56,7 +56,14 @@ func TestObserverRegistryAndStartAll(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// F-09: nil publisher must early-return without launching observers that would panic on nil pub.
 	StartAll(ctx, "node-1", nil)
+	time.Sleep(15 * time.Millisecond)
+	if called.Load() {
+		t.Fatal("expected StartAll with nil publisher to early-return without invoking observer")
+	}
+
+	StartAll(ctx, "node-1", &slicePublisher{})
 
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for !called.Load() && time.Now().Before(deadline) {
@@ -64,6 +71,50 @@ func TestObserverRegistryAndStartAll(t *testing.T) {
 	}
 	if !called.Load() {
 		t.Fatal("expected StartAll to invoke registered observer")
+	}
+}
+
+func TestZeroValuePauseControllerAndRegistry(t *testing.T) {
+	// Zero-value PauseController must not immediately cancel ContextUntilPaused when unpaused,
+	// and must still cancel derived contexts promptly once Pause/Acquire is invoked.
+	var zeroPC PauseController
+	cctx, cancel := zeroPC.ContextUntilPaused(context.Background())
+	defer cancel()
+
+	if err := cctx.Err(); err != nil {
+		t.Fatalf("expected unpaused zero-value PauseController ContextUntilPaused to remain active, got %v", err)
+	}
+
+	rel := zeroPC.Acquire()
+	select {
+	case <-cctx.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected zero-value PauseController Acquire to cancel derived ContextUntilPaused")
+	}
+	rel()
+
+	cctx2, cancel2 := zeroPC.ContextUntilPaused(context.Background())
+	defer cancel2()
+	if err := cctx2.Err(); err != nil {
+		t.Fatalf("expected resumed zero-value PauseController ContextUntilPaused to remain active, got %v", err)
+	}
+
+	// Zero-value Registry must lazily initialize its map on Register without panicking.
+	var zeroReg Registry
+	var obsCalled atomic.Bool
+	zeroReg.Register(&stubObserver{name: "zero-reg-obs", called: &obsCalled})
+	if _, ok := zeroReg.Get("zero-reg-obs"); !ok {
+		t.Fatal("expected zero-value Registry.Register to store observer")
+	}
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	zeroReg.StartAll(runCtx, "node-zero", &slicePublisher{})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !obsCalled.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !obsCalled.Load() {
+		t.Fatal("expected zero-value Registry.StartAll to launch registered observer")
 	}
 }
 

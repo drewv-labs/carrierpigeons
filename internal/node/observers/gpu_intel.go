@@ -3,6 +3,8 @@ package observers
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"os/exec"
 	"strconv"
@@ -11,6 +13,31 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 )
+
+const maxIntelGPUFrameBytes = 256 * 1024
+
+var errIntelGPUFrameTooLarge = errors.New("intel_gpu_top JSON frame exceeded max byte budget")
+
+type frameBudgetReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (f *frameBudgetReader) reset(limit int64) {
+	f.remaining = limit
+}
+
+func (f *frameBudgetReader) Read(p []byte) (int, error) {
+	if f.remaining <= 0 {
+		return 0, errIntelGPUFrameTooLarge
+	}
+	if int64(len(p)) > f.remaining {
+		p = p[:f.remaining]
+	}
+	n, err := f.r.Read(p)
+	f.remaining -= int64(n)
+	return n, err
+}
 
 func observeGPUIntel(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	backoff := time.Second
@@ -72,53 +99,78 @@ func runIntelGPUTopOnce(ctx context.Context, pub core.TelemetryPublisher, nodeID
 		_ = cmd.Wait()
 	}()
 
-	decoder := json.NewDecoder(stdout)
-	if _, err := decoder.Token(); err != nil {
-		if streamCtx.Err() == nil {
-			log.Printf("[Intel GPU Observer] Failed to read opening JSON bracket: %v", err)
-		}
+	log.Printf("[Intel GPU Observer] Attached to intel_gpu_top stream (interval=%dms).", intervalMs)
+	if err := decodeIntelGPUTopStream(streamCtx, stdout, pub, nodeID); err != nil && streamCtx.Err() == nil {
+		log.Printf("[Intel GPU Observer] JSON stream decode error: %v", err)
 		return
 	}
 
-	log.Printf("[Intel GPU Observer] Attached to intel_gpu_top stream (interval=%dms).", intervalMs)
+	if streamCtx.Err() == nil {
+		log.Println("[Intel GPU Observer] intel_gpu_top stream ended.")
+	}
+}
 
-	for decoder.More() {
+func parseIntelGPUTopFrame(data map[string]any, nodeID string) *core.CTDPayload {
+	event := core.NewCTDPayload(nodeID, "intel-gpu", "active")
+
+	if powerMap, ok := data["power"].(map[string]any); ok {
+		if gpuPower, ok := parseJSONMetricFloat(powerMap["GPU"]); ok && gpuPower >= 0 {
+			event.AddMetric("power_w", gpuPower)
+		}
+	}
+
+	if engines, ok := data["engines"].(map[string]any); ok {
+		addedUtil := false
+		if render, exists := engines["Render/3D/0"].(map[string]any); exists {
+			if busy, ok := parseJSONMetricFloat(render["busy"]); ok && busy >= 0 {
+				event.AddMetric("utilization_pct", busy)
+				addedUtil = true
+			}
+		}
+		if !addedUtil {
+			if render, exists := engines["Render/3D"].(map[string]any); exists {
+				if busy, ok := parseJSONMetricFloat(render["busy"]); ok && busy >= 0 {
+					event.AddMetric("utilization_pct", busy)
+				}
+			}
+		}
+	}
+
+	if len(event.Metrics) == 0 {
+		return nil
+	}
+	return event
+}
+
+func decodeIntelGPUTopStream(streamCtx context.Context, r io.Reader, pub core.TelemetryPublisher, nodeID string) error {
+	budget := &frameBudgetReader{r: r, remaining: maxIntelGPUFrameBytes}
+	decoder := json.NewDecoder(budget)
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+
+	for {
+		budget.reset(maxIntelGPUFrameBytes)
+		if !decoder.More() {
+			return nil
+		}
 		select {
 		case <-streamCtx.Done():
-			return
+			return streamCtx.Err()
 		default:
 		}
 
 		var data map[string]any
 		if err := decoder.Decode(&data); err != nil {
-			if streamCtx.Err() == nil {
-				log.Printf("[Intel GPU Observer] JSON stream decode error: %v", err)
-			}
-			break
+			return err
 		}
 
-		event := core.NewCTDPayload(nodeID, "intel-gpu", "active")
-
-		if powerMap, ok := data["power"].(map[string]any); ok {
-			if gpuPower, exists := powerMap["GPU"].(float64); exists {
-				event.AddMetric("power_w", gpuPower)
-			}
+		event := parseIntelGPUTopFrame(data, nodeID)
+		if event == nil || pub == nil {
+			continue
 		}
-
-		if engines, ok := data["engines"].(map[string]any); ok {
-			if render, exists := engines["Render/3D/0"].(map[string]any); exists {
-				if busy, isFloat := render["busy"].(float64); isFloat {
-					event.AddMetric("utilization_pct", busy)
-				}
-			}
-		}
-
 		if err := pub.Publish(event); err != nil {
 			log.Printf("[Intel GPU Observer] Publish failed: %v", err)
 		}
-	}
-
-	if streamCtx.Err() == nil {
-		log.Println("[Intel GPU Observer] intel_gpu_top stream ended.")
 	}
 }

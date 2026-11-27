@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
@@ -32,11 +34,37 @@ func TestRegistryAndEnvelopeValidation(t *testing.T) {
 		{Runner: "benchmark"},
 		{Action: "start", Runner: "benchmark"},
 		{Action: "abort", Runner: "benchmark"},
+		{RequestID: "req-abort-1", TargetRequestID: "req-start-1", Action: "abort", Runner: "benchmark"},
 	}
 	for _, env := range validCases {
 		if err := env.Validate(); err != nil {
 			t.Fatalf("expected valid envelope %+v, got err: %v", env, err)
 		}
+	}
+
+	rawNoTarget, err := json.Marshal(Envelope{RequestID: "req-1", Action: "start", Runner: "benchmark"})
+	if err != nil {
+		t.Fatalf("marshal Envelope failed: %v", err)
+	}
+	if strings.Contains(string(rawNoTarget), "target_request_id") {
+		t.Fatalf("expected empty TargetRequestID omitted, got %s", string(rawNoTarget))
+	}
+
+	rawAbort, err := json.Marshal(Envelope{
+		RequestID:       "req-abort-2",
+		TargetRequestID: "req-start-1",
+		Action:          "abort",
+		Runner:          "benchmark",
+	})
+	if err != nil {
+		t.Fatalf("marshal abort Envelope failed: %v", err)
+	}
+	var decodedAbort Envelope
+	if err := json.Unmarshal(rawAbort, &decodedAbort); err != nil {
+		t.Fatalf("unmarshal abort Envelope failed: %v", err)
+	}
+	if decodedAbort.RequestID != "req-abort-2" || decodedAbort.TargetRequestID != "req-start-1" {
+		t.Fatalf("unexpected decoded abort Envelope: %+v", decodedAbort)
 	}
 
 	invalidCases := []Envelope{

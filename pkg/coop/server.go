@@ -45,6 +45,27 @@ type Options struct {
 	ExtraRunners     []runner.Runner
 }
 
+// StatusSnapshot reports live PigeonCoop operational state and ingestion/drop counters.
+type StatusSnapshot struct {
+	MeshName                  string `json:"mesh_name"`
+	NodeID                    string `json:"node_id"`
+	BrokerURL                 string `json:"broker_url,omitempty"`
+	Started                   bool   `json:"started"`
+	IngestedCount             uint64 `json:"ingested_count"`
+	BatcherDroppedCount       uint64 `json:"batcher_dropped_count"`
+	TelemetryDroppedCount     uint64 `json:"telemetry_dropped_count"`
+	ControlDroppedCount       uint64 `json:"control_dropped_count"`
+	RunnerRequestDroppedCount uint64 `json:"runner_request_dropped_count"`
+}
+
+type coopDropCounters struct {
+	ingested         uint64
+	batcherDropped   uint64
+	telemetryDropped uint64
+	controlDropped   uint64
+	runnerReqDropped uint64
+}
+
 // Server orchestrates the full PigeonCoop hub stack:
 // Embedded pure-Go MQTT Broker (optional external) + PostgreSQL Ledger + Batched COPY Injector +
 // RunnerRequestCTD Router + Ntfy Watchdog + implicit self-observation & Runner runtime.
@@ -67,8 +88,59 @@ type Server struct {
 	subscriber     *broker.Subscriber
 	selfNode       *edge.Agent
 	brokerURL      string
+	lastCounters   coopDropCounters
 
 	stopOnce sync.Once
+}
+
+type coopTelemetryObserver struct {
+	srv      *Server
+	interval time.Duration
+}
+
+func (o *coopTelemetryObserver) Name() string { return "coop-ingest" }
+
+func (o *coopTelemetryObserver) emit(nodeID string, pub core.TelemetryPublisher) {
+	if o.srv == nil || pub == nil {
+		return
+	}
+	st := o.srv.Status()
+	health := "healthy"
+	if st.BatcherDroppedCount > 0 || st.TelemetryDroppedCount > 0 || st.ControlDroppedCount > 0 || st.RunnerRequestDroppedCount > 0 {
+		health = "degraded"
+	}
+	ev := core.NewCTDPayload(nodeID, o.Name(), health).
+		AddMetric("ingested_count", st.IngestedCount).
+		AddMetric("batcher_dropped_count", st.BatcherDroppedCount).
+		AddMetric("telemetry_dropped_count", st.TelemetryDroppedCount).
+		AddMetric("control_dropped_count", st.ControlDroppedCount).
+		AddMetric("runner_request_dropped_count", st.RunnerRequestDroppedCount)
+	_ = pub.Publish(ev)
+}
+
+func (o *coopTelemetryObserver) Observe(ctx context.Context, nodeID string, pub core.TelemetryPublisher) {
+	if ctx == nil || pub == nil || ctx.Err() != nil {
+		return
+	}
+	interval := o.interval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	o.emit(nodeID, pub)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if ctx.Err() != nil {
+				return
+			}
+			o.emit(nodeID, pub)
+		}
+	}
 }
 
 // New constructs a configured PigeonCoop Server ready to Start(ctx).
@@ -191,6 +263,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.bootCancel = bootCancel
 	s.runCtx = runCtx
 	s.runCancel = runCancel
+	s.lastCounters = coopDropCounters{}
 	s.mu.Unlock()
 
 	bootOK := false
@@ -261,11 +334,9 @@ func (s *Server) Start(ctx context.Context) error {
 
 	if s.opts.ProvisionRoles {
 		if err := activeStore.ProvisionRoles(bootCtx, s.opts.IngestPassword, s.opts.ReadOnlyPassword); err != nil {
-			log.Printf("[%s] Warning: ProvisionRoles skipped/failed (insufficient superuser privileges?): %v",
-				s.cfg.Brand.CoopName, err)
-		} else {
-			log.Printf("[%s] Provisioned least-privilege roles (ctd_ingestor, pigeoncare_ro).", s.cfg.Brand.CoopName)
+			return fmt.Errorf("provision PostgreSQL roles: %w", err)
 		}
+		log.Printf("[%s] Provisioned least-privilege roles (ctd_ingestor, pigeoncare_ro).", s.cfg.Brand.CoopName)
 	}
 
 	// 2. Start embedded pure-Go MQTT broker (unless external broker mode is selected)
@@ -410,6 +481,16 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		}
 
+		extraObservers := s.opts.ExtraObservers
+		if s.cfg.SelfObserve {
+			extraObservers = make([]observer.Observer, 0, len(s.opts.ExtraObservers)+1)
+			extraObservers = append(extraObservers, &coopTelemetryObserver{
+				srv:      s,
+				interval: s.cfg.ParsedPollInterval(),
+			})
+			extraObservers = append(extraObservers, s.opts.ExtraObservers...)
+		}
+
 		selfCfg := config.EdgeConfig{
 			NodeID:                s.cfg.NodeID,
 			Tags:                  s.cfg.Tags,
@@ -437,7 +518,7 @@ func (s *Server) Start(ctx context.Context) error {
 				"role":      "coop",
 				"mesh_name": s.cfg.MeshName,
 			},
-			ExtraObservers: s.opts.ExtraObservers,
+			ExtraObservers: extraObservers,
 			ExtraRunners:   s.opts.ExtraRunners,
 		})
 		s.mu.Lock()
@@ -479,6 +560,81 @@ func (s *Server) BrokerURL() string {
 // MeshName returns the registered MNS identifier for this PigeonCoop instance.
 func (s *Server) MeshName() string {
 	return s.cfg.MeshName
+}
+
+func snapshotSubscriberCounters(sub *broker.Subscriber) coopDropCounters {
+	if sub == nil {
+		return coopDropCounters{}
+	}
+	return coopDropCounters{
+		ingested:         sub.IngestedCount(),
+		batcherDropped:   sub.BatcherDroppedCount(),
+		telemetryDropped: sub.TelemetryDroppedCount(),
+		controlDropped:   sub.ControlDroppedCount(),
+		runnerReqDropped: sub.RunnerRequestDroppedCount(),
+	}
+}
+
+func (s *Server) currentCounters() coopDropCounters {
+	s.mu.Lock()
+	sub := s.subscriber
+	cached := s.lastCounters
+	s.mu.Unlock()
+	if sub != nil {
+		return snapshotSubscriberCounters(sub)
+	}
+	return cached
+}
+
+// Status returns a live snapshot of Coop state and ingestion/drop counters.
+func (s *Server) Status() StatusSnapshot {
+	s.mu.Lock()
+	sub := s.subscriber
+	cached := s.lastCounters
+	started := s.started && !s.stopped
+	brokerURL := s.brokerURL
+	s.mu.Unlock()
+
+	counters := cached
+	if sub != nil {
+		counters = snapshotSubscriberCounters(sub)
+	}
+	return StatusSnapshot{
+		MeshName:                  s.cfg.MeshName,
+		NodeID:                    s.cfg.NodeID,
+		BrokerURL:                 config.RedactURL(brokerURL),
+		Started:                   started,
+		IngestedCount:             counters.ingested,
+		BatcherDroppedCount:       counters.batcherDropped,
+		TelemetryDroppedCount:     counters.telemetryDropped,
+		ControlDroppedCount:       counters.controlDropped,
+		RunnerRequestDroppedCount: counters.runnerReqDropped,
+	}
+}
+
+// IngestedCount returns total CTD events flushed to PostgreSQL since startup.
+func (s *Server) IngestedCount() uint64 {
+	return s.currentCounters().ingested
+}
+
+// BatcherDroppedCount returns total CTD events dropped by the COPY batcher due to queue saturation or flush failure.
+func (s *Server) BatcherDroppedCount() uint64 {
+	return s.currentCounters().batcherDropped
+}
+
+// TelemetryDroppedCount returns total telemetry messages dropped due to decode queue, byte-budget saturation, or post-stop arrival.
+func (s *Server) TelemetryDroppedCount() uint64 {
+	return s.currentCounters().telemetryDropped
+}
+
+// ControlDroppedCount returns total control/registry messages dropped due to shard saturation or post-stop arrival.
+func (s *Server) ControlDroppedCount() uint64 {
+	return s.currentCounters().controlDropped
+}
+
+// RunnerRequestDroppedCount returns total RunnerRequestCTD messages dropped due to queue saturation or post-stop arrival.
+func (s *Server) RunnerRequestDroppedCount() uint64 {
+	return s.currentCounters().runnerReqDropped
 }
 
 func parseEmbeddedLeafCert(certFile string) ([]byte, *x509.Certificate, error) {
@@ -860,7 +1016,6 @@ func (s *Server) teardownResources() {
 	s.runCtx = nil
 	s.runCancel = nil
 	s.selfNode = nil
-	s.subscriber = nil
 	s.loopbackBridge = nil
 	s.embedded = nil
 	s.store = nil
@@ -876,6 +1031,11 @@ func (s *Server) teardownResources() {
 	}
 	if subscriber != nil {
 		subscriber.Disconnect()
+		final := snapshotSubscriberCounters(subscriber)
+		s.mu.Lock()
+		s.lastCounters = final
+		s.subscriber = nil
+		s.mu.Unlock()
 	}
 	if bridge != nil {
 		bridge.Close()

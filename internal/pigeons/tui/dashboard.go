@@ -9,9 +9,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncare"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeonmath"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
@@ -29,6 +31,12 @@ const (
 	TabRunnerManager
 	TabPigeonMath
 	TabPigeonCare
+)
+
+const (
+	maxUIHistoryEntries     = 200
+	maxChatHistoryEntries   = 50
+	maxCurrentResponseBytes = 256 * 1024
 )
 
 // RunnerRecord represents a recent runner dispatch or node bookend displayed in RunnerManager.
@@ -55,6 +63,116 @@ func truncateRunes(s string, maxRunes int, ellipsis string) string {
 		return string(r[:maxRunes])
 	}
 	return string(r[:maxRunes-len(ellRunes)]) + ellipsis
+}
+
+// sanitizeTerminalText strips ANSI CSI/OSC/DCS/APC/PM/SOS escape sequences and C0/C1 control
+// characters from untrusted strings prior to rendering in interactive terminal modals.
+func sanitizeTerminalText(s string, preserveNewlines bool) string {
+	if s == "" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+
+	skipCSI := func(i int) int {
+		for i < len(s) && s[i] >= 0x30 && s[i] <= 0x3f {
+			i++
+		}
+		for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+			i++
+		}
+		if i < len(s) && s[i] >= 0x40 && s[i] <= 0x7e {
+			i++
+		}
+		return i
+	}
+
+	skipStringSeq := func(i int) int {
+		for i < len(s) {
+			if s[i] == 0x07 {
+				return i + 1
+			}
+			if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+				return i + 2
+			}
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == 0x9c {
+				return i + size
+			}
+			i += size
+		}
+		return i
+	}
+
+	for i := 0; i < len(s); {
+		b := s[i]
+		if b == 0x1b {
+			i++
+			if i >= len(s) {
+				break
+			}
+			switch s[i] {
+			case '[':
+				i = skipCSI(i + 1)
+			case ']', 'P', 'X', '^', '_':
+				i = skipStringSeq(i + 1)
+			default:
+				if s[i] >= 0x20 && s[i] <= 0x2f {
+					for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+						i++
+					}
+					if i < len(s) && s[i] >= 0x30 && s[i] <= 0x7e {
+						i++
+					}
+				} else if s[i] >= 0x30 && s[i] <= 0x7e {
+					i++
+				}
+			}
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == 0x9b {
+			i = skipCSI(i + size)
+			continue
+		}
+		if r == 0x9d || r == 0x90 || r == 0x98 || r == 0x9e || r == 0x9f {
+			i = skipStringSeq(i + size)
+			continue
+		}
+		if r == '\n' {
+			if preserveNewlines {
+				sb.WriteByte('\n')
+			} else {
+				sb.WriteByte(' ')
+			}
+			i += size
+			continue
+		}
+		if r == '\t' {
+			sb.WriteByte(' ')
+			i += size
+			continue
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			i += size
+			continue
+		}
+		sb.WriteRune(r)
+		i += size
+	}
+	return sb.String()
+}
+
+func sanitizeTerminalSlice(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, len(items))
+	for i, item := range items {
+		out[i] = sanitizeTerminalText(item, false)
+	}
+	return out
 }
 
 // DashboardOptions configures the multi-tab Pigeons TUI control plane.
@@ -153,16 +271,54 @@ type DashboardModel struct {
 	lastMathSeq uint64
 
 	// Tab 4 (PigeonCare) state
-	chatHistory     []llm.Message
-	uiHistory       []string
-	userInput       string
-	currentResponse *strings.Builder
-	streamCancel    context.CancelFunc
-	activeStreamID  uint64
-	waiting         bool
-	pendingApproval *ApprovalPromptMsg
+	chatHistory       []llm.Message
+	faultContextTurns int
+	uiHistory         []string
+	userInput         string
+	currentResponse   *strings.Builder
+	responseTruncated bool
+	streamCancel      context.CancelFunc
+	activeStreamID    uint64
+	waiting           bool
+	pendingApproval   *ApprovalPromptMsg
 
 	quitting bool
+}
+
+func (m *DashboardModel) appendUIHistory(entries ...string) {
+	m.uiHistory = append(m.uiHistory, entries...)
+	if len(m.uiHistory) <= maxUIHistoryEntries {
+		return
+	}
+	trimmed := make([]string, maxUIHistoryEntries)
+	copy(trimmed, m.uiHistory[len(m.uiHistory)-maxUIHistoryEntries:])
+	m.uiHistory = trimmed
+}
+
+func (m *DashboardModel) appendChatHistory(msgs ...llm.Message) {
+	m.chatHistory = append(m.chatHistory, msgs...)
+	if len(m.chatHistory) <= maxChatHistoryEntries {
+		return
+	}
+	keepPrefix := min(m.faultContextTurns, maxChatHistoryEntries)
+	if keepPrefix > len(m.chatHistory) {
+		keepPrefix = len(m.chatHistory)
+	}
+	tailLimit := maxChatHistoryEntries - keepPrefix
+	tailStart := len(m.chatHistory) - tailLimit
+	if tailStart < keepPrefix {
+		tailStart = keepPrefix
+	}
+	trimmed := make([]llm.Message, 0, maxChatHistoryEntries)
+	trimmed = append(trimmed, m.chatHistory[:keepPrefix]...)
+	trimmed = append(trimmed, m.chatHistory[tailStart:]...)
+	m.chatHistory = trimmed
+}
+
+func (m *DashboardModel) popTrailingUserTurn() {
+	if len(m.chatHistory) > m.faultContextTurns && m.chatHistory[len(m.chatHistory)-1].Role == "user" {
+		m.chatHistory = m.chatHistory[:len(m.chatHistory)-1]
+	}
 }
 
 // NewManagedChannelPrompter creates an async PolicyGate Prompter paired with an inbox channel
@@ -268,12 +424,14 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 		bSpec.AgentName, bSpec.ProductName, meshLabel, bSpec.MathName)
 	uiHist := []string{agentStyle.Render(agentGreeting)}
 	var chatHist []llm.Message
+	faultTurns := 0
 	if fault := strings.TrimSpace(opts.FaultContext); fault != "" {
 		uiHist = append([]string{systemStyle.Render("Fault Context:\n" + fault)}, uiHist...)
 		chatHist = append(chatHist,
 			llm.Message{Role: "user", Content: "Operator-supplied fault context for triage:\n" + fault},
 			llm.Message{Role: "assistant", Content: "Fault context loaded into session memory. Ready to correlate against CTD Ledger telemetry."},
 		)
+		faultTurns = len(chatHist)
 	}
 
 	banner := "Ready"
@@ -282,24 +440,25 @@ func NewDashboardModel(opts DashboardOptions) DashboardModel {
 	}
 
 	return DashboardModel{
-		ctx:           modelCtx,
-		cancel:        modelCancel,
-		cfg:           opts.Config,
-		brand:         bSpec,
-		store:         opts.Store,
-		care:          opts.Care,
-		math:          mathEng,
-		dispatcher:    opts.Dispatcher,
-		approvalInbox: opts.ApprovalInbox,
-		activeTab:     opts.InitialTab,
-		width:         110,
-		height:        32,
-		focusRequest:  opts.FocusRequest,
-		statusBanner:  banner,
-		overviewPoll:  &pollGuard{},
-		mathPoll:      &pollGuard{},
-		chatHistory:   chatHist,
-		uiHistory:     uiHist,
+		ctx:               modelCtx,
+		cancel:            modelCancel,
+		cfg:               opts.Config,
+		brand:             bSpec,
+		store:             opts.Store,
+		care:              opts.Care,
+		math:              mathEng,
+		dispatcher:        opts.Dispatcher,
+		approvalInbox:     opts.ApprovalInbox,
+		activeTab:         opts.InitialTab,
+		width:             110,
+		height:            32,
+		focusRequest:      opts.FocusRequest,
+		statusBanner:      banner,
+		overviewPoll:      &pollGuard{},
+		mathPoll:          &pollGuard{},
+		chatHistory:       chatHist,
+		faultContextTurns: faultTurns,
+		uiHistory:         uiHist,
 	}
 }
 
@@ -352,9 +511,17 @@ func waitForApprovalCmd(inbox <-chan ApprovalPromptMsg) tea.Cmd {
 }
 
 func (m DashboardModel) scheduleOverviewTick() tea.Cmd {
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
-		return overviewTickMsg(t)
-	})
+	ctx := m.baseContext()
+	return func() tea.Msg {
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		select {
+		case t := <-timer.C:
+			return overviewTickMsg(t)
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 func (m DashboardModel) scheduleMathTick() tea.Cmd {
@@ -362,9 +529,17 @@ func (m DashboardModel) scheduleMathTick() tea.Cmd {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
-	return tea.Tick(interval, func(t time.Time) tea.Msg {
-		return mathTickMsg(t)
-	})
+	ctx := m.baseContext()
+	return func() tea.Msg {
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		select {
+		case t := <-timer.C:
+			return mathTickMsg(t)
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 func extractTargetNodes(raw any) []string {
@@ -500,9 +675,10 @@ func (m DashboardModel) dispatchAbortCmd(rec RunnerRecord) tea.Cmd {
 			return abortResultMsg{status: "No active target nodes on selected row"}
 		}
 		req := core.RunnerRequestCTD{
-			RequestID: fmt.Sprintf("abort-%d", time.Now().UTC().UnixNano()),
-			Action:    "abort",
-			Runner:    rec.Runner,
+			RequestID:       fmt.Sprintf("abort-%d", time.Now().UTC().UnixNano()),
+			TargetRequestID: strings.TrimSpace(rec.RequestID),
+			Action:          "abort",
+			Runner:          rec.Runner,
 			Selectors: core.RunnerSelector{
 				Nodes: targetNodes,
 			},
@@ -634,11 +810,13 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		hadPending := m.pendingApproval != nil
 		m.clearPendingApproval()
 		m.currentResponse = nil
+		m.responseTruncated = false
+		m.popTrailingUserTurn()
 		errLine := agentStyle.Render(m.brand.AgentName + " Error: " + msg.err.Error())
 		if len(m.uiHistory) > 0 {
 			m.uiHistory[len(m.uiHistory)-1] = errLine
 		} else {
-			m.uiHistory = append(m.uiHistory, errLine)
+			m.appendUIHistory(errLine)
 		}
 		if hadPending && m.approvalInbox != nil {
 			return m, m.waitForApprovalCmd()
@@ -651,8 +829,30 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.currentResponse == nil {
 			m.currentResponse = &strings.Builder{}
+			m.responseTruncated = false
 		}
-		m.currentResponse.WriteString(msg.token)
+		if !m.responseTruncated {
+			const truncNotice = "\n...[response truncated at 256 KiB]"
+			rem := maxCurrentResponseBytes - m.currentResponse.Len()
+			if len(msg.token) <= rem {
+				m.currentResponse.WriteString(msg.token)
+			} else {
+				contentLimit := max(0, maxCurrentResponseBytes-len(truncNotice))
+				existing := m.currentResponse.String()
+				m.currentResponse.Reset()
+				if len(existing) >= contentLimit {
+					m.currentResponse.WriteString(jsonutil.TruncateValidUTF8(existing, contentLimit))
+				} else {
+					m.currentResponse.WriteString(existing)
+					budget := contentLimit - len(existing)
+					if budget > 0 {
+						m.currentResponse.WriteString(jsonutil.TruncateValidUTF8(msg.token, budget))
+					}
+				}
+				m.currentResponse.WriteString(truncNotice)
+				m.responseTruncated = true
+			}
+		}
 		return m, waitForToken(msg.streamID, msg.ch)
 
 	case streamDoneMsg:
@@ -671,13 +871,14 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			reply = m.currentResponse.String()
 			m.currentResponse = nil
 		}
+		m.responseTruncated = false
 		doneLine := agentStyle.Render(m.brand.AgentName + ": " + reply)
 		if len(m.uiHistory) > 0 {
 			m.uiHistory[len(m.uiHistory)-1] = doneLine
 		} else {
-			m.uiHistory = append(m.uiHistory, doneLine)
+			m.appendUIHistory(doneLine)
 		}
-		m.chatHistory = append(m.chatHistory, llm.Message{Role: "assistant", Content: reply})
+		m.appendChatHistory(llm.Message{Role: "assistant", Content: reply})
 		cmds := []tea.Cmd{m.fetchOverviewCmd(), m.fetchMathCmd()}
 		if hadPending && m.approvalInbox != nil {
 			cmds = append(cmds, m.waitForApprovalCmd())
@@ -710,7 +911,7 @@ func (m DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				default:
 				}
 			}
-			m.statusBanner = fmt.Sprintf("Confirmation decision: %s (%s)", decision, m.pendingApproval.Proposal.Title)
+			m.statusBanner = fmt.Sprintf("Confirmation decision: %s (%s)", decision, sanitizeTerminalText(m.pendingApproval.Proposal.Title, false))
 			m.pendingApproval = nil
 			if m.approvalInbox != nil {
 				return m, m.waitForApprovalCmd()
@@ -794,6 +995,7 @@ func (m DashboardModel) quit() (tea.Model, tea.Cmd) {
 	}
 	m.waiting = false
 	m.currentResponse = nil
+	m.responseTruncated = false
 	m.activeStreamID++
 	m.quitting = true
 	return m, tea.Quit
@@ -810,6 +1012,8 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clearPendingApproval()
 			m.waiting = false
 			m.currentResponse = nil
+			m.responseTruncated = false
+			m.popTrailingUserTurn()
 			m.activeStreamID++
 			m.statusBanner = "Cancelled active stream."
 			if hadPending && m.approvalInbox != nil {
@@ -831,16 +1035,19 @@ func (m DashboardModel) updateCareKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.care == nil {
-			m.uiHistory = append(m.uiHistory, agentStyle.Render(m.brand.AgentName+": LLM service is not configured."))
+			m.appendUIHistory(agentStyle.Render(m.brand.AgentName + ": LLM service is not configured."))
 			m.userInput = ""
 			return m, nil
 		}
 
-		m.chatHistory = append(m.chatHistory, llm.Message{Role: "user", Content: userText})
-		m.uiHistory = append(m.uiHistory, userStyle.Render("Operator: "+userText))
-		m.uiHistory = append(m.uiHistory, agentStyle.Render(m.brand.AgentName+": "))
+		m.appendChatHistory(llm.Message{Role: "user", Content: userText})
+		m.appendUIHistory(
+			userStyle.Render("Operator: "+userText),
+			agentStyle.Render(m.brand.AgentName+": "),
+		)
 		m.userInput = ""
 		m.currentResponse = &strings.Builder{}
+		m.responseTruncated = false
 		m.waiting = true
 		m.activeStreamID++
 		streamID := m.activeStreamID
@@ -1135,15 +1342,42 @@ func (m DashboardModel) renderPigeonCare(box lipgloss.Style, accent lipgloss.Col
 			BorderForeground(lipgloss.Color("214")).
 			Padding(0, 1)
 
+		safeTitle := sanitizeTerminalText(prop.Title, false)
+		safeNodes := sanitizeTerminalSlice(prop.Selectors.Nodes)
+		safeTags := sanitizeTerminalSlice(prop.Selectors.Tags)
+
 		var mText strings.Builder
-		fmt.Fprintf(&mText, "⚠ %s Action Confirmation Required: %s\n", m.brand.AgentName, prop.Title)
+		fmt.Fprintf(&mText, "⚠ %s Action Confirmation Required: %s\n", m.brand.AgentName, safeTitle)
 		if prop.Kind == pigeoncare.ActionEphemeralRunner {
+			safeInterp := sanitizeTerminalText(prop.Interpreter, false)
+			safeSHA := sanitizeTerminalText(prop.SHA256, false)
 			fmt.Fprintf(&mText, "Interpreter: %s | Timeout: %ds | SHA-256: %s\n",
-				prop.Interpreter, prop.TimeoutSec, truncateRunes(prop.SHA256, 16, ""))
-			fmt.Fprintf(&mText, "Targets: nodes=%v tags=%v\n", prop.Selectors.Nodes, prop.Selectors.Tags)
-			fmt.Fprintf(&mText, "Script:\n%s\n", strings.TrimSpace(prop.ScriptBody))
+				safeInterp, prop.TimeoutSec, truncateRunes(safeSHA, 16, ""))
+			fmt.Fprintf(&mText, "Targets: all=%v nodes=%v tags=%v\n", prop.Selectors.All, safeNodes, safeTags)
+			if len(prop.Env) > 0 {
+				envKeys := make([]string, 0, len(prop.Env))
+				for k := range prop.Env {
+					envKeys = append(envKeys, k)
+				}
+				slices.Sort(envKeys)
+				envPairs := make([]string, 0, len(envKeys))
+				for _, k := range envKeys {
+					envPairs = append(envPairs, fmt.Sprintf("%s=%s",
+						sanitizeTerminalText(k, false),
+						sanitizeTerminalText(prop.Env[k], false)))
+				}
+				fmt.Fprintf(&mText, "Env: %s\n", strings.Join(envPairs, " "))
+			}
+			safeScript := sanitizeTerminalText(strings.TrimSpace(prop.ScriptBody), true)
+			fmt.Fprintf(&mText, "Script:\n%s\n", safeScript)
+		} else if prop.Kind == pigeoncare.ActionStandardRunner {
+			safeRunner := sanitizeTerminalText(prop.Runner, false)
+			fmt.Fprintf(&mText, "Runner: %s\n", safeRunner)
+			fmt.Fprintf(&mText, "Targets: all=%v nodes=%v tags=%v\n", prop.Selectors.All, safeNodes, safeTags)
 		} else if prop.Kind == pigeoncare.ActionCreatePMV {
-			fmt.Fprintf(&mText, "View: %s.%s\nSQL: %s\n", m.brand.MathSchema, prop.ViewName, prop.RawSQL)
+			safeView := sanitizeTerminalText(prop.ViewName, false)
+			safeSQL := sanitizeTerminalText(prop.RawSQL, true)
+			fmt.Fprintf(&mText, "View: %s.%s\nSQL: %s\n", m.brand.MathSchema, safeView, safeSQL)
 		}
 		mText.WriteString("\nChoose: [1 / y] Allow   [2 / a] Always Allow   [3 / n] Deny")
 		sb.WriteString("\n" + modalStyle.Render(mText.String()) + "\n")

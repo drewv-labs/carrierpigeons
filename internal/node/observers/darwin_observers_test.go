@@ -292,6 +292,60 @@ func TestDarwinPowermetricsSingleflightCachingAndPause(t *testing.T) {
 	}
 }
 
+func TestDarwinSingleflightScopedPerPauseControllerAndClearsInFlightOnSoleCancel(t *testing.T) {
+	pcA := observer.NewPauseController()
+	pcB := observer.NewPauseController()
+	ctxA := observer.WithPauseController(context.Background(), pcA)
+	ctxB := observer.WithPauseController(context.Background(), pcB)
+
+	sfA1 := darwinPMSingleflightForContext(ctxA)
+	sfA2 := darwinPMSingleflightForContext(ctxA)
+	sfB := darwinPMSingleflightForContext(ctxB)
+	if sfA1 != sfA2 {
+		t.Fatal("expected identical PauseController to share the same darwinPMSingleflight")
+	}
+	if sfA1 == sfB || sfA1 == defaultDarwinPM {
+		t.Fatal("expected distinct PauseControllers to isolate darwinPMSingleflight instances")
+	}
+
+	// Sole waiter canceling must clear s.inFlight BEFORE cancelFn runs so an immediate next caller starts a fresh flight.
+	sf := newDarwinPMSingleflight()
+	soleCtx, cancelSole := context.WithCancel(context.Background())
+	firstStarted := make(chan struct{})
+	blockFirstAfterCancel := make(chan struct{})
+	var calls atomic.Int64
+
+	execFn := func(ctx context.Context, _ string) (string, error) {
+		n := calls.Add(1)
+		if n == 1 {
+			close(firstStarted)
+			<-ctx.Done()
+			<-blockFirstAfterCancel
+			return "", ctx.Err()
+		}
+		return "fresh-flight-ok", nil
+	}
+
+	soleDone := make(chan error, 1)
+	go func() {
+		_, err := sf.sample(soleCtx, "smc", execFn)
+		soleDone <- err
+	}()
+	<-firstStarted
+	cancelSole()
+	if err := <-soleDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected sole waiter cancel error, got %v", err)
+	}
+
+	// While first flight's goroutine is still stalled in cleanup (blockFirstAfterCancel open),
+	// a new caller must NOT attach to the canceled flight—it must launch call #2 immediately!
+	out, err := sf.sample(context.Background(), "smc", execFn)
+	close(blockFirstAfterCancel)
+	if err != nil || out != "fresh-flight-ok" || calls.Load() != 2 {
+		t.Fatalf("expected cleared s.inFlight to start fresh flight #2, got out=%q err=%v calls=%d", out, err, calls.Load())
+	}
+}
+
 func TestDarwinSynchronousPlatformWaitGroupContract(t *testing.T) {
 	ctx, cancel := context.WithCancel(WithPollInterval(context.Background(), 20*time.Millisecond))
 	pub := &darwinTestPublisher{}

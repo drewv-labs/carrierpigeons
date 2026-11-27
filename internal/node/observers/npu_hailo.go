@@ -8,20 +8,32 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/drewv-labs/carrierpigeons/pkg/observer"
 )
 
+const (
+	hailoRescanMinInterval = 60 * time.Second
+	hailoMaxProbeBackoff   = 60 * time.Second
+)
+
 var (
 	tempRegex   = regexp.MustCompile(`([0-9.]+)\s*C`)
 	powerRegex  = regexp.MustCompile(`([0-9.]+)\s*W`)
-	deviceRegex = regexp.MustCompile(`(?i)(?:Device|PCIe)\s+([0-9a-fA-F:\.]+)`)
+	deviceRegex = regexp.MustCompile(`(?i)(?:Device|PCIe):?\s+([0-9a-fA-F:\.]+)`)
 )
 
 type hailoHooks struct {
 	hasDeviceNode func() bool
 	runCmd        func(ctx context.Context, args ...string) ([]byte, error)
+	now           func() time.Time
+}
+
+type hailoProbeBackoff struct {
+	failures    int
+	nextProbeAt time.Time
 }
 
 func defaultHailoHooks() hailoHooks {
@@ -30,6 +42,7 @@ func defaultHailoHooks() hailoHooks {
 		runCmd: func(ctx context.Context, args ...string) ([]byte, error) {
 			return runCommand(ctx, defaultCmdTimeout, "hailortcli", args...)
 		},
+		now: time.Now,
 	}
 }
 
@@ -45,6 +58,29 @@ func hasHailoDeviceNode() bool {
 	return len(sysDevs) > 0
 }
 
+func isHailoDeviceInUse(out []byte, err error) bool {
+	if err == nil {
+		return false
+	}
+	combined := strings.ToUpper(string(out) + " " + err.Error())
+	return strings.Contains(combined, "HAILO_DEVICE_IN_USE") || strings.Contains(combined, "DEVICE_IN_USE")
+}
+
+func computeHailoProbeBackoff(baseInterval time.Duration, consecutiveFailures int) time.Duration {
+	base := max(baseInterval*2, time.Second)
+	if base > hailoMaxProbeBackoff {
+		return hailoMaxProbeBackoff
+	}
+	backoff := base
+	for i := 1; i < consecutiveFailures; i++ {
+		if backoff >= hailoMaxProbeBackoff/2 {
+			return hailoMaxProbeBackoff
+		}
+		backoff *= 2
+	}
+	return min(backoff, hailoMaxProbeBackoff)
+}
+
 func observeNPUHailo(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
 	observeNPUHailoWithHooks(ctx, pub, nodeID, defaultHailoHooks())
 }
@@ -56,6 +92,9 @@ func observeNPUHailoWithHooks(ctx context.Context, pub core.TelemetryPublisher, 
 	if hooks.runCmd == nil {
 		hooks.runCmd = defaultHailoHooks().runCmd
 	}
+	if hooks.now == nil {
+		hooks.now = time.Now
+	}
 	if !hooks.hasDeviceNode() {
 		log.Printf("[Hailo NPU Observer] hailortcli present on %s, but no /dev/hailo* accelerator attached; observer idle.", nodeID)
 		return
@@ -63,19 +102,25 @@ func observeNPUHailoWithHooks(ctx context.Context, pub core.TelemetryPublisher, 
 
 	var (
 		cachedDevices []string
-		ticks         int
+		hasScanned    bool
+		lastScanAt    time.Time
 		needsRescan   bool
+		probeBackoff  = make(map[string]hailoProbeBackoff)
 	)
+	basePoll := pollInterval(ctx)
 
 	runPeriodicObserver(ctx, true, func() {
 		if !hooks.hasDeviceNode() {
 			cachedDevices = nil
+			hasScanned = false
 			needsRescan = true
-			ticks++
+			clear(probeBackoff)
 			return
 		}
 
-		if ticks == 0 || ticks%60 == 0 || needsRescan {
+		now := hooks.now()
+		rescanDue := !hasScanned || now.Sub(lastScanAt) >= hailoRescanMinInterval
+		if rescanDue || (needsRescan && now.Sub(lastScanAt) >= hailoRescanMinInterval) {
 			cmdCtx, cancelCmd := observer.ContextUntilPaused(ctx)
 			scanned, err := scanHailoDevicesWithCmd(cmdCtx, hooks.runCmd)
 			canceled := cmdCtx.Err() != nil
@@ -85,6 +130,8 @@ func observeNPUHailoWithHooks(ctx context.Context, pub core.TelemetryPublisher, 
 				needsRescan = true
 				return
 			}
+			hasScanned = true
+			lastScanAt = hooks.now()
 			if err != nil {
 				cachedDevices = nil
 			} else {
@@ -92,13 +139,16 @@ func observeNPUHailoWithHooks(ctx context.Context, pub core.TelemetryPublisher, 
 			}
 			needsRescan = false
 		}
-		ticks++
 
 		if len(cachedDevices) == 0 {
 			return
 		}
 
 		for i, device := range cachedDevices {
+			if st, exists := probeBackoff[device]; exists && now.Before(st.nextProbeAt) {
+				continue
+			}
+
 			var (
 				temp, power       float64
 				hasTemp, hasPower bool
@@ -117,25 +167,37 @@ func observeNPUHailoWithHooks(ctx context.Context, pub core.TelemetryPublisher, 
 				}
 			}
 
-			cmdCtx, cancelPower := observer.ContextUntilPaused(ctx)
-			powerOut, powerErr := hooks.runCmd(cmdCtx, "measure-power", "-d", device)
-			powerCanceled := cmdCtx.Err() != nil
-			cancelPower()
-			if powerCanceled {
-				return
-			}
-			if powerErr == nil {
-				if matches := powerRegex.FindStringSubmatch(string(powerOut)); len(matches) > 1 {
-					power, hasPower = parseFiniteFloat(matches[1])
+			var powerErr error
+			if isHailoDeviceInUse(tempOut, tempErr) {
+				powerErr = tempErr
+			} else {
+				cmdCtx, cancelPower := observer.ContextUntilPaused(ctx)
+				powerOut, pErr := hooks.runCmd(cmdCtx, "measure-power", "-d", device)
+				powerCanceled := cmdCtx.Err() != nil
+				cancelPower()
+				if powerCanceled {
+					return
+				}
+				powerErr = pErr
+				if powerErr == nil {
+					if matches := powerRegex.FindStringSubmatch(string(powerOut)); len(matches) > 1 {
+						power, hasPower = parseFiniteFloat(matches[1])
+					}
 				}
 			}
 
 			if tempErr != nil && powerErr != nil {
+				st := probeBackoff[device]
+				st.failures++
+				st.nextProbeAt = hooks.now().Add(computeHailoProbeBackoff(basePoll, st.failures))
+				probeBackoff[device] = st
 				needsRescan = true
+				continue
 			}
 			if !hasTemp && !hasPower {
 				continue
 			}
+			delete(probeBackoff, device)
 
 			componentID := "hailo-npu-" + strconv.Itoa(i)
 			event := core.NewCTDPayload(nodeID, componentID, "active").
@@ -149,22 +211,6 @@ func observeNPUHailoWithHooks(ctx context.Context, pub core.TelemetryPublisher, 
 
 			if err := pub.Publish(event); err != nil {
 				log.Printf("[Hailo NPU Observer] Publish failed for %s: %v", componentID, err)
-			}
-		}
-
-		if needsRescan {
-			// Clear stale detached device cache immediately when all probes for a device failed.
-			cmdCtx, cancelCmd := observer.ContextUntilPaused(ctx)
-			scanned, err := scanHailoDevicesWithCmd(cmdCtx, hooks.runCmd)
-			canceled := cmdCtx.Err() != nil
-			cancelCmd()
-			if !canceled {
-				if err != nil {
-					cachedDevices = nil
-				} else {
-					cachedDevices = scanned
-				}
-				needsRescan = false
 			}
 		}
 	})

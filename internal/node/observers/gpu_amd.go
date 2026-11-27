@@ -3,12 +3,12 @@ package observers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,7 +80,7 @@ func hasSysfsAMDGPU(sysRoot string) bool {
 func readSysfsFloatChecked(path string) (float64, bool, bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0, false, true
+		return 0, false, errors.Is(err, os.ErrNotExist)
 	}
 	v, ok := parseFiniteFloat(string(b))
 	if !ok {
@@ -123,14 +123,14 @@ func discoverCachedAMDCards(sysRoot string) []cachedAMDGPUCard {
 	return cards
 }
 
-func (c *amdSysfsCache) getCards(sysRoot string, forceRefresh bool) []cachedAMDGPUCard {
+func (c *amdSysfsCache) getCards(sysRoot string, forceRefresh bool) ([]cachedAMDGPUCard, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := c.now()
 	if !forceRefresh {
 		if entry, ok := c.entries[sysRoot]; ok && !entry.dirty && now.Sub(entry.discoveredAt) < sysfsDiscoveryTTL {
-			return entry.cards
+			return entry.cards, false
 		}
 	}
 	cards := discoverCachedAMDCards(sysRoot)
@@ -138,7 +138,7 @@ func (c *amdSysfsCache) getCards(sysRoot string, forceRefresh bool) []cachedAMDG
 		discoveredAt: now,
 		cards:        cards,
 	}
-	return cards
+	return cards, true
 }
 
 func (c *amdSysfsCache) markDirty(sysRoot string) {
@@ -152,28 +152,28 @@ func (c *amdSysfsCache) markDirty(sysRoot string) {
 func (c *amdSysfsCache) collectSamples(sysRoot, nodeID string) ([]*core.CTDPayload, bool) {
 	readPass := func(cards []cachedAMDGPUCard) ([]*core.CTDPayload, bool) {
 		var payloads []*core.CTDPayload
-		readErr := false
+		missingErr := false
 
 		for _, card := range cards {
 			ev := core.NewCTDPayload(nodeID, "amd-gpu-"+card.name, "active")
 
 			if card.hasBusy {
-				if util, ok, rErr := readSysfsFloatChecked(filepath.Join(card.devDir, "gpu_busy_percent")); rErr {
-					readErr = true
+				if util, ok, rMissing := readSysfsFloatChecked(filepath.Join(card.devDir, "gpu_busy_percent")); rMissing {
+					missingErr = true
 				} else if ok {
 					ev.AddMetric("utilization_pct", util)
 				}
 			}
 			if card.hasVRAMUsed {
-				if usedB, ok, rErr := readSysfsFloatChecked(filepath.Join(card.devDir, "mem_info_vram_used")); rErr {
-					readErr = true
+				if usedB, ok, rMissing := readSysfsFloatChecked(filepath.Join(card.devDir, "mem_info_vram_used")); rMissing {
+					missingErr = true
 				} else if ok {
 					ev.AddMetric("memory_used_mb", math.Round((usedB/1024.0/1024.0)*10)/10)
 				}
 			}
 			if card.hasVRAMTotal {
-				if totalB, ok, rErr := readSysfsFloatChecked(filepath.Join(card.devDir, "mem_info_vram_total")); rErr {
-					readErr = true
+				if totalB, ok, rMissing := readSysfsFloatChecked(filepath.Join(card.devDir, "mem_info_vram_total")); rMissing {
+					missingErr = true
 				} else if ok {
 					ev.AddMetric("memory_total_mb", math.Round((totalB/1024.0/1024.0)*10)/10)
 				}
@@ -183,7 +183,9 @@ func (c *amdSysfsCache) collectSamples(sysRoot, nodeID string) ([]*core.CTDPaylo
 				if card.hasTemp1 && !isHwmonTempFault(card.temp1FaultPath) {
 					raw, err := os.ReadFile(filepath.Join(card.hwmonDir, "temp1_input"))
 					if err != nil {
-						readErr = true
+						if errors.Is(err, os.ErrNotExist) {
+							missingErr = true
+						}
 					} else if tempC, ok := parseSysfsMillidegreeTemp(raw); ok {
 						ev.AddMetric("temperature_c", tempC)
 					}
@@ -191,31 +193,31 @@ func (c *amdSysfsCache) collectSamples(sysRoot, nodeID string) ([]*core.CTDPaylo
 
 				powerAdded := false
 				if card.hasPowerAvg {
-					if microW, ok, rErr := readSysfsFloatChecked(filepath.Join(card.hwmonDir, "power1_average")); rErr {
-						readErr = true
+					if microW, ok, rMissing := readSysfsFloatChecked(filepath.Join(card.hwmonDir, "power1_average")); rMissing {
+						missingErr = true
 					} else if ok {
 						ev.AddMetric("power_w", math.Round((microW/1_000_000.0)*10)/10)
 						powerAdded = true
 					}
 				}
 				if !powerAdded && card.hasPowerInput {
-					if microW, ok, rErr := readSysfsFloatChecked(filepath.Join(card.hwmonDir, "power1_input")); rErr {
-						readErr = true
+					if microW, ok, rMissing := readSysfsFloatChecked(filepath.Join(card.hwmonDir, "power1_input")); rMissing {
+						missingErr = true
 					} else if ok {
 						ev.AddMetric("power_w", math.Round((microW/1_000_000.0)*10)/10)
 					}
 				}
 
 				if card.hasFan1 {
-					if rpm, ok, rErr := readSysfsFloatChecked(filepath.Join(card.hwmonDir, "fan1_input")); rErr {
-						readErr = true
+					if rpm, ok, rMissing := readSysfsFloatChecked(filepath.Join(card.hwmonDir, "fan1_input")); rMissing {
+						missingErr = true
 					} else if ok && rpm >= 0 {
 						ev.AddMetric("fan_rpm", int(rpm))
 					}
 				}
 				if card.hasPWM1 {
-					if pwmPct, ok, rErr := readHwmonPWMPctChecked(filepath.Join(card.hwmonDir, "pwm1")); rErr {
-						readErr = true
+					if pwmPct, ok, rMissing := readHwmonPWMPctChecked(filepath.Join(card.hwmonDir, "pwm1")); rMissing {
+						missingErr = true
 					} else if ok {
 						ev.AddMetric("fan_speed_pct", pwmPct)
 					}
@@ -227,19 +229,19 @@ func (c *amdSysfsCache) collectSamples(sysRoot, nodeID string) ([]*core.CTDPaylo
 			}
 		}
 
-		return payloads, readErr
+		return payloads, missingErr
 	}
 
-	cards := c.getCards(sysRoot, false)
-	payloads, readErr := readPass(cards)
-	if readErr {
-		cards = c.getCards(sysRoot, true)
-		payloads, readErr = readPass(cards)
-		if readErr {
-			c.markDirty(sysRoot)
-		}
+	cards, refreshed := c.getCards(sysRoot, false)
+	payloads, missingErr := readPass(cards)
+	if missingErr && !refreshed {
+		cards, _ = c.getCards(sysRoot, true)
+		payloads, missingErr = readPass(cards)
 	}
-	return payloads, readErr
+	if missingErr {
+		c.markDirty(sysRoot)
+	}
+	return payloads, missingErr
 }
 
 // observeGPUAMDSysfs reads AMD Radeon / Instinct telemetry directly from Linux `/sys/class/drm/card*/device`
@@ -310,10 +312,8 @@ func parseROCmSMIOutput(raw []byte, nodeID string) ([]*core.CTDPayload, error) {
 		if memBytes, ok := parseJSONMetricFloat(metrics["VRAM Total Used Memory (B)"]); ok && memBytes >= 0 {
 			event.AddMetric("memory_used_mb", memBytes/1024.0/1024.0)
 		}
-		if fanRPMStr, ok := metrics["Fan RPM"].(string); ok {
-			if fanRPM, err := strconv.Atoi(strings.TrimSpace(fanRPMStr)); err == nil && fanRPM >= 0 {
-				event.AddMetric("fan_rpm", fanRPM)
-			}
+		if fanRPM, ok := parseJSONMetricFloat(metrics["Fan RPM"]); ok && fanRPM >= 0 {
+			event.AddMetric("fan_rpm", int(math.Round(fanRPM)))
 		}
 		if fanPct, ok := parseJSONMetricFloat(metrics["Fan speed (%)"]); ok && fanPct >= 0 {
 			event.AddMetric("fan_speed_pct", fanPct)

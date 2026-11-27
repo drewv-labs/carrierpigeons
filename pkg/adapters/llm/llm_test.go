@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type stubToolExecutor struct{}
@@ -113,8 +115,8 @@ func TestOpenAISSEStreamingAndToolLoop(t *testing.T) {
 		n := turns.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		if n == 1 {
-			_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_node_telemetry","arguments":"{\"node_id\":"}}]}}]}`)
-			_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"rv64-compute-01\"}"}}]}}]}`)
+			_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_node_","arguments":"{\"node_id\":"}}]}}]}`)
+			_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"telemetry","arguments":"\"rv64-compute-01\"}"}}]}}]}`)
 			_, _ = fmt.Fprintln(w, `data: [DONE]`)
 			return
 		}
@@ -557,5 +559,352 @@ func TestClaudeCustomEndpointRoutingViaNew(t *testing.T) {
 	}
 	if defaultAdapter.endpoint != "https://api.anthropic.com/v1/messages" {
 		t.Fatalf("expected blank endpoint to fall back to default Anthropic URL, got %q", defaultAdapter.endpoint)
+	}
+}
+
+func TestDefaultLLMHTTPClientBlocksRedirectsAndPreservesTransportDefaults(t *testing.T) {
+	client := defaultLLMHTTPClient()
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		t.Fatalf("expected *http.Transport, got %T", client.Transport)
+	}
+	if tr == http.DefaultTransport {
+		t.Fatal("expected cloned transport, not shared http.DefaultTransport")
+	}
+	if tr.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("expected ResponseHeaderTimeout=30s, got %v", tr.ResponseHeaderTimeout)
+	}
+	if tr.Proxy == nil {
+		t.Fatal("expected cloned http.DefaultTransport to retain Proxy function")
+	}
+
+	var sinkHits atomic.Int32
+	exfilSink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sinkHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer exfilSink.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, exfilSink.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	claude := NewClaudeAdapterWithEndpoint(redirector.URL, "claude-secret-key", "claude-sonnet-4-5", nil)
+	if _, err := claude.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "hi"}}); err == nil {
+		t.Fatal("expected Claude Chat to reject 307 redirect")
+	} else if !strings.Contains(err.Error(), "HTTP 307") || strings.Contains(err.Error(), "claude-secret-key") {
+		t.Fatalf("unexpected redirect error: %v", err)
+	}
+
+	openai := NewOpenAIAdapter(redirector.URL+"/v1/chat/completions", "openai-secret-key", "gpt-4o", nil)
+	if _, err := openai.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "hi"}}); err == nil {
+		t.Fatal("expected OpenAI Chat to reject 307 redirect")
+	} else if !strings.Contains(err.Error(), "HTTP 307") || strings.Contains(err.Error(), "openai-secret-key") {
+		t.Fatalf("unexpected redirect error: %v", err)
+	}
+
+	if sinkHits.Load() != 0 {
+		t.Fatalf("redirect target received %d hits; expected 0", sinkHits.Load())
+	}
+}
+
+func TestPostJSONRedactsURLErrorsAndAuthHeaders(t *testing.T) {
+	// 1. Connection/transport *url.Error must redact userinfo and query secrets while preserving *url.Error.
+	closedSrv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := closedSrv.URL
+	closedSrv.Close()
+
+	u, err := url.Parse(closedURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	u.User = url.UserPassword("svc", "url_secret_pw")
+	u.RawQuery = "api_key=query_secret_tok&mode=fast"
+
+	_, err = postJSON(
+		context.Background(),
+		defaultLLMHTTPClient(),
+		u.String(),
+		map[string]string{
+			"Authorization": "Bearer bearer_secret_val",
+			"x-api-key":     "xapi_secret_val",
+		},
+		map[string]string{"hello": "world"},
+		"OpenAI",
+	)
+	if err == nil {
+		t.Fatal("expected connection error against closed server")
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("expected *url.Error to remain unwrappable, got %T: %v", err, err)
+	}
+	for _, secret := range []string{"url_secret_pw", "query_secret_tok", "bearer_secret_val", "xapi_secret_val"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("postJSON connection error leaked secret %q: %v", secret, err)
+		}
+	}
+
+	// 2. Non-2xx upstream response echoing auth headers or raw tokens must be scrubbed.
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprintf(w, "rejected auth=%s key=%s raw_tok=%s",
+			r.Header.Get("Authorization"),
+			r.Header.Get("x-api-key"),
+			strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "),
+		)
+	}))
+	defer errSrv.Close()
+
+	_, err = postJSON(
+		context.Background(),
+		defaultLLMHTTPClient(),
+		errSrv.URL,
+		map[string]string{
+			"Authorization": "Bearer live_bearer_secret_987",
+			"x-api-key":     "live_anthropic_secret_654",
+		},
+		map[string]string{"hello": "world"},
+		"Claude",
+	)
+	if err == nil {
+		t.Fatal("expected HTTP 401 error")
+	}
+	for _, secret := range []string{"live_bearer_secret_987", "live_anthropic_secret_654"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("postJSON HTTP error body leaked secret %q: %v", secret, err)
+		}
+	}
+}
+
+func TestStreamChatEnforcesBodyAndBuilderCaps(t *testing.T) {
+	if maxStreamBodyBytes != 16<<20 {
+		t.Fatalf("expected default maxStreamBodyBytes=16MiB, got %d", maxStreamBodyBytes)
+	}
+
+	origBody := streamBodyLimit
+	origContent := streamContentLimit
+	origToolArg := streamToolArgLimit
+	t.Cleanup(func() {
+		streamBodyLimit = origBody
+		streamContentLimit = origContent
+		streamToolArgLimit = origToolArg
+	})
+
+	t.Run("claude_body_limit", func(t *testing.T) {
+		streamBodyLimit = 256
+		streamContentLimit = origContent
+		streamToolArgLimit = origToolArg
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			for i := 0; i < 20; i++ {
+				_, _ = fmt.Fprintln(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"0123456789abcdef"}}`)
+			}
+		}))
+		defer srv.Close()
+
+		adapter := NewClaudeAdapterWithEndpoint(srv.URL, "k", "claude-sonnet-4-5", nil)
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "go"}})
+		if err != nil {
+			t.Fatalf("StreamChat: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		if !strings.Contains(out.String(), "exceeded size limit") {
+			t.Fatalf("expected Claude body size limit error, got %q", out.String())
+		}
+	})
+
+	t.Run("claude_tool_arg_limit_skips_execution", func(t *testing.T) {
+		streamBodyLimit = origBody
+		streamContentLimit = origContent
+		streamToolArgLimit = 32
+
+		called := false
+		exec := &recordingToolExecutor{onExec: func() { called = true }}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintln(w, `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_node_telemetry"}}`)
+			_, _ = fmt.Fprintln(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"node_id\":\"0123456789012345678901234567890123456789\"}"}}`)
+		}))
+		defer srv.Close()
+
+		adapter := NewClaudeAdapterWithEndpoint(srv.URL, "k", "claude-sonnet-4-5", exec)
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "go"}})
+		if err != nil {
+			t.Fatalf("StreamChat: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		if called {
+			t.Fatal("expected tool NOT to be executed when streamed input_json_delta exceeded limit")
+		}
+		if !strings.Contains(out.String(), "tool input exceeded limit") {
+			t.Fatalf("expected Claude tool input cap error, got %q", out.String())
+		}
+	})
+
+	t.Run("openai_body_and_tool_arg_limit", func(t *testing.T) {
+		streamBodyLimit = 256
+		streamContentLimit = origContent
+		streamToolArgLimit = origToolArg
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			for i := 0; i < 20; i++ {
+				_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"0123456789abcdef"}}]}`)
+			}
+		}))
+		defer srv.Close()
+
+		adapter := NewOpenAIAdapter(srv.URL+"/v1", "k", "gpt-4o", nil)
+		ch, err := adapter.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "go"}})
+		if err != nil {
+			t.Fatalf("StreamChat: %v", err)
+		}
+		var out strings.Builder
+		for tok := range ch {
+			out.WriteString(tok)
+		}
+		if !strings.Contains(out.String(), "exceeded size limit") {
+			t.Fatalf("expected OpenAI body size limit error, got %q", out.String())
+		}
+
+		streamBodyLimit = origBody
+		streamToolArgLimit = 24
+		called := false
+		exec := &recordingToolExecutor{onExec: func() { called = true }}
+		toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"get_node_telemetry","arguments":"{\"node_id\":\"01234567890123456789012345\"}"}}]}}]}`)
+		}))
+		defer toolSrv.Close()
+
+		adapter2 := NewOpenAIAdapter(toolSrv.URL+"/v1", "k", "gpt-4o", exec)
+		ch2, err := adapter2.StreamChat(context.Background(), "sys", []Message{{Role: "user", Content: "go"}})
+		if err != nil {
+			t.Fatalf("StreamChat: %v", err)
+		}
+		var out2 strings.Builder
+		for tok := range ch2 {
+			out2.WriteString(tok)
+		}
+		if called {
+			t.Fatal("expected tool NOT to be executed when OpenAI streamed args exceeded limit")
+		}
+		if !strings.Contains(out2.String(), "tool arguments exceeded limit") {
+			t.Fatalf("expected OpenAI tool args cap error, got %q", out2.String())
+		}
+	})
+
+	t.Run("ollama_body_and_content_limit", func(t *testing.T) {
+		streamBodyLimit = 180
+		streamContentLimit = origContent
+		streamToolArgLimit = origToolArg
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			for i := 0; i < 15; i++ {
+				_, _ = fmt.Fprintln(w, `{"message":{"role":"assistant","content":"0123456789abcdef"}}`)
+			}
+		}))
+		defer srv.Close()
+
+		adapter := NewOllamaAdapter(srv.URL, "qwen2.5-coder", nil)
+		_, err := adapter.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "go"}})
+		if err == nil || !strings.Contains(err.Error(), "exceeded size limit") {
+			t.Fatalf("expected Ollama body limit error, got %v", err)
+		}
+
+		streamBodyLimit = origBody
+		streamContentLimit = 20
+		_, err = adapter.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "go"}})
+		if err == nil || !strings.Contains(err.Error(), "exceeded max content size") {
+			t.Fatalf("expected Ollama content limit error, got %v", err)
+		}
+	})
+}
+
+func TestOpenAIEndpointNormalizationAndVLLMLlamaCPPConfig(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "https://api.openai.com/v1/chat/completions"},
+		{"http://127.0.0.1:8000", "http://127.0.0.1:8000/v1/chat/completions"},
+		{"http://127.0.0.1:8000/", "http://127.0.0.1:8000/v1/chat/completions"},
+		{"http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1/chat/completions"},
+		{"http://127.0.0.1:8000/v1/", "http://127.0.0.1:8000/v1/chat/completions"},
+		{"http://127.0.0.1:8000/v1/chat/completions", "http://127.0.0.1:8000/v1/chat/completions"},
+		{"http://127.0.0.1:8000/v1/chat/completions/", "http://127.0.0.1:8000/v1/chat/completions"},
+	}
+	for _, tc := range cases {
+		a := NewOpenAIAdapter(tc.in, "k", "m", nil)
+		if a.endpoint != tc.want {
+			t.Fatalf("NewOpenAIAdapter(%q).endpoint = %q, want %q", tc.in, a.endpoint, tc.want)
+		}
+	}
+
+	// Verify vLLM and llama.cpp pass through APIKey & Model and normalize /v1 endpoints properly.
+	for _, tc := range []struct {
+		provider     string
+		apiKey       string
+		model        string
+		defaultKey   string
+		defaultModel string
+	}{
+		{"vllm", "vllm-prod-key", "custom/vllm-model", "vllm-no-key", "Qwen/Qwen2.5-Coder-32B-Instruct"},
+		{"llamacpp", "llama-prod-key", "custom-gguf", "local-no-key", "default"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			var gotPath, gotAuth, gotModel string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotAuth = r.Header.Get("Authorization")
+				var reqBody struct {
+					Model string `json:"model"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&reqBody)
+				gotModel = reqBody.Model
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+			}))
+			defer srv.Close()
+
+			a := New(Config{
+				Provider: tc.provider,
+				Endpoint: srv.URL + "/v1",
+				APIKey:   tc.apiKey,
+				Model:    tc.model,
+			})
+			reply, err := a.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "ping"}})
+			if err != nil || reply != "ok" {
+				t.Fatalf("%s Chat failed: reply=%q err=%v", tc.provider, reply, err)
+			}
+			if gotPath != "/v1/chat/completions" {
+				t.Fatalf("%s hit path %q, want /v1/chat/completions", tc.provider, gotPath)
+			}
+			if gotAuth != "Bearer "+tc.apiKey {
+				t.Fatalf("%s sent Authorization %q, want Bearer %s", tc.provider, gotAuth, tc.apiKey)
+			}
+			if gotModel != tc.model {
+				t.Fatalf("%s sent model %q, want %q", tc.provider, gotModel, tc.model)
+			}
+
+			// Fallback defaults when APIKey and Model are empty.
+			defAdapter := New(Config{Provider: tc.provider, Endpoint: srv.URL + "/v1"})
+			if _, err := defAdapter.Chat(context.Background(), "sys", []Message{{Role: "user", Content: "ping"}}); err != nil {
+				t.Fatalf("%s default Chat failed: %v", tc.provider, err)
+			}
+			if gotAuth != "Bearer "+tc.defaultKey || gotModel != tc.defaultModel {
+				t.Fatalf("%s default auth/model = (%q, %q), want (Bearer %s, %s)",
+					tc.provider, gotAuth, gotModel, tc.defaultKey, tc.defaultModel)
+			}
+		})
 	}
 }

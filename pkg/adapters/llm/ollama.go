@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 )
 
 var _ BaseLLM = (*OllamaAdapter)(nil)
@@ -95,11 +97,13 @@ func (a *OllamaAdapter) runChat(
 			return true, err
 		}
 
-		scanner := bufio.NewScanner(resp.Body)
+		capped := newCappedStreamReader(resp.Body, streamBodyLimit)
+		scanner := bufio.NewScanner(capped)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 		var toolCalls []ToolCall
 		var fullContent strings.Builder
+		var capErr error
 
 		for scanner.Scan() {
 			var chunk struct {
@@ -107,14 +111,21 @@ func (a *OllamaAdapter) runChat(
 			}
 			if err := json.Unmarshal(scanner.Bytes(), &chunk); err == nil {
 				if chunk.Message.Content != "" {
+					if !writeBounded(&fullContent, chunk.Message.Content, streamContentLimit) {
+						capErr = fmt.Errorf("Ollama stream exceeded max content size (%d bytes)", streamContentLimit)
+						break
+					}
 					if emit != nil && !emit(chunk.Message.Content) {
 						resp.Body.Close()
 						stepFailed = true
 						return true, ctx.Err()
 					}
-					fullContent.WriteString(chunk.Message.Content)
 				}
 				if len(chunk.Message.ToolCalls) > 0 {
+					if len(toolCalls)+len(chunk.Message.ToolCalls) > maxStreamToolCalls {
+						capErr = fmt.Errorf("Ollama stream exceeded max tool calls (%d)", maxStreamToolCalls)
+						break
+					}
 					toolCalls = append(toolCalls, chunk.Message.ToolCalls...)
 				}
 			}
@@ -125,9 +136,13 @@ func (a *OllamaAdapter) runChat(
 			stepFailed = true
 			return true, err
 		}
+		if capErr != nil {
+			stepFailed = true
+			return true, capErr
+		}
 		if scanErr != nil {
 			stepFailed = true
-			return true, fmt.Errorf("Ollama stream error: %w", scanErr)
+			return true, fmt.Errorf("Ollama stream error: %w", jsonutil.RedactError(scanErr))
 		}
 
 		if len(toolCalls) == 0 || a.tools == nil {

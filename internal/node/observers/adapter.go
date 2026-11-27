@@ -23,6 +23,9 @@ type pollIntervalKey struct{}
 
 // WithPollInterval attaches a custom observer polling cadence to ctx.
 func WithPollInterval(ctx context.Context, d time.Duration) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if d <= 0 {
 		d = defaultPollInterval
 	}
@@ -41,9 +44,15 @@ func pollInterval(ctx context.Context) time.Duration {
 // runPeriodicObserver executes emit on the configured poll cadence while parking cleanly across PauseController windows
 // without executing syscalls/subprocesses while paused or double-emitting buffered ticks upon resumption.
 func runPeriodicObserver(ctx context.Context, emitOnBoot bool, emit func()) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	interval := pollInterval(ctx)
 	if emitOnBoot {
 		if !observer.WaitIfPaused(ctx) {
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 		emit()
@@ -66,6 +75,9 @@ func runPeriodicObserver(ctx context.Context, emitOnBoot bool, emit func()) {
 				case <-ticker.C:
 				default:
 				}
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			emit()
 		}
@@ -107,6 +119,12 @@ func (a *adaptersObserver) Observe(ctx context.Context, nodeID string, pub core.
 
 // ObserveAdapters runs all peripheral hardware observer loops bound to ctx and blocks until ctx is done.
 func ObserveAdapters(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
+	if pub == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
@@ -144,6 +162,30 @@ func StartConfiguredWithRegistry(
 	interval time.Duration,
 	reg *observer.Registry,
 ) []string {
+	return StartConfiguredWithRegistryAndWaitGroup(ctx, nodeID, pub, cfg, interval, reg, nil)
+}
+
+// StartConfiguredWithRegistryAndWaitGroup launches enabled built-in hardware observers alongside custom observers from reg,
+// tracking every spawned observer goroutine in wg when non-nil so callers can join all observers before disconnecting relays.
+func StartConfiguredWithRegistryAndWaitGroup(
+	ctx context.Context,
+	nodeID string,
+	pub core.TelemetryPublisher,
+	cfg config.ObserversConfig,
+	interval time.Duration,
+	reg *observer.Registry,
+	wg *sync.WaitGroup,
+) []string {
+	if pub == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	pc := observer.PauseControllerFromContext(ctx)
 	if pc == nil {
 		pc = observer.NewPauseController()
@@ -154,21 +196,33 @@ func StartConfiguredWithRegistry(
 	obsCtx := WithPollInterval(ctx, interval)
 	var active []string
 
+	launch := func(fn func()) {
+		if wg != nil {
+			wg.Add(1)
+		}
+		go func() {
+			if wg != nil {
+				defer wg.Done()
+			}
+			fn()
+		}()
+	}
+
 	if cfg.OS {
 		active = append(active, "host-os")
-		go observeOSPlatform(obsCtx, pub, nodeID)
+		launch(func() { observeOSPlatform(obsCtx, pub, nodeID) })
 	}
 	if cfg.Net {
 		active = append(active, "net")
-		go observeNet(obsCtx, pub, nodeID)
+		launch(func() { observeNet(obsCtx, pub, nodeID) })
 	}
 	if cfg.GPU {
 		active = append(active, "gpu")
-		go observeGPU(obsCtx, pub, nodeID)
+		launch(func() { observeGPU(obsCtx, pub, nodeID) })
 	}
 	if cfg.NPU {
 		active = append(active, "npu")
-		go observeNPU(obsCtx, pub, nodeID)
+		launch(func() { observeNPU(obsCtx, pub, nodeID) })
 	}
 
 	var names []string
@@ -191,8 +245,9 @@ func StartConfiguredWithRegistry(
 			custom, ok = observer.Get(name)
 		}
 		if ok {
+			obs := custom
 			active = append(active, name)
-			go custom.Observe(obsCtx, nodeID, pub)
+			launch(func() { obs.Observe(obsCtx, nodeID, pub) })
 		}
 	}
 

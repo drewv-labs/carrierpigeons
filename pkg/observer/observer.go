@@ -30,6 +30,9 @@ func NewRegistry() *Registry {
 
 // Clone copies all currently registered observers into an independent Registry instance.
 func (r *Registry) Clone() *Registry {
+	if r == nil {
+		return NewRegistry()
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	cp := make(map[string]Observer, len(r.items))
@@ -39,16 +42,22 @@ func (r *Registry) Clone() *Registry {
 
 // Register binds an Observer implementation into r.
 func (r *Registry) Register(o Observer) {
-	if o == nil {
+	if r == nil || o == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.items == nil {
+		r.items = make(map[string]Observer)
+	}
 	r.items[o.Name()] = o
 }
 
 // Get retrieves a registered Observer by name.
 func (r *Registry) Get(name string) (Observer, bool) {
+	if r == nil {
+		return nil, false
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	o, ok := r.items[name]
@@ -57,6 +66,9 @@ func (r *Registry) Get(name string) (Observer, bool) {
 
 // Names returns a sorted list of all registered observer names in r.
 func (r *Registry) Names() []string {
+	if r == nil {
+		return nil
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.items))
@@ -69,7 +81,16 @@ func (r *Registry) Names() []string {
 
 // StartAll launches every registered Observer in r concurrently under ctx.
 func (r *Registry) StartAll(ctx context.Context, nodeID string, pub core.TelemetryPublisher) {
-	if pc := PauseControllerFromContext(ctx); pc != nil && pub != nil {
+	if r == nil || pub == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if pc := PauseControllerFromContext(ctx); pc != nil {
 		pub = NewGatedPublisher(pub, pc)
 	}
 

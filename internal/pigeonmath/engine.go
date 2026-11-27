@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/llm"
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
@@ -106,7 +107,7 @@ func truncateUTF8Bytes(b []byte, maxBytes int) []byte {
 //     and probe candidate SQL (`SELECT * FROM (<candidate>\n) AS _pmv_cert_probe LIMIT 5`) BEFORE mutating
 //     any existing certified row in `pigeonmath.pmv_catalog`.
 //  3. Run PigeonCare pre-materialization certification BEFORE replacing any existing certified catalog row or live view.
-//  4. Materialize `pigeonmath.pmv_<view_name>` and persist `certified` state in `pigeonmath.pmv_catalog`.
+//  4. Atomically materialize `pigeonmath.pmv_<view_name>` and persist `certified` state in `pigeonmath.pmv_catalog`.
 func (e *Engine) SubmitAndCertifyPMV(
 	ctx context.Context,
 	actor string,
@@ -114,7 +115,7 @@ func (e *Engine) SubmitAndCertifyPMV(
 	rawSQL string,
 	optimizer llm.BaseLLM,
 ) (*db.PMVRecord, error) {
-	if e.store == nil {
+	if e == nil || e.store == nil {
 		return nil, fmt.Errorf("pigeonmath store is not connected")
 	}
 	if err := e.store.EnsureMathSchema(ctx); err != nil {
@@ -180,7 +181,7 @@ func (e *Engine) SubmitAndCertifyPMV(
 	// Step 2: Structural & Read-Only Planner Verification via EXPLAIN before mutating pmv_catalog.
 	explainPlan, explainErr := e.store.ExplainReadOnly(ctx, candidateSQL)
 	if explainErr != nil && candidateSQL != cleanedRaw {
-		// Fallback to original raw intent SQL if LLM rewrite broke planner semantics!
+		// Fallback to original raw intent SQL if LLM rewrite broke planner semantics.
 		notes = append(notes, fmt.Sprintf("optimizer SQL failed EXPLAIN (%v); reverted to raw intent SQL", explainErr))
 		candidateSQL = cleanedRaw
 		usedOptimized = false
@@ -201,6 +202,25 @@ func (e *Engine) SubmitAndCertifyPMV(
 	// Newline before ')' guarantees trailing '--' SQL comments in candidateSQL cannot comment out the wrapper.
 	probeQuery := fmt.Sprintf("SELECT * FROM (%s\n) AS _pmv_cert_probe LIMIT 5", candidateSQL)
 	sampleRows, probeErr := e.store.QueryReadOnlyMaps(ctx, probeQuery)
+	if probeErr != nil && candidateSQL != cleanedRaw {
+		// Mirror Step 2: fallback to raw intent SQL if optimizer rewrite fails at probe runtime.
+		notes = append(notes, fmt.Sprintf("optimizer SQL failed sample probe (%v); reverted to raw intent SQL", probeErr))
+		candidateSQL = cleanedRaw
+		usedOptimized = false
+		explainPlan, explainErr = e.store.ExplainReadOnly(ctx, candidateSQL)
+		if explainErr != nil {
+			draft.Status = "failed"
+			draft.OptimizedSQL = candidateSQL
+			draft.AgentNotes = strings.Join(append(notes, "EXPLAIN failed: "+explainErr.Error()), " | ")
+			draft.ValidationReport = map[string]any{
+				"explain_ok": false,
+				"error":      explainErr.Error(),
+			}
+			return draft, fmt.Errorf("SQL validation failed for %s: %w", normName, explainErr)
+		}
+		probeQuery = fmt.Sprintf("SELECT * FROM (%s\n) AS _pmv_cert_probe LIMIT 5", candidateSQL)
+		sampleRows, probeErr = e.store.QueryReadOnlyMaps(ctx, probeQuery)
+	}
 	if probeErr != nil {
 		draft.Status = "failed"
 		draft.OptimizedSQL = candidateSQL
@@ -246,7 +266,18 @@ func (e *Engine) SubmitAndCertifyPMV(
 
 	postCheckVerdict := "structural & read-only probe passed"
 	if optimizer != nil {
-		sampleJSON, _ := json.Marshal(sampleRows)
+		sampleJSON, marshalErr := json.Marshal(jsonutil.SanitizeValue(sampleRows))
+		if marshalErr != nil {
+			return failCertification(
+				"sample serialization failed: "+marshalErr.Error(),
+				map[string]any{
+					"explain_ok":        true,
+					"post_check_passed": false,
+					"error":             marshalErr.Error(),
+				},
+				fmt.Errorf("serialize sample rows for %s: %w", normName, marshalErr),
+			)
+		}
 		sampleJSON = truncateUTF8Bytes(sampleJSON, 4096)
 		delim := randomDelimiterTag()
 		chkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -295,7 +326,44 @@ func (e *Engine) SubmitAndCertifyPMV(
 		postCheckVerdict = trimmedVerdict
 	}
 
-	// Step 4: Materialize view strictly inside `pigeonmath` schema (`pigeonmath.pmv_*`) now that certification succeeded.
+	notes = append(notes, postCheckVerdict)
+	now := time.Now().UTC()
+	report := map[string]any{
+		"explain_ok":         true,
+		"explain_plan_bytes": len(explainPlan),
+		"used_optimized_sql": usedOptimized,
+		"sample_row_count":   len(sampleRows),
+		"verdict":            postCheckVerdict,
+		"certified_at":       now.Format(time.RFC3339),
+	}
+
+	// Step 4: Atomically materialize `<mathSchema>.pmv_*` and certify `pmv_catalog` when supported.
+	if atomicStore, ok := e.store.(db.AtomicPMVDB); ok {
+		certified, err := atomicStore.MaterializeAndCertifyPMV(ctx, db.PMVRecord{
+			ViewName:         normName,
+			SubmittedBy:      actor,
+			RawIntentSQL:     cleanedRaw,
+			OptimizedSQL:     candidateSQL,
+			Status:           "certified",
+			AgentNotes:       strings.Join(notes, " | "),
+			ValidationReport: report,
+		})
+		if err != nil {
+			return failCertification(
+				"materialize failed: "+err.Error(),
+				map[string]any{
+					"explain_ok":        true,
+					"post_check_passed": true,
+					"materialize_ok":    false,
+					"error":             err.Error(),
+				},
+				fmt.Errorf("materialize %s.%s: %w", e.mathSchema, normName, err),
+			)
+		}
+		return certified, nil
+	}
+
+	// Fallback path for non-atomic MathDB implementations (e.g., in-memory test stubs).
 	if err := e.store.MaterializePMV(ctx, normName, candidateSQL); err != nil {
 		return failCertification(
 			"materialize failed: "+err.Error(),
@@ -307,17 +375,6 @@ func (e *Engine) SubmitAndCertifyPMV(
 			},
 			fmt.Errorf("materialize %s.%s: %w", e.mathSchema, normName, err),
 		)
-	}
-
-	notes = append(notes, postCheckVerdict)
-	now := time.Now().UTC()
-	report := map[string]any{
-		"explain_ok":         true,
-		"explain_plan_bytes": len(explainPlan),
-		"used_optimized_sql": usedOptimized,
-		"sample_row_count":   len(sampleRows),
-		"verdict":            postCheckVerdict,
-		"certified_at":       now.Format(time.RFC3339),
 	}
 
 	if hasCertified {
@@ -350,16 +407,25 @@ func (e *Engine) SubmitAndCertifyPMV(
 
 // GetPMV retrieves a cached/certified PMV including its original `raw_intent_sql`.
 func (e *Engine) GetPMV(ctx context.Context, viewName string) (*db.PMVRecord, error) {
+	if e == nil || e.store == nil {
+		return nil, fmt.Errorf("pigeonmath store is not connected")
+	}
 	return e.store.GetPMV(ctx, viewName)
 }
 
 // ListPMVs lists all tracked PigeonMath views ordered by recency.
 func (e *Engine) ListPMVs(ctx context.Context) ([]db.PMVRecord, error) {
+	if e == nil || e.store == nil {
+		return nil, fmt.Errorf("pigeonmath store is not connected")
+	}
 	return e.store.ListPMVs(ctx)
 }
 
 // QueryPMV previews rows from an existing `pigeonmath.pmv_<slug>` view inside a READ ONLY transaction.
 func (e *Engine) QueryPMV(ctx context.Context, viewName string, limit int) ([]map[string]any, error) {
+	if e == nil || e.store == nil {
+		return nil, fmt.Errorf("pigeonmath store is not connected")
+	}
 	normName, err := db.NormalizePMVName(viewName)
 	if err != nil {
 		return nil, err

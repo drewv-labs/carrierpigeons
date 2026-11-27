@@ -4,17 +4,33 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 )
 
 const (
-	defaultMaxToolTurns  = 6
-	defaultOllamaMaxTurn = 8
-	maxErrorBodyBytes    = 4096
+	defaultMaxToolTurns    = 6
+	defaultOllamaMaxTurn   = 8
+	maxErrorBodyBytes      = 4096
+	maxStreamBodyBytes     = 16 << 20 // 16 MiB total response stream cap per turn
+	maxStreamContentBytes  = 4 << 20  // 4 MiB cap for accumulated assistant text per turn
+	maxStreamToolArgBytes  = 1 << 20  // 1 MiB cap for accumulated tool arguments per tool call
+	maxStreamToolNameBytes = 256      // 256 B cap for streamed tool name
+	maxStreamToolCalls     = 64       // max distinct tool calls accumulated per turn
+)
+
+var (
+	streamBodyLimit    int64 = maxStreamBodyBytes
+	streamContentLimit       = maxStreamContentBytes
+	streamToolArgLimit       = maxStreamToolArgBytes
+
+	errStreamLimitExceeded = errors.New("stream response exceeded size limit")
 )
 
 // ToolCallFunction represents a tool invocation emitted by an LLM.
@@ -60,9 +76,12 @@ type Config struct {
 }
 
 func defaultLLMHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
 	return &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 30 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
 	}
 }
@@ -76,7 +95,80 @@ func sendToken(ctx context.Context, ch chan<- string, token string) bool {
 	}
 }
 
-// postJSON marshals payload, sends an HTTP POST with headers, and rejects non-2xx responses with bounded error bodies.
+type cappedStreamReader struct {
+	lr        *io.LimitedReader
+	truncated bool
+}
+
+func newCappedStreamReader(r io.Reader, limit int64) *cappedStreamReader {
+	if limit <= 0 {
+		limit = maxStreamBodyBytes
+	}
+	return &cappedStreamReader{
+		lr: &io.LimitedReader{R: r, N: limit + 1},
+	}
+}
+
+func (c *cappedStreamReader) Read(p []byte) (int, error) {
+	if c.truncated || c.lr.N <= 0 {
+		c.truncated = true
+		return 0, errStreamLimitExceeded
+	}
+	if c.lr.N == 1 {
+		var probe [1]byte
+		n, err := c.lr.R.Read(probe[:])
+		if n > 0 {
+			c.lr.N = 0
+			c.truncated = true
+			return 0, errStreamLimitExceeded
+		}
+		if err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	maxRead := c.lr.N - 1
+	if int64(len(p)) > maxRead {
+		p = p[:maxRead]
+	}
+	n, err := c.lr.R.Read(p)
+	c.lr.N -= int64(n)
+	return n, err
+}
+
+func writeBounded(sb *strings.Builder, s string, limit int) bool {
+	if limit <= 0 || sb.Len()+len(s) <= limit {
+		sb.WriteString(s)
+		return true
+	}
+	return false
+}
+
+func authSecretsFromHeaders(headers map[string]string) []string {
+	if len(headers) == 0 {
+		return nil
+	}
+	var secrets []string
+	for k, v := range headers {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			continue
+		}
+		if strings.EqualFold(k, "authorization") {
+			secrets = append(secrets, trimmed)
+			if len(trimmed) > len("bearer ") && strings.EqualFold(trimmed[:len("bearer ")], "bearer ") {
+				if tok := strings.TrimSpace(trimmed[len("bearer "):]); tok != "" {
+					secrets = append(secrets, tok)
+				}
+			}
+		} else if strings.EqualFold(k, "x-api-key") {
+			secrets = append(secrets, trimmed)
+		}
+	}
+	return secrets
+}
+
+// postJSON marshals payload, sends an HTTP POST with headers, and rejects non-2xx responses with bounded, redacted error bodies.
 func postJSON(
 	ctx context.Context,
 	client *http.Client,
@@ -85,13 +177,14 @@ func postJSON(
 	payload any,
 	provider string,
 ) (*http.Response, error) {
+	secrets := authSecretsFromHeaders(headers)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("%s encode error: %w", provider, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("%s request error: %w", provider, err)
+		return nil, fmt.Errorf("%s request error: %w", provider, jsonutil.RedactError(err, secrets...))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
@@ -101,12 +194,16 @@ func postJSON(
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s connection error: %w", provider, err)
+		return nil, fmt.Errorf("%s connection error: %w", provider, jsonutil.RedactError(err, secrets...))
 	}
-	if resp.StatusCode >= http.StatusBadRequest {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		resp.Body.Close()
-		return nil, fmt.Errorf("%s HTTP %d: %s", provider, resp.StatusCode, strings.TrimSpace(string(errBody)))
+		msg := jsonutil.RedactCredentials(strings.TrimSpace(string(errBody)), secrets...)
+		if msg == "" && resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest {
+			msg = "redirect blocked"
+		}
+		return nil, fmt.Errorf("%s HTTP %d: %s", provider, resp.StatusCode, msg)
 	}
 	return resp, nil
 }
@@ -160,9 +257,9 @@ func New(cfg Config) BaseLLM {
 	case "openai":
 		return NewOpenAIAdapter(cfg.Endpoint, cfg.APIKey, cfg.Model, cfg.Tools)
 	case "llamacpp", "llama.cpp":
-		return NewLlamaCPPAdapter(cfg.Endpoint, cfg.Tools)
+		return NewLlamaCPPAdapter(cfg.Endpoint, cfg.APIKey, cfg.Model, cfg.Tools)
 	case "vllm":
-		return NewVLLMAdapter(cfg.Endpoint, cfg.Model, cfg.Tools)
+		return NewVLLMAdapter(cfg.Endpoint, cfg.APIKey, cfg.Model, cfg.Tools)
 	default:
 		model := strings.TrimSpace(cfg.Model)
 		if model == "" {

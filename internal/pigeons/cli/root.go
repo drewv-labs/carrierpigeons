@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeoncare"
 	"github.com/drewv-labs/carrierpigeons/internal/pigeons/tui"
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
@@ -220,15 +222,22 @@ func dialMQTTClientWithConfig(ctx context.Context, cfg config.WorkstationConfig,
 		return nil, err
 	}
 
-	if tlsCfg != nil {
-		u, parseErr := url.Parse(strings.TrimSpace(brokerURL))
-		if parseErr != nil {
-			return nil, fmt.Errorf("invalid MQTT broker URL %s: %w", config.RedactURL(brokerURL), parseErr)
-		}
-		if !isTLSMQTTScheme(u.Scheme) {
-			return nil, fmt.Errorf("MQTT TLS configuration requires a TLS broker URL scheme (tls://, ssl://, or wss://), got %s", config.RedactURL(brokerURL))
-		}
+	parsedURL, parseErr := url.Parse(strings.TrimSpace(brokerURL))
+	if parseErr != nil {
+		return nil, fmt.Errorf("invalid MQTT broker URL %s: %w", config.RedactURL(brokerURL), jsonutil.RedactError(parseErr, brokerURL, mqttAuth.Password))
 	}
+	if tlsCfg != nil && !isTLSMQTTScheme(parsedURL.Scheme) {
+		return nil, fmt.Errorf("MQTT TLS configuration requires a TLS broker URL scheme (tls://, ssl://, or wss://), got %s", config.RedactURL(brokerURL))
+	}
+
+	dialCtx, dialCancel := context.WithCancel(ctx)
+	defer dialCancel()
+
+	var (
+		connMu     sync.Mutex
+		activeConn net.Conn
+		connected  bool
+	)
 
 	opts := mqtt.NewClientOptions().
 		AddBroker(brokerURL).
@@ -246,10 +255,74 @@ func dialMQTTClientWithConfig(ctx context.Context, cfg config.WorkstationConfig,
 		opts.SetTLSConfig(tlsCfg)
 	}
 
+	scheme := strings.ToLower(strings.TrimSpace(parsedURL.Scheme))
+	if scheme != "ws" && scheme != "wss" {
+		opts.SetCustomOpenConnectionFn(func(uri *url.URL, options mqtt.ClientOptions) (net.Conn, error) {
+			host := uri.Host
+			if _, _, splitErr := net.SplitHostPort(host); splitErr != nil {
+				defaultPort := "1883"
+				if isTLSMQTTScheme(uri.Scheme) {
+					defaultPort = "8883"
+				}
+				host = net.JoinHostPort(uri.Hostname(), defaultPort)
+			}
+			baseDialer := &net.Dialer{Timeout: pahoTimeout}
+			var (
+				c       net.Conn
+				dialErr error
+			)
+			if isTLSMQTTScheme(uri.Scheme) {
+				var tc *tls.Config
+				if options.TLSConfig != nil {
+					tc = options.TLSConfig.Clone()
+				} else {
+					tc = &tls.Config{MinVersion: tls.VersionTLS12}
+				}
+				if tc.ServerName == "" && !tc.InsecureSkipVerify {
+					tc.ServerName = uri.Hostname()
+				}
+				tlsDialer := &tls.Dialer{
+					NetDialer: baseDialer,
+					Config:    tc,
+				}
+				c, dialErr = tlsDialer.DialContext(dialCtx, "tcp", host)
+			} else {
+				c, dialErr = baseDialer.DialContext(dialCtx, "tcp", host)
+			}
+			if dialErr != nil {
+				return nil, dialErr
+			}
+			connMu.Lock()
+			if dialCtx.Err() != nil {
+				connMu.Unlock()
+				_ = c.Close()
+				return nil, dialCtx.Err()
+			}
+			activeConn = c
+			connMu.Unlock()
+			return c, nil
+		})
+	}
+
 	client := mqtt.NewClient(opts)
 	tok := client.Connect()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+
+	abortInFlightDial := func() {
+		dialCancel()
+		connMu.Lock()
+		c := activeConn
+		alreadyConnected := connected
+		connMu.Unlock()
+		if !alreadyConnected && c != nil {
+			_ = c.Close()
+		}
+		go func() {
+			<-tok.Done()
+			client.Disconnect(0)
+		}()
+	}
 
 	select {
 	case <-tok.Done():
@@ -258,21 +331,24 @@ func dialMQTTClientWithConfig(ctx context.Context, cfg config.WorkstationConfig,
 			if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
 				return nil, ctxErr
 			}
-			return nil, fmt.Errorf("connect MQTT broker %s: %w", config.RedactURL(brokerURL), tok.Error())
+			return nil, fmt.Errorf("connect MQTT broker %s: %w", config.RedactURL(brokerURL), jsonutil.RedactError(tok.Error(), brokerURL, mqttAuth.Password))
 		}
 		if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
 			client.Disconnect(0)
 			return nil, ctxErr
 		}
+		connMu.Lock()
+		connected = true
+		connMu.Unlock()
 		return client, nil
 	case <-timer.C:
-		client.Disconnect(0)
+		abortInFlightDial()
 		if ctxErr := waitForContextDeadlineErr(ctx); ctxErr != nil {
 			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("timeout connecting MQTT broker %s", config.RedactURL(brokerURL))
 	case <-ctx.Done():
-		client.Disconnect(0)
+		abortInFlightDial()
 		return nil, ctx.Err()
 	}
 }
@@ -281,9 +357,25 @@ func dialMQTTClient(ctx context.Context, brokerURL, clientID string, timeout tim
 	return dialMQTTClientWithConfig(ctx, wsCfg, brokerURL, clientID, timeout)
 }
 
+func activeMeshLabel(cfg config.WorkstationConfig) string {
+	if mesh := strings.TrimSpace(cfg.ActiveMesh); mesh != "" {
+		return mesh
+	}
+	if mesh := strings.TrimSpace(cfg.MeshName); mesh != "" {
+		return mesh
+	}
+	return core.DefaultMeshName
+}
+
 func openOperatorStoreForConfig(ctx context.Context, cfg config.WorkstationConfig) (*db.PostgresStore, error) {
+	dsn := strings.TrimSpace(cfg.DatabaseURL)
+	if dsn == "" {
+		b := cfg.Brand.MergeWithDefaults()
+		return nil, fmt.Errorf("mesh %q has no operator PostgreSQL DSN configured (set database_url in config or %s_DB_URL)",
+			activeMeshLabel(cfg), strings.ToUpper(strings.TrimSpace(b.EnvPrefix)))
+	}
 	actor := fmt.Sprintf("%s-cli:%s", cfg.Brand.CLIName, cfg.Operator)
-	return db.NewPostgresStoreWithOptions(ctx, cfg.DatabaseURL, db.StoreOptions{
+	return db.NewPostgresStoreWithOptions(ctx, dsn, db.StoreOptions{
 		AppActor:   actor,
 		MaxConns:   6,
 		MinConns:   1,
@@ -296,7 +388,13 @@ func openOperatorStore(ctx context.Context) (*db.PostgresStore, error) {
 }
 
 func openReadOnlyStoreForConfig(ctx context.Context, cfg config.WorkstationConfig, actor string) (*db.ReadOnlyAgentStore, error) {
-	return db.NewReadOnlyAgentStore(ctx, cfg.ReadOnlyDatabaseURL, actor, db.ReadOnlyOptions{
+	dsn := strings.TrimSpace(cfg.ReadOnlyDatabaseURL)
+	if dsn == "" {
+		b := cfg.Brand.MergeWithDefaults()
+		return nil, fmt.Errorf("mesh %q has no read-only PostgreSQL DSN configured (set readonly_database_url in config or %s_RO_DB_URL)",
+			activeMeshLabel(cfg), strings.ToUpper(strings.TrimSpace(b.EnvPrefix)))
+	}
+	return db.NewReadOnlyAgentStore(ctx, dsn, actor, db.ReadOnlyOptions{
 		AllowSuperuser: cfg.AllowSuperuserReadOnly,
 		MathSchema:     cfg.Brand.MathSchema,
 		EnvPrefix:      cfg.Brand.EnvPrefix,
@@ -402,8 +500,11 @@ func launchDashboardWithConfig(parentCtx context.Context, cfg config.Workstation
 		Brand:      cfg.Brand,
 	})
 
+	tuiCtx, tuiCancel := context.WithCancel(parentCtx)
+	defer tuiCancel()
+
 	model := tui.NewDashboardModel(tui.DashboardOptions{
-		Context:       parentCtx,
+		Context:       tuiCtx,
 		Config:        cfg,
 		Store:         roStore,
 		Care:          careSvc,
@@ -414,7 +515,7 @@ func launchDashboardWithConfig(parentCtx context.Context, cfg config.Workstation
 		ApprovalInbox: approvalInbox,
 	})
 
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(parentCtx))
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(tuiCtx))
 	_, runErr := p.Run()
 	return runErr
 }
@@ -428,7 +529,7 @@ func isContextAwareCommand(src *cobra.Command) bool {
 	case rootCmd, tuiCmd,
 		connectCmd, disconnectCmd, meshCmd, meshListCmd, meshCurrentCmd,
 		careCmd,
-		coopCmd, coopStatusCmd, coopMigrateCmd, coopProvisionRolesCmd, coopActivityCmd,
+		coopCmd, coopStatusCmd, coopMigrateCmd, coopProvisionRolesCmd, coopActivityCmd, coopPruneCmd,
 		listCmd,
 		mathCmd, mathListCmd, mathInspectCmd, mathCreateCmd,
 		nodeCmd,
@@ -455,6 +556,9 @@ func cloneFlagInto(dst *pflag.FlagSet, f *pflag.Flag) {
 	case "int":
 		def, _ := strconv.Atoi(f.DefValue)
 		dst.IntP(f.Name, f.Shorthand, def, f.Usage)
+	case "duration":
+		def, _ := time.ParseDuration(f.DefValue)
+		dst.DurationP(f.Name, f.Shorthand, def, f.Usage)
 	case "stringArray":
 		var def []string
 		if trimmed := strings.TrimSpace(f.DefValue); trimmed != "" && trimmed != "[]" {
@@ -478,11 +582,11 @@ func cloneFlagInto(dst *pflag.FlagSet, f *pflag.Flag) {
 
 func syncFlagsToTemplate(clonedFS, templateFS *pflag.FlagSet) func() {
 	type savedFlag struct {
-		flag      *pflag.Flag
-		val       string
-		sliceVal  []string
-		hasSlice  bool
-		changed   bool
+		flag     *pflag.Flag
+		val      string
+		sliceVal []string
+		hasSlice bool
+		changed  bool
 	}
 	var saved []savedFlag
 	clonedFS.VisitAll(func(cf *pflag.Flag) {

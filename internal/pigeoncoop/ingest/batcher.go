@@ -76,6 +76,8 @@ type Batcher struct {
 	circuitMaxHold time.Duration
 	queue          chan queuedEvent
 
+	enqueueMu  sync.RWMutex
+	closed     bool
 	hardCtx    context.Context
 	hardCancel context.CancelFunc
 	stopCh     chan struct{}
@@ -238,13 +240,18 @@ func (b *Batcher) Enqueue(ev *core.CTDPayload) {
 	if ev == nil {
 		return
 	}
-	select {
-	case <-b.stopCh:
+	evBytes := estimatePayloadBytes(ev)
+
+	b.enqueueMu.RLock()
+	defer b.enqueueMu.RUnlock()
+	if b.closed {
+		n := b.dropped.Add(1)
+		if n == 1 || n%500 == 0 {
+			log.Printf("[Coop Ingest] Batcher closed; dropped %d post-close events", n)
+		}
 		return
-	default:
 	}
 
-	evBytes := estimatePayloadBytes(ev)
 	if b.maxQueueBytes > 0 && evBytes > 0 {
 		for {
 			cur := b.queuedBytes.Load()
@@ -621,6 +628,10 @@ func (b *Batcher) loop() {
 // or the bounded drain deadline expires.
 func (b *Batcher) Close() {
 	b.stopOnce.Do(func() {
+		b.enqueueMu.Lock()
+		b.closed = true
+		b.enqueueMu.Unlock()
+
 		close(b.stopCh)
 		timer := time.AfterFunc(b.closeTimeout, b.hardCancel)
 		<-b.doneCh

@@ -60,7 +60,7 @@ func emitProcNetDevSamplesFrom(procNetDevPath, sysNetRoot string, pub core.Telem
 		if lineIdx <= 2 {
 			continue // Skip 2-line /proc/net/dev header
 		}
-		colon := strings.IndexByte(line, ':')
+		colon := strings.LastIndexByte(line, ':')
 		if colon < 0 {
 			continue
 		}

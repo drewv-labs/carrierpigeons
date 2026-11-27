@@ -8,11 +8,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -320,9 +322,10 @@ readonly_database_url = "postgres://pigeoncare_ro:sensor_ro_pw@192.0.2.20:5432/e
 	if cfgA.ReadOnlyDatabaseURL != "" {
 		t.Fatalf("expected empty ReadOnlyDatabaseURL for remote compute-mesh without explicit RO config, got %q", cfgA.ReadOnlyDatabaseURL)
 	}
-	// Inherited top-level operator, LLM, and permissions must be preserved.
-	if cfgA.Operator != "drew" || cfgA.Permissions.Mode != "auto_edit" || cfgA.LLM.Model != "qwen2.5-coder" {
-		t.Fatalf("expected inherited workstation defaults, got operator=%q mode=%q model=%q",
+	// Inherited top-level operator and LLM must be preserved, while permissions reset to safe "default"
+	// across endpoint-overriding mesh switches unless explicitly configured on the target mesh profile.
+	if cfgA.Operator != "drew" || cfgA.Permissions.Mode != "default" || cfgA.LLM.Model != "qwen2.5-coder" {
+		t.Fatalf("expected inherited operator/LLM and reset permissions mode=default, got operator=%q mode=%q model=%q",
 			cfgA.Operator, cfgA.Permissions.Mode, cfgA.LLM.Model)
 	}
 
@@ -1225,17 +1228,31 @@ func TestApplyMeshProfileIsolation(t *testing.T) {
 	base.BrokerURL = "tls://192.0.2.1:8883"
 	base.MQTTUsername = "top-user"
 	base.MQTTPassword = "top-password"
+	base.TLSCAFile = "/etc/pigeons/top-ca.pem"
+	base.TLSCertFile = "/etc/pigeons/top-client.crt"
+	base.TLSKeyFile = "/etc/pigeons/top-client.key"
 	base.TLSInsecureSkipVerify = true
 	base.MQTT = EdgeMQTTConfig{
 		Username:              "top-user",
 		Password:              "top-password",
+		TLSCAFile:             "/etc/pigeons/top-ca.pem",
+		TLSCertFile:           "/etc/pigeons/top-client.crt",
+		TLSKeyFile:            "/etc/pigeons/top-client.key",
 		TLSInsecureSkipVerify: true,
 	}
 	base.DatabaseURL = "postgres://top_admin:top_pw@192.0.2.1:5432/edge_ledger"
 	base.ReadOnlyDatabaseURL = "postgres://top_ro:top_ro_pw@192.0.2.1:5432/edge_ledger"
+	base.AllowSuperuserReadOnly = true
+	base.MCPAuthToken = "top-secret-mcp-token"
+	base.Permissions = PermissionConfig{
+		Mode:                "yolo",
+		AllowedRunners:      []string{"ephemeral", "benchmark"},
+		AllowedScriptHashes: []string{"deadbeef"},
+	}
 
-	// 1. Overriding BrokerURL alone clears inherited MQTT creds, resets TLSInsecureSkipVerify=false,
-	//    and clears inherited DatabaseURL / ReadOnlyDatabaseURL while preserving operator/LLM/permissions.
+	// 1. Overriding BrokerURL alone clears inherited MQTT creds, all 6 TLS file fields, MCPAuthToken,
+	//    AllowSuperuserReadOnly, resets TLSInsecureSkipVerify=false and Permissions to safe defaults,
+	//    and clears inherited DatabaseURL / ReadOnlyDatabaseURL while preserving operator/LLM.
 	brokerOnly := ApplyMeshProfile(base, "prod-broker", MeshProfileConfig{
 		BrokerURL: "tls://192.0.2.50:8883",
 	})
@@ -1247,59 +1264,287 @@ func TestApplyMeshProfileIsolation(t *testing.T) {
 		t.Fatalf("expected inherited MQTT credentials cleared, got top=(%q,%q) section=(%q,%q)",
 			brokerOnly.MQTTUsername, brokerOnly.MQTTPassword, brokerOnly.MQTT.Username, brokerOnly.MQTT.Password)
 	}
+	if brokerOnly.TLSCAFile != "" || brokerOnly.TLSCertFile != "" || brokerOnly.TLSKeyFile != "" ||
+		brokerOnly.MQTT.TLSCAFile != "" || brokerOnly.MQTT.TLSCertFile != "" || brokerOnly.MQTT.TLSKeyFile != "" {
+		t.Fatalf("expected all 6 inherited TLS file fields cleared, got flat=(%q,%q,%q) mqtt=(%q,%q,%q)",
+			brokerOnly.TLSCAFile, brokerOnly.TLSCertFile, brokerOnly.TLSKeyFile,
+			brokerOnly.MQTT.TLSCAFile, brokerOnly.MQTT.TLSCertFile, brokerOnly.MQTT.TLSKeyFile)
+	}
 	if brokerOnly.TLSInsecureSkipVerify || brokerOnly.MQTT.TLSInsecureSkipVerify {
 		t.Fatalf("expected TLSInsecureSkipVerify reset to false, got top=%v section=%v",
 			brokerOnly.TLSInsecureSkipVerify, brokerOnly.MQTT.TLSInsecureSkipVerify)
 	}
-	if brokerOnly.EffectiveMQTTAuth().TLSInsecureSkipVerify || brokerOnly.EffectiveMQTTAuth().Username != "" {
+	if brokerOnly.EffectiveMQTTAuth().TLSInsecureSkipVerify || brokerOnly.EffectiveMQTTAuth().Username != "" ||
+		brokerOnly.EffectiveMQTTAuth().TLSCAFile != "" || brokerOnly.EffectiveMQTTAuth().TLSCertFile != "" || brokerOnly.EffectiveMQTTAuth().TLSKeyFile != "" {
 		t.Fatalf("expected EffectiveMQTTAuth isolated, got %+v", brokerOnly.EffectiveMQTTAuth())
 	}
 	if brokerOnly.DatabaseURL != "" || brokerOnly.ReadOnlyDatabaseURL != "" {
 		t.Fatalf("expected inherited DB URLs cleared, got db=%q ro=%q", brokerOnly.DatabaseURL, brokerOnly.ReadOnlyDatabaseURL)
 	}
+	if brokerOnly.AllowSuperuserReadOnly {
+		t.Fatal("expected AllowSuperuserReadOnly reset to false on endpoint override")
+	}
+	if brokerOnly.MCPAuthToken != "" {
+		t.Fatalf("expected MCPAuthToken cleared on endpoint override, got %q", brokerOnly.MCPAuthToken)
+	}
+	if brokerOnly.Permissions.Mode != "default" || len(brokerOnly.Permissions.AllowedRunners) != 0 || len(brokerOnly.Permissions.AllowedScriptHashes) != 0 {
+		t.Fatalf("expected Permissions reset to safe defaults, got %+v", brokerOnly.Permissions)
+	}
 	if brokerOnly.Operator != "alice" || brokerOnly.LLM.Model == "" {
 		t.Fatalf("expected operator and LLM defaults preserved, got op=%q llm=%+v", brokerOnly.Operator, brokerOnly.LLM)
 	}
 
-	// 2. Overriding ReadOnlyDatabaseURL clears inherited DatabaseURL, MQTT creds, and TLSInsecureSkipVerify.
+	// 2. Overriding ReadOnlyDatabaseURL clears inherited BrokerURL, DatabaseURL, MQTT creds/TLS, MCPAuthToken, and Permissions.
 	roOnly := ApplyMeshProfile(base, "ro-mesh", MeshProfileConfig{
 		ReadOnlyDatabaseURL: "postgres://ro:ro_pw@192.0.2.60:5432/edge_ledger",
 	})
+	if roOnly.BrokerURL != "" {
+		t.Fatalf("expected inherited BrokerURL cleared when unset on target DB profile, got %q", roOnly.BrokerURL)
+	}
 	if roOnly.DatabaseURL != "" || roOnly.ReadOnlyDatabaseURL != "postgres://ro:ro_pw@192.0.2.60:5432/edge_ledger" {
 		t.Fatalf("expected DatabaseURL cleared and ReadOnlyDatabaseURL applied, got db=%q ro=%q", roOnly.DatabaseURL, roOnly.ReadOnlyDatabaseURL)
 	}
-	if roOnly.MQTTUsername != "" || roOnly.MQTTPassword != "" || roOnly.TLSInsecureSkipVerify || roOnly.MQTT.TLSInsecureSkipVerify {
-		t.Fatalf("expected MQTT creds/TLS reset on DB override, got user=%q skip=%v", roOnly.MQTTUsername, roOnly.TLSInsecureSkipVerify)
+	if roOnly.MQTTUsername != "" || roOnly.MQTTPassword != "" || roOnly.TLSInsecureSkipVerify || roOnly.MQTT.TLSInsecureSkipVerify ||
+		roOnly.TLSCAFile != "" || roOnly.MQTT.TLSCAFile != "" || roOnly.MCPAuthToken != "" || roOnly.AllowSuperuserReadOnly || roOnly.Permissions.Mode != "default" {
+		t.Fatalf("expected MQTT creds/TLS/tokens/permissions reset on RO DB override, got %+v", roOnly)
 	}
 
-	// 3. Overriding DatabaseURL clears inherited RO URL, MQTT creds, and TLSInsecureSkipVerify.
+	// 3. Overriding DatabaseURL clears inherited BrokerURL, RO URL, MQTT creds/TLS, MCPAuthToken, and Permissions.
 	dbOnly := ApplyMeshProfile(base, "db-mesh", MeshProfileConfig{
 		DatabaseURL: "postgres://admin:admin_pw@192.0.2.70:5432/edge_ledger",
 	})
+	if dbOnly.BrokerURL != "" {
+		t.Fatalf("expected inherited BrokerURL cleared when unset on DatabaseURL-only profile, got %q", dbOnly.BrokerURL)
+	}
 	if dbOnly.DatabaseURL != "postgres://admin:admin_pw@192.0.2.70:5432/edge_ledger" || dbOnly.ReadOnlyDatabaseURL != "" {
 		t.Fatalf("expected remote DatabaseURL applied and stale RO cleared, got db=%q ro=%q", dbOnly.DatabaseURL, dbOnly.ReadOnlyDatabaseURL)
 	}
-	if dbOnly.MQTTUsername != "" || dbOnly.MQTTPassword != "" || dbOnly.TLSInsecureSkipVerify {
-		t.Fatalf("expected MQTT creds/TLS reset on DatabaseURL override")
+	if dbOnly.MQTTUsername != "" || dbOnly.MQTTPassword != "" || dbOnly.TLSInsecureSkipVerify ||
+		dbOnly.TLSCertFile != "" || dbOnly.MQTT.TLSCertFile != "" || dbOnly.Permissions.Mode != "default" {
+		t.Fatalf("expected MQTT creds/TLS/permissions reset on DatabaseURL override")
 	}
 
-	// 4. Profile with explicit own credentials & TLSInsecureSkipVerify retains its own values.
+	// 4. Profile with explicit own credentials, TLS files, token, AllowSuperuserReadOnly, and Permissions retains its own values.
 	skipTrue := true
+	allowSU := true
 	explicitProf := ApplyMeshProfile(base, "lab-tls", MeshProfileConfig{
-		BrokerURL:             "tls://192.0.2.80:8883",
-		MQTTUsername:          "lab-user",
-		MQTTPassword:          "lab-pw",
-		TLSInsecureSkipVerify: &skipTrue,
+		BrokerURL:              "tls://192.0.2.80:8883",
+		MQTTUsername:           "lab-user",
+		MQTTPassword:           "lab-pw",
+		TLSCAFile:              "/etc/pigeons/lab-ca.pem",
+		TLSCertFile:            "/etc/pigeons/lab-client.crt",
+		TLSKeyFile:             "/etc/pigeons/lab-client.key",
+		TLSInsecureSkipVerify:  &skipTrue,
+		AllowSuperuserReadOnly: &allowSU,
+		MCPAuthToken:           "lab-mcp-token",
+		Permissions: PermissionConfig{
+			Mode:                "auto_edit",
+			AllowedRunners:      []string{"benchmark"},
+			AllowedScriptHashes: []string{"cafebabe"},
+		},
 	})
 	if explicitProf.MQTTUsername != "lab-user" || explicitProf.MQTTPassword != "lab-pw" ||
+		explicitProf.TLSCAFile != "/etc/pigeons/lab-ca.pem" || explicitProf.MQTT.TLSCAFile != "/etc/pigeons/lab-ca.pem" ||
+		explicitProf.TLSCertFile != "/etc/pigeons/lab-client.crt" || explicitProf.MQTT.TLSCertFile != "/etc/pigeons/lab-client.crt" ||
+		explicitProf.TLSKeyFile != "/etc/pigeons/lab-client.key" || explicitProf.MQTT.TLSKeyFile != "/etc/pigeons/lab-client.key" ||
 		!explicitProf.TLSInsecureSkipVerify || !explicitProf.MQTT.TLSInsecureSkipVerify {
 		t.Fatalf("expected explicit profile creds/TLS preserved, got %+v", explicitProf.EffectiveMQTTAuth())
+	}
+	if !explicitProf.AllowSuperuserReadOnly || explicitProf.MCPAuthToken != "lab-mcp-token" ||
+		explicitProf.Permissions.Mode != "auto_edit" ||
+		!slices.Equal(explicitProf.Permissions.AllowedRunners, []string{"benchmark"}) ||
+		!slices.Equal(explicitProf.Permissions.AllowedScriptHashes, []string{"cafebabe"}) {
+		t.Fatalf("expected explicit profile superuser/token/permissions preserved, got su=%v tok=%q perm=%+v",
+			explicitProf.AllowSuperuserReadOnly, explicitProf.MCPAuthToken, explicitProf.Permissions)
 	}
 
 	// 5. Profile that overrides neither BrokerURL nor DB URLs inherits top-level connection fields.
 	opOnly := ApplyMeshProfile(base, "op-only", MeshProfileConfig{Operator: "bob"})
-	if opOnly.Operator != "bob" || opOnly.MQTTUsername != "top-user" || opOnly.DatabaseURL != base.DatabaseURL || !opOnly.TLSInsecureSkipVerify {
+	if opOnly.Operator != "bob" || opOnly.MQTTUsername != "top-user" || opOnly.DatabaseURL != base.DatabaseURL ||
+		!opOnly.TLSInsecureSkipVerify || opOnly.TLSCAFile != "/etc/pigeons/top-ca.pem" ||
+		opOnly.MCPAuthToken != "top-secret-mcp-token" || !opOnly.AllowSuperuserReadOnly || opOnly.Permissions.Mode != "yolo" {
 		t.Fatalf("expected non-endpoint profile to preserve inherited connection fields, got %+v", opOnly)
+	}
+}
+
+func TestMeshProfilePatchClearsStaleROAndWritesCanonicalNestedMQTT(t *testing.T) {
+	skipTrue := true
+	existing := MeshProfileConfig{
+		BrokerURL:             "tls://192.0.2.10:8883",
+		DatabaseURL:           "postgres://admin:old_pw@192.0.2.10:5432/edge_ledger",
+		ReadOnlyDatabaseURL:   "postgres://pigeoncare_ro:old_ro_pw@192.0.2.10:5432/edge_ledger",
+		MQTTUsername:          "legacy-user",
+		MQTTPassword:          "legacy-pass",
+		TLSCAFile:             "/etc/old-ca.pem",
+		TLSCertFile:           "/etc/old-client.crt",
+		TLSKeyFile:            "/etc/old-client.key",
+		TLSInsecureSkipVerify: &skipTrue,
+	}
+
+	newDB := "postgres://admin:new_pw@192.0.2.20:5432/edge_ledger"
+	newUser := "nested-user"
+	newPass := "nested-pass"
+	newCA := "/etc/new-ca.pem"
+	newCert := "/etc/new-client.crt"
+	newKey := "/etc/new-client.key"
+	skipFalse := false
+
+	patched := MeshProfilePatch{
+		DatabaseURL:           &newDB,
+		MQTTUsername:          &newUser,
+		MQTTPassword:          &newPass,
+		TLSCAFile:             &newCA,
+		TLSCertFile:           &newCert,
+		TLSKeyFile:            &newKey,
+		TLSInsecureSkipVerify: &skipFalse,
+	}.Apply(existing)
+
+	if patched.DatabaseURL != newDB {
+		t.Fatalf("expected updated DatabaseURL %q, got %q", newDB, patched.DatabaseURL)
+	}
+	if patched.ReadOnlyDatabaseURL != "" {
+		t.Fatalf("expected stale ReadOnlyDatabaseURL cleared when DatabaseURL patched without ReadOnlyDatabaseURL, got %q", patched.ReadOnlyDatabaseURL)
+	}
+	if patched.MQTTUsername != "" || patched.MQTTPassword != "" ||
+		patched.TLSCAFile != "" || patched.TLSCertFile != "" || patched.TLSKeyFile != "" ||
+		patched.TLSInsecureSkipVerify != nil {
+		t.Fatalf("expected legacy flat MQTT auth/TLS fields cleared on patch, got %+v", patched)
+	}
+	if patched.MQTT.Username != newUser || patched.MQTT.Password != newPass ||
+		patched.MQTT.TLSCAFile != newCA || patched.MQTT.TLSCertFile != newCert ||
+		patched.MQTT.TLSKeyFile != newKey || patched.MQTT.TLSInsecureSkipVerify {
+		t.Fatalf("expected canonical nested MQTT fields populated, got %+v", patched.MQTT)
+	}
+
+	// Patching both DatabaseURL and ReadOnlyDatabaseURL preserves the new ReadOnlyDatabaseURL.
+	newRO := "postgres://pigeoncare_ro:new_ro_pw@192.0.2.20:5432/edge_ledger"
+	patchedBoth := MeshProfilePatch{
+		DatabaseURL:         &newDB,
+		ReadOnlyDatabaseURL: &newRO,
+	}.Apply(existing)
+	if patchedBoth.ReadOnlyDatabaseURL != newRO {
+		t.Fatalf("expected explicit ReadOnlyDatabaseURL %q preserved, got %q", newRO, patchedBoth.ReadOnlyDatabaseURL)
+	}
+
+	// End-to-end TOML persistence verifies no flat duplicate keys are emitted after upsert.
+	dir := t.TempDir()
+	wsPath := filepath.Join(dir, "pigeons.toml")
+	seed := `[meshes.target]
+broker_url = "tls://192.0.2.10:8883"
+database_url = "postgres://admin:old_pw@192.0.2.10:5432/edge_ledger"
+readonly_database_url = "postgres://pigeoncare_ro:old_ro_pw@192.0.2.10:5432/edge_ledger"
+mqtt_username = "legacy-user"
+mqtt_password = "legacy-pass"
+tls_ca_file = "/etc/old-ca.pem"
+`
+	if err := os.WriteFile(wsPath, []byte(seed), 0o600); err != nil {
+		t.Fatalf("write seed toml: %v", err)
+	}
+	if _, err := UpsertWorkstationMeshProfile(wsPath, "target", MeshProfilePatch{
+		DatabaseURL:  &newDB,
+		MQTTUsername: &newUser,
+		MQTTPassword: &newPass,
+		TLSCAFile:    &newCA,
+	}); err != nil {
+		t.Fatalf("UpsertWorkstationMeshProfile: %v", err)
+	}
+	raw, err := os.ReadFile(wsPath)
+	if err != nil {
+		t.Fatalf("read upserted toml: %v", err)
+	}
+	text := string(raw)
+	for _, forbidden := range []string{"mqtt_username =", "mqtt_password =", "readonly_database_url =", "old-ca.pem"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("expected canonical TOML without legacy/stale %q, got:\n%s", forbidden, text)
+		}
+	}
+	if !strings.Contains(text, "[meshes.target.mqtt]") {
+		t.Fatalf("expected canonical [meshes.target.mqtt] section, got:\n%s", text)
+	}
+	loaded, err := LoadWorkstationConfigForMesh(wsPath, "target")
+	if err != nil {
+		t.Fatalf("LoadWorkstationConfigForMesh: %v", err)
+	}
+	auth := loaded.EffectiveMQTTAuth()
+	if auth.Username != newUser || auth.Password != newPass || auth.TLSCAFile != newCA {
+		t.Fatalf("unexpected reloaded MQTT auth: %+v", auth)
+	}
+	if loaded.ReadOnlyDatabaseURL != "" {
+		t.Fatalf("expected stale RO URL cleared on reload, got %q", loaded.ReadOnlyDatabaseURL)
+	}
+}
+
+func TestWorkstationConfigAdvisoryFileLockConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	wsPath := filepath.Join(dir, "pigeons.toml")
+	statePath := filepath.Join(dir, "current_mesh")
+	t.Setenv("PIGEONS_CURRENT_MESH_FILE", statePath)
+
+	const workers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*2)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			meshName := fmt.Sprintf("mesh-%02d", idx)
+			broker := fmt.Sprintf("tcp://192.0.2.%d:1883", 10+idx)
+			if _, err := UpsertWorkstationMeshProfile(wsPath, meshName, MeshProfilePatch{
+				BrokerURL: &broker,
+			}); err != nil {
+				errs <- fmt.Errorf("upsert %s: %w", meshName, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent UpsertWorkstationMeshProfile error: %v", err)
+	}
+
+	baseCfg, err := LoadBaseWorkstationConfig(wsPath)
+	if err != nil {
+		t.Fatalf("LoadBaseWorkstationConfig after concurrent upserts: %v", err)
+	}
+	if len(baseCfg.Meshes) != workers {
+		t.Fatalf("lost updates detected: got %d meshes (%v), want %d", len(baseCfg.Meshes), baseCfg.ConfiguredMeshNames(), workers)
+	}
+	for i := 0; i < workers; i++ {
+		meshName := fmt.Sprintf("mesh-%02d", i)
+		wantBroker := fmt.Sprintf("tcp://192.0.2.%d:1883", 10+i)
+		mp, ok := baseCfg.Meshes[meshName]
+		if !ok || mp.BrokerURL != wantBroker {
+			t.Fatalf("mesh %s missing or corrupted: ok=%v got=%q want=%q", meshName, ok, mp.BrokerURL, wantBroker)
+		}
+	}
+
+	// Concurrent current_mesh write/clear operations must serialize cleanly under statePath + ".lock".
+	var stateWG sync.WaitGroup
+	stateErrs := make(chan error, workers*2)
+	for i := 0; i < workers; i++ {
+		stateWG.Add(1)
+		go func(idx int) {
+			defer stateWG.Done()
+			meshName := fmt.Sprintf("mesh-%02d", idx)
+			if _, err := WriteCurrentMesh(meshName); err != nil {
+				stateErrs <- fmt.Errorf("WriteCurrentMesh(%s): %w", meshName, err)
+				return
+			}
+			if idx%3 == 0 {
+				if err := ClearCurrentMesh(); err != nil {
+					stateErrs <- fmt.Errorf("ClearCurrentMesh(%s): %w", meshName, err)
+				}
+			}
+		}(i)
+	}
+	stateWG.Wait()
+	close(stateErrs)
+	for err := range stateErrs {
+		t.Fatalf("concurrent state mutation error: %v", err)
+	}
+	if _, err := ReadCurrentMesh(); err != nil {
+		t.Fatalf("ReadCurrentMesh after concurrent mutations failed: %v", err)
 	}
 }
 

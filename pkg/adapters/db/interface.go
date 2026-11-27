@@ -85,6 +85,17 @@ type MathDB interface {
 	DropPMV(ctx context.Context, viewName string) error
 }
 
+// AtomicPMVDB is an optional MathDB capability that atomically materializes `<mathSchema>.pmv_<slug>`
+// and upserts `pmv_catalog` with `status = 'certified'` inside a single transaction guarded by a per-view advisory lock.
+type AtomicPMVDB interface {
+	MaterializeAndCertifyPMV(ctx context.Context, rec PMVRecord) (*PMVRecord, error)
+}
+
+// TraceBatchDB is an optional high-throughput lineage ingestion capability implemented via `pgx.CopyFrom`.
+type TraceBatchDB interface {
+	InsertTraces(ctx context.Context, edges []core.TraceEdge) error
+}
+
 // AgentSafeDB combines strictly read-only CTD Ledger queries with isolated `pigeonmath` view management.
 // Under no circumstances does AgentSafeDB expose write methods against public CTD Ledger tables.
 type AgentSafeDB interface {

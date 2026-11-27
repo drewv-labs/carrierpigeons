@@ -41,13 +41,13 @@ var errRelayClosed = errors.New("relay closed")
 // and Paho's reconnect resume path cannot retain unbounded memory or replay duplicate QoS-1 packets.
 type noopStore struct{}
 
-func (noopStore) Open()                                 {}
-func (noopStore) Put(string, packets.ControlPacket)     {}
-func (noopStore) Get(string) packets.ControlPacket      { return nil }
-func (noopStore) All() []string                         { return nil }
-func (noopStore) Del(string)                            {}
-func (noopStore) Close()                                {}
-func (noopStore) Reset()                                {}
+func (noopStore) Open()                             {}
+func (noopStore) Put(string, packets.ControlPacket) {}
+func (noopStore) Get(string) packets.ControlPacket  { return nil }
+func (noopStore) All() []string                     { return nil }
+func (noopStore) Del(string)                        {}
+func (noopStore) Close()                            {}
+func (noopStore) Reset()                            {}
 
 // Options configures a node's MQTT relay, ring-buffer spool, LWT presence, TLS, and NodeHello metadata.
 type Options struct {
@@ -511,7 +511,7 @@ func (c *MQTTClient) forceReconnect() {
 	}
 }
 
-// Publish enqueues the payload into the ring-buffer spool without ever blocking observers.
+// Publish marshals payload once and enqueues the pre-marshaled frame into the ring-buffer spool without ever blocking observers.
 func (c *MQTTClient) Publish(payload *core.CTDPayload) error {
 	if payload == nil {
 		return nil
@@ -535,7 +535,8 @@ func (c *MQTTClient) Publish(payload *core.CTDPayload) error {
 	default:
 	}
 
-	evicted, accepted := c.spool.PushSized(payload, int64(len(raw)))
+	topic := payload.RoutingTopic(c.topicPrefix)
+	evicted, accepted := c.spool.PushRaw(payload, topic, raw)
 	if !accepted {
 		if c.spool.IsClosed() {
 			c.recordDeliveryDrop("relay closed", payload, errRelayClosed)
@@ -556,7 +557,7 @@ func (c *MQTTClient) Publish(payload *core.CTDPayload) error {
 	return nil
 }
 
-// flushLoop waits for an active MQTT connection, pulls micro-batches from the ring buffer,
+// flushLoop waits for an active MQTT connection, pulls pre-marshaled micro-batches from the ring buffer,
 // and pipelines QoS 1 MQTT publishes to eliminate WAN RTT bottlenecks.
 func (c *MQTTClient) flushLoop() {
 	defer close(c.flushDone)
@@ -564,7 +565,7 @@ func (c *MQTTClient) flushLoop() {
 		if !c.waitForConnected() {
 			return
 		}
-		batch, ok := c.spool.PopBatchBlocking(maxPipelinedPublishes, c.stopCh)
+		batch, ok := c.spool.PopRawBatchBlocking(maxPipelinedPublishes, c.stopCh)
 		if !ok {
 			return
 		}
@@ -572,7 +573,7 @@ func (c *MQTTClient) flushLoop() {
 	}
 }
 
-func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
+func (c *MQTTClient) deliverBatchWithRetry(batch []SpoolItem) {
 	type pendingItem struct {
 		payload  *core.CTDPayload
 		topic    string
@@ -580,22 +581,33 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		failures int
 	}
 	pending := make([]pendingItem, 0, len(batch))
-	for _, p := range batch {
-		if p == nil {
-			continue
-		}
-		raw, err := json.Marshal(p)
-		if err != nil {
-			c.recordDeliveryDrop("marshal error", p, err)
-			continue
+	for _, item := range batch {
+		raw := item.Raw
+		topic := item.Topic
+		if len(raw) == 0 {
+			if item.Payload == nil {
+				continue
+			}
+			marshaled, err := json.Marshal(item.Payload)
+			if err != nil {
+				c.recordDeliveryDrop("marshal error", item.Payload, err)
+				continue
+			}
+			raw = marshaled
 		}
 		if len(raw) > maxMQTTPayloadBytes {
-			c.recordDeliveryDrop("payload exceeds max MQTT packet size", p, fmt.Errorf("%d bytes > %d", len(raw), maxMQTTPayloadBytes))
+			c.recordDeliveryDrop("payload exceeds max MQTT packet size", item.Payload, fmt.Errorf("%d bytes > %d", len(raw), maxMQTTPayloadBytes))
+			continue
+		}
+		if topic == "" && item.Payload != nil {
+			topic = item.Payload.RoutingTopic(c.topicPrefix)
+		}
+		if topic == "" {
 			continue
 		}
 		pending = append(pending, pendingItem{
-			payload: p,
-			topic:   p.RoutingTopic(c.topicPrefix),
+			payload: item.Payload,
+			topic:   topic,
 			raw:     raw,
 		})
 	}
@@ -607,11 +619,15 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 		if len(items) == 0 {
 			return
 		}
-		payloads := make([]*core.CTDPayload, 0, len(items))
+		spoolItems := make([]SpoolItem, 0, len(items))
 		for _, item := range items {
-			payloads = append(payloads, item.payload)
+			spoolItems = append(spoolItems, SpoolItem{
+				Payload: item.payload,
+				Topic:   item.topic,
+				Raw:     item.raw,
+			})
 		}
-		c.spool.PrependBatch(payloads)
+		c.spool.PrependRawBatch(spoolItems)
 	}
 
 	maxAttempts := c.effectiveMaxAttempts()
@@ -787,10 +803,10 @@ func (c *MQTTClient) deliverBatchWithRetry(batch []*core.CTDPayload) {
 	}
 }
 
-func countNonNilPayloads(items []*core.CTDPayload) uint64 {
+func countValidSpoolItems(items []SpoolItem) uint64 {
 	var n uint64
-	for _, p := range items {
-		if p != nil {
+	for _, item := range items {
+		if len(item.Raw) > 0 || item.Payload != nil {
 			n++
 		}
 	}
@@ -798,12 +814,12 @@ func countNonNilPayloads(items []*core.CTDPayload) uint64 {
 }
 
 func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
-	remaining := c.spool.CloseAndDrain()
+	remaining := c.spool.CloseAndDrainRaw()
 	if len(remaining) == 0 {
 		return
 	}
 	if !c.isConnected() {
-		if dropped := countNonNilPayloads(remaining); dropped > 0 {
+		if dropped := countValidSpoolItems(remaining); dropped > 0 {
 			total := c.deliveryDropped.Add(dropped)
 			log.Printf("[Relay] Disconnected during shutdown; dropped %d unsent spooled CTD events (total_dropped=%d)", dropped, total)
 		}
@@ -814,7 +830,7 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 	for start := 0; start < len(remaining); start += maxPipelinedPublishes {
 		select {
 		case <-timer.C:
-			if unsent := countNonNilPayloads(remaining[start:]); unsent > 0 {
+			if unsent := countValidSpoolItems(remaining[start:]); unsent > 0 {
 				total := c.deliveryDropped.Add(unsent)
 				log.Printf("[Relay] Shutdown drain timed out; dropped %d unsent CTD events (total_dropped=%d)", unsent, total)
 			}
@@ -827,20 +843,31 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 		}
 		chunk := remaining[start:end]
 		tokens := make([]mqtt.Token, 0, len(chunk))
-		for _, p := range chunk {
-			if p == nil {
-				continue
-			}
-			raw, err := json.Marshal(p)
-			if err != nil {
-				c.recordDeliveryDrop("marshal error", p, err)
-				continue
+		for _, item := range chunk {
+			raw := item.Raw
+			topic := item.Topic
+			if len(raw) == 0 {
+				if item.Payload == nil {
+					continue
+				}
+				marshaled, err := json.Marshal(item.Payload)
+				if err != nil {
+					c.recordDeliveryDrop("marshal error", item.Payload, err)
+					continue
+				}
+				raw = marshaled
 			}
 			if len(raw) > maxMQTTPayloadBytes {
-				c.recordDeliveryDrop("payload exceeds max MQTT packet size", p, fmt.Errorf("%d bytes > %d", len(raw), maxMQTTPayloadBytes))
+				c.recordDeliveryDrop("payload exceeds max MQTT packet size", item.Payload, fmt.Errorf("%d bytes > %d", len(raw), maxMQTTPayloadBytes))
 				continue
 			}
-			tokens = append(tokens, c.client.Publish(p.RoutingTopic(c.topicPrefix), 1, false, raw))
+			if topic == "" && item.Payload != nil {
+				topic = item.Payload.RoutingTopic(c.topicPrefix)
+			}
+			if topic == "" {
+				continue
+			}
+			tokens = append(tokens, c.client.Publish(topic, 1, false, raw))
 		}
 		for i, tok := range tokens {
 			select {
@@ -861,7 +888,7 @@ func (c *MQTTClient) drainRemainingBeforeClose(maxWait time.Duration) {
 						unacked++
 					}
 				}
-				unsent := countNonNilPayloads(remaining[end:])
+				unsent := countValidSpoolItems(remaining[end:])
 				if dropped := unacked + unsent; dropped > 0 {
 					total := c.deliveryDropped.Add(dropped)
 					log.Printf("[Relay] Shutdown drain timed out; dropped %d CTD events (%d unacked, %d unsent, total_dropped=%d)",

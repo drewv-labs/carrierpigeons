@@ -69,12 +69,12 @@ type CoopMQTTConfig struct {
 
 // EdgeMQTTConfig provides optional structured [mqtt] credentials and TLS settings on edge/workstation configs.
 type EdgeMQTTConfig struct {
-	Username              string `toml:"username"`
-	Password              string `toml:"password"`
-	TLSCAFile             string `toml:"tls_ca_file"`
-	TLSCertFile           string `toml:"tls_cert_file"`
-	TLSKeyFile            string `toml:"tls_key_file"`
-	TLSInsecureSkipVerify bool   `toml:"tls_insecure_skip_verify"`
+	Username              string `toml:"username,omitempty"`
+	Password              string `toml:"password,omitempty"`
+	TLSCAFile             string `toml:"tls_ca_file,omitempty"`
+	TLSCertFile           string `toml:"tls_cert_file,omitempty"`
+	TLSKeyFile            string `toml:"tls_key_file,omitempty"`
+	TLSInsecureSkipVerify bool   `toml:"tls_insecure_skip_verify,omitempty"`
 }
 
 // BuildMQTTTLSConfig constructs a *tls.Config when CA/client certs or skip-verify are configured.
@@ -466,43 +466,48 @@ func (p MeshProfilePatch) IsEmpty() bool {
 }
 
 // Apply overlays non-nil fields onto an existing MeshProfileConfig.
+// Patched MQTT auth/TLS settings are stored canonically under nested `dst.MQTT.*` while legacy flat
+// duplicates are cleared, and patching `DatabaseURL` without `ReadOnlyDatabaseURL` clears stale RO URLs.
 func (p MeshProfilePatch) Apply(dst MeshProfileConfig) MeshProfileConfig {
 	if p.BrokerURL != nil {
 		dst.BrokerURL = strings.TrimSpace(*p.BrokerURL)
 	}
 	if p.DatabaseURL != nil {
 		dst.DatabaseURL = strings.TrimSpace(*p.DatabaseURL)
+		if p.ReadOnlyDatabaseURL == nil {
+			dst.ReadOnlyDatabaseURL = ""
+		}
 	}
 	if p.ReadOnlyDatabaseURL != nil {
 		dst.ReadOnlyDatabaseURL = strings.TrimSpace(*p.ReadOnlyDatabaseURL)
 	}
 	if p.MQTTUsername != nil {
 		u := strings.TrimSpace(*p.MQTTUsername)
-		dst.MQTTUsername = u
+		dst.MQTTUsername = ""
 		dst.MQTT.Username = u
 	}
 	if p.MQTTPassword != nil {
-		dst.MQTTPassword = *p.MQTTPassword
+		dst.MQTTPassword = ""
 		dst.MQTT.Password = *p.MQTTPassword
 	}
 	if p.TLSCAFile != nil {
 		v := strings.TrimSpace(*p.TLSCAFile)
-		dst.TLSCAFile = v
+		dst.TLSCAFile = ""
 		dst.MQTT.TLSCAFile = v
 	}
 	if p.TLSCertFile != nil {
 		v := strings.TrimSpace(*p.TLSCertFile)
-		dst.TLSCertFile = v
+		dst.TLSCertFile = ""
 		dst.MQTT.TLSCertFile = v
 	}
 	if p.TLSKeyFile != nil {
 		v := strings.TrimSpace(*p.TLSKeyFile)
-		dst.TLSKeyFile = v
+		dst.TLSKeyFile = ""
 		dst.MQTT.TLSKeyFile = v
 	}
 	if p.TLSInsecureSkipVerify != nil {
 		b := *p.TLSInsecureSkipVerify
-		dst.TLSInsecureSkipVerify = &b
+		dst.TLSInsecureSkipVerify = nil
 		dst.MQTT.TLSInsecureSkipVerify = b
 	}
 	if p.TopicRoot != nil {
@@ -622,8 +627,9 @@ func mergeBrandOverlay(base, over brand.Spec) brand.Spec {
 	return out.MergeWithDefaults()
 }
 
-// ApplyMeshProfile layers a named `[meshes.<meshName>]` profile onto a base WorkstationConfig,
-// inheriting top-level LLM, permission, and operator defaults for any unset fields.
+// ApplyMeshProfile layers a named `[meshes.<meshName>]` profile onto a base WorkstationConfig.
+// When the profile overrides any broker/database endpoint, cross-mesh credentials, TLS certs, tokens,
+// superuser overrides, and execution permissions are isolated/reset to safe defaults unless explicitly set on p.
 func ApplyMeshProfile(base WorkstationConfig, meshName string, p MeshProfileConfig) WorkstationConfig {
 	out := base
 	out.ActiveMesh = meshName
@@ -633,14 +639,19 @@ func ApplyMeshProfile(base WorkstationConfig, meshName string, p MeshProfileConf
 		strings.TrimSpace(p.DatabaseURL) != "" ||
 		strings.TrimSpace(p.ReadOnlyDatabaseURL) != ""
 	if overridesEndpoint {
+		out.BrokerURL = ""
 		out.MQTTUsername = ""
 		out.MQTTPassword = ""
-		out.MQTT.Username = ""
-		out.MQTT.Password = ""
+		out.TLSCAFile = ""
+		out.TLSCertFile = ""
+		out.TLSKeyFile = ""
 		out.TLSInsecureSkipVerify = false
-		out.MQTT.TLSInsecureSkipVerify = false
+		out.MQTT = EdgeMQTTConfig{}
 		out.DatabaseURL = ""
 		out.ReadOnlyDatabaseURL = ""
+		out.AllowSuperuserReadOnly = false
+		out.MCPAuthToken = ""
+		out.Permissions = PermissionConfig{Mode: "default"}
 	}
 
 	if v := strings.TrimSpace(p.BrokerURL); v != "" {
@@ -1043,12 +1054,14 @@ func WriteCurrentMeshForBrand(b brand.Spec, meshName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if prev, prevErr := ReadCurrentMeshForBrand(bSpec); prevErr == nil && prev != "" && prev != meshName {
-		if prevPath, pErr := previousMeshStatePathForBrand(bSpec); pErr == nil {
-			_ = writeAtomicFile0600(prevPath, []byte(prev+"\n"))
+	if err := withAdvisoryFileLock(statePath, func() error {
+		if prev, prevErr := ReadCurrentMeshForBrand(bSpec); prevErr == nil && prev != "" && prev != meshName {
+			if prevPath, pErr := previousMeshStatePathForBrand(bSpec); pErr == nil {
+				_ = writeAtomicFile0600(prevPath, []byte(prev+"\n"))
+			}
 		}
-	}
-	if err := writeAtomicFile0600(statePath, []byte(meshName+"\n")); err != nil {
+		return writeAtomicFile0600(statePath, []byte(meshName+"\n"))
+	}); err != nil {
 		return "", err
 	}
 	return statePath, nil
@@ -1067,15 +1080,17 @@ func ClearCurrentMeshForBrand(b brand.Spec) error {
 	if err != nil {
 		return err
 	}
-	if prev, prevErr := ReadCurrentMeshForBrand(bSpec); prevErr == nil && prev != "" {
-		if prevPath, pErr := previousMeshStatePathForBrand(bSpec); pErr == nil {
-			_ = writeAtomicFile0600(prevPath, []byte(prev+"\n"))
+	return withAdvisoryFileLock(statePath, func() error {
+		if prev, prevErr := ReadCurrentMeshForBrand(bSpec); prevErr == nil && prev != "" {
+			if prevPath, pErr := previousMeshStatePathForBrand(bSpec); pErr == nil {
+				_ = writeAtomicFile0600(prevPath, []byte(prev+"\n"))
+			}
 		}
-	}
-	if err := os.Remove(statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove %s: %w", statePath, err)
-	}
-	return nil
+		if err := os.Remove(statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", statePath, err)
+		}
+		return nil
+	})
 }
 
 // ClearCurrentMesh removes `~/.config/pigeons/current_mesh`, reverting workstation commands to top-level defaults.
@@ -1325,84 +1340,86 @@ func UpsertWorkstationMeshProfileForBrand(explicitPath string, b brand.Spec, mes
 		return "", err
 	}
 
-	var existingRaw []byte
-	var existingCfg WorkstationConfig
-	if raw, readErr := os.ReadFile(targetPath); readErr == nil {
-		existingRaw = raw
-		if _, decErr := toml.Decode(string(raw), &existingCfg); decErr != nil {
-			return "", fmt.Errorf("decode existing %s: %w", targetPath, decErr)
-		}
-	} else if !errors.Is(readErr, os.ErrNotExist) {
-		return "", fmt.Errorf("read %s: %w", targetPath, readErr)
-	} else if strings.TrimSpace(explicitPath) == "" && strings.TrimSpace(os.Getenv(bSpec.EnvPrefix+"_CONFIG")) == "" {
-		// When bootstrapping ~/.config/<cli>/<cli>.toml, preserve any active /etc/<cli>/<cli>.toml
-		// base settings and profiles instead of silently shadowing them.
-		if sysPath := resolveWorkstationConfigFileForBrand("", bSpec); sysPath != "" && sysPath != targetPath {
-			sysRaw, sysErr := os.ReadFile(sysPath)
-			if sysErr != nil {
-				return "", fmt.Errorf("read active base config %s: %w", sysPath, sysErr)
+	if err := withAdvisoryFileLock(targetPath, func() error {
+		var existingRaw []byte
+		var existingCfg WorkstationConfig
+		if raw, readErr := os.ReadFile(targetPath); readErr == nil {
+			existingRaw = raw
+			if _, decErr := toml.Decode(string(raw), &existingCfg); decErr != nil {
+				return fmt.Errorf("decode existing %s: %w", targetPath, decErr)
 			}
-			existingRaw = sysRaw
-			if _, decErr := toml.Decode(string(sysRaw), &existingCfg); decErr != nil {
-				return "", fmt.Errorf("decode active base config %s: %w", sysPath, decErr)
-			}
-		}
-	}
-
-	mergedProfile := patch.Apply(existingCfg.Meshes[meshName])
-	renderedBlock, err := renderMeshProfileTOML(meshName, mergedProfile)
-	if err != nil {
-		return "", fmt.Errorf("encode [meshes.%s]: %w", meshName, err)
-	}
-
-	var updatedText string
-	if len(existingRaw) == 0 {
-		headerTitle := "Pigeons"
-		if brandCLIDirSlug(bSpec) != "pigeons" {
-			headerTitle = bSpec.ProductName
-		}
-		updatedText = fmt.Sprintf("# %s Workstation Control Plane Configuration\n\n%s", headerTitle, renderedBlock)
-	} else {
-		lines := strings.Split(string(existingRaw), "\n")
-		var outLines []string
-		inTargetMesh := false
-		replaced := false
-
-		for _, line := range lines {
-			if hdr, isArray, ok := parseTOMLTableHeaderPath(line); ok {
-				if !isArray && isMeshSectionHeader(hdr, meshName) {
-					if !replaced {
-						outLines = append(outLines, strings.TrimRight(renderedBlock, "\n"))
-						replaced = true
-					}
-					inTargetMesh = true
-					continue
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			return fmt.Errorf("read %s: %w", targetPath, readErr)
+		} else if strings.TrimSpace(explicitPath) == "" && strings.TrimSpace(os.Getenv(bSpec.EnvPrefix+"_CONFIG")) == "" {
+			// When bootstrapping ~/.config/<cli>/<cli>.toml, preserve any active /etc/<cli>/<cli>.toml
+			// base settings and profiles instead of silently shadowing them.
+			if sysPath := resolveWorkstationConfigFileForBrand("", bSpec); sysPath != "" && sysPath != targetPath {
+				sysRaw, sysErr := os.ReadFile(sysPath)
+				if sysErr != nil {
+					return fmt.Errorf("read active base config %s: %w", sysPath, sysErr)
 				}
-				inTargetMesh = false
-			}
-			if !inTargetMesh {
-				outLines = append(outLines, line)
+				existingRaw = sysRaw
+				if _, decErr := toml.Decode(string(sysRaw), &existingCfg); decErr != nil {
+					return fmt.Errorf("decode active base config %s: %w", sysPath, decErr)
+				}
 			}
 		}
 
-		if !replaced {
-			trimmedExisting := strings.TrimRight(string(existingRaw), " \t\r\n")
-			if trimmedExisting == "" {
-				updatedText = renderedBlock
-			} else {
-				updatedText = trimmedExisting + "\n\n" + renderedBlock
+		mergedProfile := patch.Apply(existingCfg.Meshes[meshName])
+		renderedBlock, err := renderMeshProfileTOML(meshName, mergedProfile)
+		if err != nil {
+			return fmt.Errorf("encode [meshes.%s]: %w", meshName, err)
+		}
+
+		var updatedText string
+		if len(existingRaw) == 0 {
+			headerTitle := "Pigeons"
+			if brandCLIDirSlug(bSpec) != "pigeons" {
+				headerTitle = bSpec.ProductName
 			}
+			updatedText = fmt.Sprintf("# %s Workstation Control Plane Configuration\n\n%s", headerTitle, renderedBlock)
 		} else {
-			updatedText = strings.TrimRight(strings.Join(outLines, "\n"), " \t\r\n") + "\n"
+			lines := strings.Split(string(existingRaw), "\n")
+			var outLines []string
+			inTargetMesh := false
+			replaced := false
+
+			for _, line := range lines {
+				if hdr, isArray, ok := parseTOMLTableHeaderPath(line); ok {
+					if !isArray && isMeshSectionHeader(hdr, meshName) {
+						if !replaced {
+							outLines = append(outLines, strings.TrimRight(renderedBlock, "\n"))
+							replaced = true
+						}
+						inTargetMesh = true
+						continue
+					}
+					inTargetMesh = false
+				}
+				if !inTargetMesh {
+					outLines = append(outLines, line)
+				}
+			}
+
+			if !replaced {
+				trimmedExisting := strings.TrimRight(string(existingRaw), " \t\r\n")
+				if trimmedExisting == "" {
+					updatedText = renderedBlock
+				} else {
+					updatedText = trimmedExisting + "\n\n" + renderedBlock
+				}
+			} else {
+				updatedText = strings.TrimRight(strings.Join(outLines, "\n"), " \t\r\n") + "\n"
+			}
 		}
-	}
 
-	var verify WorkstationConfig
-	if _, err := toml.Decode(updatedText, &verify); err != nil {
-		return "", fmt.Errorf("verify updated TOML for %s: %w", targetPath, err)
-	}
+		var verify WorkstationConfig
+		if _, err := toml.Decode(updatedText, &verify); err != nil {
+			return fmt.Errorf("verify updated TOML for %s: %w", targetPath, err)
+		}
 
-	if err := writeAtomicFile0600(targetPath, []byte(updatedText)); err != nil {
+		return writeAtomicFile0600(targetPath, []byte(updatedText))
+	}); err != nil {
 		return "", err
 	}
 	return targetPath, nil

@@ -3,8 +3,11 @@ package db
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -543,16 +546,46 @@ type recordedExec struct {
 type fakePGXTx struct {
 	pgx.Tx
 	execs   []recordedExec
+	execFn  func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	queryFn func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-func (f *fakePGXTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (f *fakePGXTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	f.execs = append(f.execs, recordedExec{sql: sql, args: args})
+	if f.execFn != nil {
+		return f.execFn(ctx, sql, args...)
+	}
 	return pgconn.CommandTag{}, nil
 }
 
 func (f *fakePGXTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return f.queryFn(ctx, sql, args...)
+}
+
+type fakePGXRow struct {
+	scanFn func(dest ...any) error
+}
+
+func (r *fakePGXRow) Scan(dest ...any) error {
+	return r.scanFn(dest...)
+}
+
+type fakeSchemaConn struct {
+	execs      []recordedExec
+	queryRowFn func(ctx context.Context, sql string, args ...any) pgx.Row
+	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func (c *fakeSchemaConn) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return c.queryRowFn(ctx, sql, args...)
+}
+
+func (c *fakeSchemaConn) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	c.execs = append(c.execs, recordedExec{sql: sql, args: args})
+	if c.execFn != nil {
+		return c.execFn(ctx, sql, args...)
+	}
+	return pgconn.CommandTag{}, nil
 }
 
 type fakePGXRows struct {
@@ -906,6 +939,406 @@ func TestResolveNodesAllFreshnessAndLineageCTEBoundsAndPrune(t *testing.T) {
 		}
 		if gotArgs[1] != maxLedgerPruneBatchLimit {
 			t.Fatalf("expected batchLimit clamped to %d, got %v", maxLedgerPruneBatchLimit, gotArgs[1])
+		}
+	})
+}
+
+func TestEnsureMathSchemaUsesPGCatalogForLeastPrivilegeRole(t *testing.T) {
+	if strings.Contains(strings.ToLower(ensureMathSchemaExistsQuery), "information_schema") {
+		t.Fatalf("ensureMathSchemaExistsQuery MUST NOT use information_schema.tables (hides unprivileged tables from ctd_ingestor): %s", ensureMathSchemaExistsQuery)
+	}
+	for _, frag := range []string{
+		"pg_catalog.pg_class",
+		"pg_catalog.pg_namespace",
+		"n.nspname = $1",
+		"c.relname = 'pmv_catalog'",
+	} {
+		if !strings.Contains(ensureMathSchemaExistsQuery, frag) {
+			t.Fatalf("ensureMathSchemaExistsQuery missing %q:\n%s", frag, ensureMathSchemaExistsQuery)
+		}
+	}
+
+	t.Run("returns nil immediately without DDL when pmv_catalog exists in pg_catalog", func(t *testing.T) {
+		store := &PostgresStore{mathSchema: "pigeonmath"}
+		var seenSQL string
+		var seenArgs []any
+		conn := &fakeSchemaConn{
+			queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+				seenSQL = sql
+				seenArgs = args
+				return &fakePGXRow{
+					scanFn: func(dest ...any) error {
+						*dest[0].(*bool) = true
+						return nil
+					},
+				}
+			},
+			execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+				return pgconn.CommandTag{}, &pgconn.PgError{Code: "42501", Message: "permission denied for database edge_ledger"}
+			},
+		}
+
+		if err := store.ensureMathSchemaWithConn(context.Background(), conn); err != nil {
+			t.Fatalf("expected least-privilege ctd_ingestor EnsureMathSchema to succeed when pmv_catalog exists, got %v", err)
+		}
+		if seenSQL != ensureMathSchemaExistsQuery {
+			t.Fatalf("expected ensureMathSchemaExistsQuery, got %s", seenSQL)
+		}
+		if len(seenArgs) != 1 || seenArgs[0] != "pigeonmath" {
+			t.Fatalf("unexpected query args: %#v", seenArgs)
+		}
+		if len(conn.execs) != 0 {
+			t.Fatalf("expected zero DDL Exec calls when pmv_catalog already exists, got %d", len(conn.execs))
+		}
+	})
+
+	t.Run("runs CREATE SCHEMA and CREATE TABLE when pmv_catalog does not exist", func(t *testing.T) {
+		store := &PostgresStore{mathSchema: "pigeonmath"}
+		conn := &fakeSchemaConn{
+			queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return &fakePGXRow{
+					scanFn: func(dest ...any) error {
+						*dest[0].(*bool) = false
+						return nil
+					},
+				}
+			},
+		}
+
+		if err := store.ensureMathSchemaWithConn(context.Background(), conn); err != nil {
+			t.Fatalf("ensureMathSchemaWithConn failed: %v", err)
+		}
+		if len(conn.execs) != 1 || !strings.Contains(conn.execs[0].sql, "CREATE SCHEMA IF NOT EXISTS pigeonmath;") || !strings.Contains(conn.execs[0].sql, "CREATE TABLE IF NOT EXISTS pigeonmath.pmv_catalog") {
+			t.Fatalf("expected pigeonmath DDL execution, got %+v", conn.execs)
+		}
+	})
+
+	t.Run("propagates catalog lookup error without attempting CREATE SCHEMA", func(t *testing.T) {
+		store := &PostgresStore{mathSchema: "pigeonmath"}
+		wantErr := errors.New("connection reset during catalog probe")
+		conn := &fakeSchemaConn{
+			queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
+				return &fakePGXRow{
+					scanFn: func(_ ...any) error { return wantErr },
+				}
+			},
+		}
+		err := store.ensureMathSchemaWithConn(context.Background(), conn)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("expected wrapped %v, got %v", wantErr, err)
+		}
+		if len(conn.execs) != 0 {
+			t.Fatalf("expected zero DDL Exec calls on catalog probe error, got %d", len(conn.execs))
+		}
+	})
+}
+
+func TestInsertTracesBatchesViaCopyFrom(t *testing.T) {
+	store := &PostgresStore{}
+	called := false
+	store.copyTracesFn = func(_ context.Context, _ [][]any) (int64, error) {
+		called = true
+		return 0, nil
+	}
+	if err := store.InsertTraces(context.Background(), nil); err != nil {
+		t.Fatalf("expected nil slice InsertTraces to return nil, got %v", err)
+	}
+	if called {
+		t.Fatal("expected empty slice InsertTraces to short-circuit before CopyFrom")
+	}
+
+	ts := time.Date(2026, 11, 26, 18, 0, 0, 0, time.UTC)
+	var captured [][]any
+	store.copyTracesFn = func(_ context.Context, copyRows [][]any) (int64, error) {
+		captured = copyRows
+		return int64(len(copyRows)), nil
+	}
+
+	edges := []core.TraceEdge{
+		{
+			SourceID:  "req:01",
+			Verb:      "dispatched_to",
+			TargetID:  "node:rv64-compute-01",
+			NodeID:    "rv64-compute-01",
+			RunID:     "req:01",
+			Meta:      map[string]string{"runner": "benchmark"},
+			Timestamp: ts,
+		},
+		{
+			SourceID: "req:01",
+			Verb:     "dispatched_to",
+			TargetID: "node:rv64-compute-02",
+		},
+	}
+
+	if err := store.InsertTraces(context.Background(), edges); err != nil {
+		t.Fatalf("InsertTraces failed: %v", err)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("expected 2 CopyFrom rows, got %d", len(captured))
+	}
+	if captured[0][0] != "req:01" || captured[0][1] != "dispatched_to" || captured[0][2] != "node:rv64-compute-01" ||
+		captured[0][3] != "rv64-compute-01" || captured[0][4] != "req:01" ||
+		string(captured[0][5].([]byte)) != `{"runner":"benchmark"}` || !captured[0][6].(time.Time).Equal(ts) {
+		t.Fatalf("unexpected first CopyFrom trace row: %#v", captured[0])
+	}
+	if captured[1][3] != nil || captured[1][4] != nil || string(captured[1][5].([]byte)) != "{}" || captured[1][6].(time.Time).IsZero() {
+		t.Fatalf("expected empty NodeID/RunID mapped to nil and default UTC timestamp, got: %#v", captured[1])
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.InsertTraces(cancelCtx, edges); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestMaterializeAndCertifyPMVAtomicAndStatusGuards(t *testing.T) {
+	t.Run("atomic advisory lock, view creation, and certified catalog upsert inside single tx", func(t *testing.T) {
+		store := &PostgresStore{mathSchema: "pigeonmath"}
+		now := time.Date(2026, 11, 26, 18, 30, 0, 0, time.UTC)
+
+		rec := PMVRecord{
+			ViewName:     "thermal_summary",
+			SubmittedBy:  "operator",
+			RawIntentSQL: "SELECT node_id FROM ctd_nodes;",
+			OptimizedSQL: "SELECT node_id FROM ctd_nodes WHERE status = 'ONLINE'",
+			AgentNotes:   "indexed filter",
+			ValidationReport: map[string]any{
+				"sample_rows": []map[string]any{
+					{"node_id": "rv64-compute-01", "headroom": math.NaN()},
+				},
+			},
+		}
+
+		reportJSON, sanitizedReport, err := marshalValidationReport(rec.ValidationReport)
+		if err != nil {
+			t.Fatalf("marshalValidationReport failed on NaN sample: %v", err)
+		}
+		if strings.Contains(string(reportJSON), "NaN") || !strings.Contains(string(reportJSON), `"headroom":null`) {
+			t.Fatalf("expected NaN sanitized to null in reportJSON, got %s", string(reportJSON))
+		}
+
+		var gotCatalogSQL string
+		var gotCatalogArgs []any
+		tx := &fakePGXTx{
+			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+				gotCatalogSQL = sql
+				gotCatalogArgs = args
+				return &fakePGXRows{
+					remaining: 1,
+					scanFn: func(dest ...any) error {
+						*dest[0].(*string) = "pmv_thermal_summary"
+						*dest[1].(*string) = "operator"
+						*dest[2].(*string) = "SELECT node_id FROM ctd_nodes"
+						*dest[3].(*string) = "SELECT node_id FROM ctd_nodes WHERE status = 'ONLINE'"
+						*dest[4].(*string) = "certified"
+						*dest[5].(*int) = 1
+						*dest[6].(*string) = "indexed filter"
+						*dest[7].(*[]byte) = reportJSON
+						*dest[8].(*time.Time) = now
+						*dest[9].(*time.Time) = now
+						return nil
+					},
+				}, nil
+			},
+		}
+
+		normName, _ := NormalizePMVName(rec.ViewName)
+		cleanedRaw, _ := ValidateSelectOnlySQL(rec.RawIntentSQL)
+		cleanedOpt, _ := ValidateSelectOnlySQL(rec.OptimizedSQL)
+
+		certified, err := store.materializeAndCertifyPMVWithTx(
+			context.Background(),
+			tx,
+			normName,
+			cleanedRaw,
+			cleanedOpt,
+			rec,
+			reportJSON,
+			sanitizedReport,
+		)
+		if err != nil {
+			t.Fatalf("materializeAndCertifyPMVWithTx failed: %v", err)
+		}
+		if certified.Status != "certified" || certified.Version != 1 || certified.ViewName != "pmv_thermal_summary" {
+			t.Fatalf("unexpected certified PMV record: %+v", certified)
+		}
+		if len(tx.execs) != 4 {
+			t.Fatalf("expected 4 Exec calls (timeout, advisory lock, savepoint, create view), got %d: %+v", len(tx.execs), tx.execs)
+		}
+		if !strings.Contains(tx.execs[0].sql, "SET LOCAL statement_timeout = '5000ms'") {
+			t.Fatalf("expected statement_timeout first, got %s", tx.execs[0].sql)
+		}
+		if tx.execs[1].sql != pmvAdvisoryLockSQL || len(tx.execs[1].args) != 2 || tx.execs[1].args[0] != "pigeonmath" || tx.execs[1].args[1] != "pmv_thermal_summary" {
+			t.Fatalf("expected per-view pg_advisory_xact_lock second, got %+v", tx.execs[1])
+		}
+		if tx.execs[2].sql != "SAVEPOINT pmv_replace" {
+			t.Fatalf("expected SAVEPOINT pmv_replace third, got %s", tx.execs[2].sql)
+		}
+		if !strings.Contains(tx.execs[3].sql, "CREATE OR REPLACE VIEW pigeonmath.pmv_thermal_summary WITH (security_invoker = true) AS SELECT node_id FROM ctd_nodes WHERE status = 'ONLINE'") {
+			t.Fatalf("unexpected CREATE OR REPLACE VIEW SQL: %s", tx.execs[3].sql)
+		}
+		if !strings.Contains(gotCatalogSQL, "status = 'certified'") ||
+			!strings.Contains(gotCatalogSQL, "WHEN pigeonmath.pmv_catalog.status = 'certified' THEN pigeonmath.pmv_catalog.version + 1") {
+			t.Fatalf("expected atomic certified status + conditional version bump in catalog upsert SQL:\n%s", gotCatalogSQL)
+		}
+		if len(gotCatalogArgs) != 6 || gotCatalogArgs[0] != "pmv_thermal_summary" {
+			t.Fatalf("unexpected catalog upsert args: %#v", gotCatalogArgs)
+		}
+	})
+
+	t.Run("column signature change falls back to savepoint + drop + create inside same tx", func(t *testing.T) {
+		store := &PostgresStore{mathSchema: "pigeonmath"}
+		tx := &fakePGXTx{
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				if strings.HasPrefix(sql, "CREATE OR REPLACE VIEW") {
+					return pgconn.CommandTag{}, &pgconn.PgError{Code: "42P16", Message: "cannot change name of view column"}
+				}
+				return pgconn.CommandTag{}, nil
+			},
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return &fakePGXRows{
+					remaining: 1,
+					scanFn: func(dest ...any) error {
+						*dest[0].(*string) = "pmv_sig_change"
+						*dest[4].(*string) = "certified"
+						*dest[5].(*int) = 2
+						return nil
+					},
+				}, nil
+			},
+		}
+
+		out, err := store.materializeAndCertifyPMVWithTx(
+			context.Background(),
+			tx,
+			"pmv_sig_change",
+			"SELECT node_id, status FROM ctd_nodes",
+			"SELECT node_id, status FROM ctd_nodes",
+			PMVRecord{ViewName: "pmv_sig_change"},
+			[]byte("{}"),
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("expected savepoint drop+recreate fallback to succeed, got %v", err)
+		}
+		if out.Version != 2 || out.Status != "certified" {
+			t.Fatalf("unexpected re-certified PMV: %+v", out)
+		}
+		if len(tx.execs) != 7 {
+			t.Fatalf("expected 7 Exec calls with savepoint fallback, got %d: %+v", len(tx.execs), tx.execs)
+		}
+		if tx.execs[4].sql != "ROLLBACK TO SAVEPOINT pmv_replace" ||
+			tx.execs[5].sql != "DROP VIEW IF EXISTS pigeonmath.pmv_sig_change" ||
+			!strings.HasPrefix(tx.execs[6].sql, "CREATE VIEW pigeonmath.pmv_sig_change WITH (security_invoker = true) AS ") {
+			t.Fatalf("unexpected fallback sequence: %+v", tx.execs[4:])
+		}
+	})
+
+	t.Run("SavePMVDraft and UpdatePMVState guard against clobbering certified views", func(t *testing.T) {
+		draftSQL := buildSavePMVDraftSQL("pigeonmath")
+		if !strings.Contains(draftSQL, "WHERE pigeonmath.pmv_catalog.status <> 'certified'") {
+			t.Fatalf("SavePMVDraft SQL missing status <> 'certified' demotion guard:\n%s", draftSQL)
+		}
+		if !strings.Contains(draftSQL, "WHERE view_name = $1 AND NOT EXISTS (SELECT 1 FROM upserted)") {
+			t.Fatalf("SavePMVDraft SQL missing fallback SELECT of existing certified row:\n%s", draftSQL)
+		}
+
+		updateSQL := buildUpdatePMVStateSQL("pigeonmath")
+		if !strings.Contains(updateSQL, "AND ($3 = 'certified' OR status <> 'certified')") {
+			t.Fatalf("UpdatePMVState SQL missing status <> 'certified' clobber guard:\n%s", updateSQL)
+		}
+
+		store := &PostgresStore{mathSchema: "pigeonmath"}
+		conn := &fakeSchemaConn{}
+		reportBytes, _, err := marshalValidationReport(map[string]any{"err_metric": math.Inf(1)})
+		if err != nil {
+			t.Fatalf("marshalValidationReport failed: %v", err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(reportBytes, &decoded); err != nil || decoded["err_metric"] != nil {
+			t.Fatalf("expected +Inf sanitized to nil, got %v (err=%v)", decoded, err)
+		}
+		if err := store.updatePMVStateWithConn(context.Background(), conn, "pmv_guarded", PMVRecord{
+			ViewName:   "pmv_guarded",
+			Status:     "failed",
+			AgentNotes: "late failure",
+		}, reportBytes); err != nil {
+			t.Fatalf("updatePMVStateWithConn failed: %v", err)
+		}
+		if len(conn.execs) != 1 || !strings.Contains(conn.execs[0].sql, "status <> 'certified'") {
+			t.Fatalf("expected guarded UPDATE execution, got %+v", conn.execs)
+		}
+	})
+}
+
+func TestNewPostgresStoreWithOptionsRedactsParseConfigCredentials(t *testing.T) {
+	cases := []struct {
+		name   string
+		dsn    string
+		secret string
+	}{
+		{
+			name:   "newline_control_char_in_url_dsn",
+			dsn:    "postgres://ctd_ingestor:ctl_secret_pw@127.0.0.1:5432/edge\nledger",
+			secret: "ctl_secret_pw",
+		},
+		{
+			name:   "malformed_percent_escape_in_url_password",
+			dsn:    "postgres://ctd_ingestor:super_secret_pw%zz@127.0.0.1:5432/edge_ledger",
+			secret: "super_secret_pw",
+		},
+		{
+			name:   "malformed_url_with_query_password",
+			dsn:    "postgres://127.0.0.1:notaport/edge_ledger?password=query_secret_pw",
+			secret: "query_secret_pw",
+		},
+		{
+			name:   "invalid_keyword_value_dsn_with_password",
+			dsn:    "host=127.0.0.1 user=ctd_ingestor password='kv_secret_password' port=notaport",
+			secret: "kv_secret_password",
+		},
+		{
+			name:   "schemeless_userinfo_dsn",
+			dsn:    "ctd_ingestor:raw_secret_password@127.0.0.1:5432/edge_ledger",
+			secret: "raw_secret_password",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := NewPostgresStoreWithOptions(context.Background(), tc.dsn, StoreOptions{AppActor: "test"})
+			if err == nil || store != nil {
+				t.Fatalf("expected ParseConfig error for %s, got store=%v err=%v", tc.name, store, err)
+			}
+			if strings.Contains(err.Error(), tc.secret) {
+				t.Fatalf("credential leaked in error string: %v", err)
+			}
+			var uErr *url.Error
+			if errors.As(err, &uErr) && strings.Contains(uErr.URL, tc.secret) {
+				t.Fatalf("credential leaked in unwrapped *url.Error.URL: %q", uErr.URL)
+			}
+		})
+	}
+
+	t.Run("redactDSNParseError unwraps and redacts wrapped *url.Error", func(t *testing.T) {
+		rawDSN := "postgres://ctd_ingestor:wrapped_secret_pw@127.0.0.1:5432/edge_ledger?token=wrapped_tok"
+		wrapped := fmt.Errorf("parse dsn %s: %w", rawDSN, &url.Error{
+			Op:  "parse",
+			URL: rawDSN,
+			Err: errors.New("invalid escape"),
+		})
+		got := redactDSNParseError(rawDSN, wrapped)
+		if strings.Contains(got.Error(), "wrapped_secret_pw") || strings.Contains(got.Error(), "wrapped_tok") {
+			t.Fatalf("expected credentials scrubbed from wrapped error message, got: %v", got)
+		}
+		var uErr *url.Error
+		if !errors.As(got, &uErr) {
+			t.Fatalf("expected *url.Error preserved in error chain, got %T: %v", got, got)
+		}
+		if strings.Contains(uErr.URL, "wrapped_secret_pw") || strings.Contains(uErr.URL, "wrapped_tok") {
+			t.Fatalf("expected *url.Error.URL redacted, got %q", uErr.URL)
 		}
 	})
 }

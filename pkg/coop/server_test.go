@@ -40,6 +40,7 @@ type mockBaseDB struct {
 	events       []*core.CTDPayload
 	tagsByID     map[string][]string
 	statusByID   map[string]string
+	provisionErr error
 }
 
 func newMockBaseDB() *mockBaseDB {
@@ -56,7 +57,11 @@ func (m *mockBaseDB) EnsureSchema(_ context.Context) error {
 	return nil
 }
 
-func (m *mockBaseDB) ProvisionRoles(_ context.Context, _, _ string) error { return nil }
+func (m *mockBaseDB) ProvisionRoles(_ context.Context, _, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.provisionErr
+}
 
 func (m *mockBaseDB) UpsertMeshIdentity(_ context.Context, id core.MeshIdentity) error {
 	m.mu.Lock()
@@ -117,7 +122,7 @@ func (m *mockBaseDB) ResolveNodes(_ context.Context, sel core.RunnerSelector) ([
 	return sel.Nodes, nil
 }
 
-func (m *mockBaseDB) AddNodeTags(_ context.Context, nodeID string, tags []string) ([]string, error) {
+func (m *mockBaseDB) AddNodeTags(_ context.Context, _ string, tags []string) ([]string, error) {
 	return tags, nil
 }
 
@@ -153,9 +158,9 @@ func (m *mockBaseDB) UpdatePMVState(_ context.Context, _ db.PMVRecord) error { r
 func (m *mockBaseDB) GetPMV(_ context.Context, _ string) (*db.PMVRecord, error) {
 	return nil, nil
 }
-func (m *mockBaseDB) ListPMVs(_ context.Context) ([]db.PMVRecord, error)       { return nil, nil }
-func (m *mockBaseDB) MaterializePMV(_ context.Context, _, _ string) error      { return nil }
-func (m *mockBaseDB) DropPMV(_ context.Context, _ string) error                { return nil }
+func (m *mockBaseDB) ListPMVs(_ context.Context) ([]db.PMVRecord, error)  { return nil, nil }
+func (m *mockBaseDB) MaterializePMV(_ context.Context, _, _ string) error { return nil }
+func (m *mockBaseDB) DropPMV(_ context.Context, _ string) error           { return nil }
 func (m *mockBaseDB) FetchForUnload(_ context.Context, _ db.UnloadFilter) ([]core.CTDPayload, error) {
 	return nil, nil
 }
@@ -453,7 +458,6 @@ func TestSubscriberDisconnectCompletesUnderSixSecondsWhenLedgerBlocks(t *testing
 		t.Fatalf("expected Subscriber.Disconnect() to complete in <6s when Ledger blocks, took %s", elapsed)
 	}
 }
-
 
 func writeCertSignedBy(t *testing.T, dir, prefix string, tmpl *x509.Certificate, parent *x509.Certificate, signer *ecdsa.PrivateKey) (certPath, keyPath string, parsed *x509.Certificate, priv *ecdsa.PrivateKey) {
 	t.Helper()
@@ -1214,6 +1218,11 @@ func TestServerConcurrentStartStopRace(t *testing.T) {
 					_ = srv.Store()
 					_ = srv.BrokerURL()
 					_ = srv.MeshName()
+					_ = srv.Status()
+					_ = srv.BatcherDroppedCount()
+					_ = srv.TelemetryDroppedCount()
+					_ = srv.ControlDroppedCount()
+					_ = srv.RunnerRequestDroppedCount()
 					time.Sleep(time.Millisecond)
 				}
 			}()
@@ -1679,5 +1688,105 @@ func TestServerEmbeddedCASignedLeafWithoutTLSCAFile(t *testing.T) {
 				t.Fatal("timed out waiting for MNS identity with CA-signed leaf without TLSCAFile")
 			}
 		})
+	}
+}
+
+func TestServerProvisionRolesFailFastAndSelfTelemetryDropCounters(t *testing.T) {
+	// 1. Explicit ProvisionRoles=true must fail fast when ProvisionRoles errors.
+	failStore := newMockBaseDB()
+	failStore.provisionErr = errors.New("42501: insufficient superuser privileges")
+	failSrv := New(config.CoopConfig{
+		MeshName:    "provision-fail-mesh",
+		NodeID:      "rv64-coop-01",
+		SelfObserve: false,
+		MQTT: config.CoopMQTTConfig{
+			Mode:   "embedded",
+			Listen: "127.0.0.1:0",
+		},
+	}, Options{
+		Store:          failStore,
+		ProvisionRoles: true,
+	})
+	if err := failSrv.Start(context.Background()); err == nil {
+		failSrv.Stop()
+		t.Fatal("expected Server.Start to fail fast when ProvisionRoles=true errors")
+	} else if !strings.Contains(err.Error(), "provision PostgreSQL roles") {
+		t.Fatalf("unexpected ProvisionRoles error wrapper: %v", err)
+	}
+
+	// 2. SelfObserve emits coop-ingest self-telemetry with drop counters and Status() exposes them.
+	store := newMockBaseDB()
+	srv := New(config.CoopConfig{
+		MeshName:      "drop-metrics-mesh",
+		NodeID:        "rv64-coop-01",
+		SelfObserve:   true,
+		PollInterval:  "25ms",
+		SpoolCapacity: 64,
+		MQTT: config.CoopMQTTConfig{
+			Mode:   "embedded",
+			Listen: "127.0.0.1:0",
+		},
+		Ingest: config.IngestConfig{
+			QueueSize:     64,
+			BatchSize:     1,
+			FlushInterval: "15ms",
+		},
+	}, Options{Store: store})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("Server.Start failed: %v", err)
+	}
+
+	var foundSelfTelemetry bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		for _, ev := range store.events {
+			if ev != nil && ev.NodeID == "rv64-coop-01" && ev.Component == "coop-ingest" {
+				metrics := ev.Metrics
+				if metrics == nil && len(ev.RawMetrics()) > 0 {
+					_ = json.Unmarshal(ev.RawMetrics(), &metrics)
+				}
+				if _, ok := metrics["batcher_dropped_count"]; ok {
+					if _, ok2 := metrics["telemetry_dropped_count"]; ok2 {
+						if _, ok3 := metrics["control_dropped_count"]; ok3 {
+							if _, ok4 := metrics["runner_request_dropped_count"]; ok4 {
+								foundSelfTelemetry = true
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+		store.mu.Unlock()
+		if foundSelfTelemetry {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !foundSelfTelemetry {
+		srv.Stop()
+		t.Fatal("expected coop-ingest self-telemetry CTD payload with all four drop counters")
+	}
+
+	st := srv.Status()
+	if !st.Started || st.MeshName != "drop-metrics-mesh" || st.NodeID != "rv64-coop-01" || st.IngestedCount == 0 {
+		srv.Stop()
+		t.Fatalf("unexpected running Status(): %+v", st)
+	}
+	if srv.BatcherDroppedCount() != 0 || srv.TelemetryDroppedCount() != 0 || srv.ControlDroppedCount() != 0 || srv.RunnerRequestDroppedCount() != 0 {
+		srv.Stop()
+		t.Fatalf("expected zero drop counts under healthy load, got %+v", st)
+	}
+
+	srv.Stop()
+	if srv.Status().Started {
+		t.Fatal("expected Status().Started == false after Stop()")
+	}
+	if srv.IngestedCount() == 0 {
+		t.Fatal("expected final IngestedCount snapshot preserved after Stop()")
 	}
 }

@@ -3,20 +3,25 @@ package pigeoncare
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
+	"github.com/drewv-labs/carrierpigeons/pkg/config"
+	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 type serviceMockSafeDB struct {
 	stubSafeDB
 	getClusterStatusFn  func(context.Context, time.Duration) ([]db.NodeSummary, error)
 	queryReadOnlyMapsFn func(context.Context, string, ...any) ([]map[string]any, error)
+	savePMVDraftFn      func(context.Context, db.PMVRecord) (*db.PMVRecord, error)
 }
 
 func (m *serviceMockSafeDB) GetClusterStatus(ctx context.Context, d time.Duration) ([]db.NodeSummary, error) {
@@ -31,6 +36,13 @@ func (m *serviceMockSafeDB) QueryReadOnlyMaps(ctx context.Context, sql string, a
 		return m.queryReadOnlyMapsFn(ctx, sql, args...)
 	}
 	return m.stubSafeDB.QueryReadOnlyMaps(ctx, sql, args...)
+}
+
+func (m *serviceMockSafeDB) SavePMVDraft(ctx context.Context, rec db.PMVRecord) (*db.PMVRecord, error) {
+	if m.savePMVDraftFn != nil {
+		return m.savePMVDraftFn(ctx, rec)
+	}
+	return m.stubSafeDB.SavePMVDraft(ctx, rec)
 }
 
 func TestServiceToolOutputSanitizesNonFiniteFloats(t *testing.T) {
@@ -99,7 +111,7 @@ func TestServiceToolOutputSanitizesNonFiniteFloats(t *testing.T) {
 
 	// Verify caller-owned map was NOT mutated in place.
 	if !math.IsNaN(sharedMetrics["temp_c"].(float64)) {
-		t.Fatal("sanitizeJSONValue mutated sharedMetrics in place")
+		t.Fatal("SanitizeValue mutated sharedMetrics in place")
 	}
 
 	// Verify typed structs with float64, []float64, [2]float64, map[string]float64, *[]float64,
@@ -109,14 +121,14 @@ func TestServiceToolOutputSanitizesNonFiniteFloats(t *testing.T) {
 	}
 	type typedStructMetrics struct {
 		embeddedMeta
-		TempC      float64            `json:"temp_c"`
-		Series     []float64          `json:"series"`
-		Pair       [2]float64         `json:"pair"`
-		PerCore    map[string]float64 `json:"per_core"`
-		PtrSeries  *[]float64         `json:"ptr_series"`
-		Hidden     float64            `json:"-"`
-		OmitZero   float64            `json:"omit_zero,omitempty"`
-		OmitNaN    float64            `json:"omit_nan,omitempty"`
+		TempC     float64            `json:"temp_c"`
+		Series    []float64          `json:"series"`
+		Pair      [2]float64         `json:"pair"`
+		PerCore   map[string]float64 `json:"per_core"`
+		PtrSeries *[]float64         `json:"ptr_series"`
+		Hidden    float64            `json:"-"`
+		OmitZero  float64            `json:"omit_zero,omitempty"`
+		OmitNaN   float64            `json:"omit_nan,omitempty"`
 	}
 	ptrSlice := []float64{2.25, math.Inf(-1)}
 	structMetrics := typedStructMetrics{
@@ -177,7 +189,7 @@ func TestServiceToolOutputSanitizesNonFiniteFloats(t *testing.T) {
 		t.Fatalf("expected per_core {cpu0:null, cpu1:48}, got %#v", m["per_core"])
 	}
 	if !math.IsNaN(structMetrics.Series[1]) || !math.IsNaN(structMetrics.PerCore["cpu0"]) {
-		t.Fatal("sanitizeJSONValue mutated typed struct fields in place")
+		t.Fatal("SanitizeValue mutated typed struct fields in place")
 	}
 }
 
@@ -297,4 +309,175 @@ func TestServiceNilStoreAndConcurrentExecuteRace(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestServicePreAuthorizationValidationAndNormalization(t *testing.T) {
+	var prompts atomic.Int32
+	var dispatched []core.RunnerRequestCTD
+	var dispatchDeadlineSeen atomic.Bool
+
+	svc := NewService(Options{
+		Store:      &stubSafeDB{},
+		Permission: config.PermissionConfig{Mode: "default"},
+		Prompter: func(_ context.Context, _ ActionProposal) (ConfirmationDecision, error) {
+			prompts.Add(1)
+			return DecisionAllow, nil
+		},
+		Dispatcher: func(ctx context.Context, req core.RunnerRequestCTD) error {
+			if _, ok := ctx.Deadline(); ok {
+				dispatchDeadlineSeen.Store(true)
+			}
+			dispatched = append(dispatched, req)
+			return nil
+		},
+	})
+
+	// 1. propose_pigeonmath_view rejects mutating SQL BEFORE invoking Prompter/Authorize.
+	pmvOut := svc.Execute(context.Background(), "propose_pigeonmath_view", map[string]any{
+		"view_name": "bad_view",
+		"sql":       "DELETE FROM telemetric_ledger",
+	})
+	if !strings.Contains(pmvOut, "Invalid sql") {
+		t.Fatalf("expected invalid SQL rejection before Authorize, got: %s", pmvOut)
+	}
+
+	// 2. dispatch_ephemeral_runner rejects disallowed interpreter, invalid timeouts, and invalid selector tokens BEFORE Authorize.
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{
+			name: "disallowed_interpreter",
+			args: map[string]any{"interpreter": "perl", "script_body": "print 1;\n", "nodes": []string{"rv64-01"}},
+			want: "Invalid argument 'interpreter'",
+		},
+		{
+			name: "nan_timeout",
+			args: map[string]any{"interpreter": "sh", "script_body": "uname -m\n", "nodes": []string{"rv64-01"}, "timeout_sec": math.NaN()},
+			want: "Invalid argument 'timeout_sec'",
+		},
+		{
+			name: "inf_timeout",
+			args: map[string]any{"interpreter": "sh", "script_body": "uname -m\n", "nodes": []string{"rv64-01"}, "timeout_sec": math.Inf(1)},
+			want: "Invalid argument 'timeout_sec'",
+		},
+		{
+			name: "negative_timeout",
+			args: map[string]any{"interpreter": "sh", "script_body": "uname -m\n", "nodes": []string{"rv64-01"}, "timeout_sec": -10},
+			want: "Invalid argument 'timeout_sec'",
+		},
+		{
+			name: "overflow_float_timeout",
+			args: map[string]any{"interpreter": "sh", "script_body": "uname -m\n", "nodes": []string{"rv64-01"}, "timeout_sec": 1e30},
+			want: "Invalid argument 'timeout_sec'",
+		},
+		{
+			name: "invalid_node_token",
+			args: map[string]any{"interpreter": "sh", "script_body": "uname -m\n", "nodes": []string{"rv64/bad#topic"}},
+			want: "invalid target node",
+		},
+		{
+			name: "invalid_tag_token",
+			args: map[string]any{"interpreter": "sh", "script_body": "uname -m\n", "tags": "good-tag, bad+tag"},
+			want: "invalid target tag",
+		},
+	} {
+		out := svc.Execute(context.Background(), "dispatch_ephemeral_runner", tc.args)
+		if !strings.Contains(out, tc.want) {
+			t.Fatalf("%s: expected %q, got: %s", tc.name, tc.want, out)
+		}
+	}
+	if prompts.Load() != 0 {
+		t.Fatalf("expected zero authorization prompts for invalid inputs, got %d", prompts.Load())
+	}
+
+	// 3. Valid dispatch normalizes interpreter path, trims all slice forms, clamps timeout_sec to 300, and attaches bounded timeout.
+	out := svc.Execute(context.Background(), "dispatch_ephemeral_runner", map[string]any{
+		"interpreter": " /usr/bin/bash ",
+		"script_body": "uname -a\n",
+		"nodes":       " rv64-compute-01 , rv64-compute-02 ",
+		"tags":        []string{"  compute-bench  ", "  "},
+		"timeout_sec": float64(900),
+	})
+	if !strings.Contains(out, "Dispatched ephemeral runner") {
+		t.Fatalf("expected valid dispatch to succeed, got: %s", out)
+	}
+	if prompts.Load() != 1 || len(dispatched) != 1 || !dispatchDeadlineSeen.Load() {
+		t.Fatalf("expected 1 prompt, 1 dispatch, deadline=true; got prompts=%d dispatched=%d deadline=%v",
+			prompts.Load(), len(dispatched), dispatchDeadlineSeen.Load())
+	}
+	req := dispatched[0]
+	if got := req.Params["interpreter"]; got != "bash" {
+		t.Fatalf("expected normalized interpreter=bash, got %#v", got)
+	}
+	if got := req.Params["timeout_sec"]; got != 300 {
+		t.Fatalf("expected clamped timeout_sec=300, got %#v", got)
+	}
+	if len(req.Selectors.Nodes) != 2 || req.Selectors.Nodes[0] != "rv64-compute-01" || req.Selectors.Nodes[1] != "rv64-compute-02" {
+		t.Fatalf("expected trimmed comma-split nodes, got %#v", req.Selectors.Nodes)
+	}
+	if len(req.Selectors.Tags) != 1 || req.Selectors.Tags[0] != "compute-bench" {
+		t.Fatalf("expected trimmed tags, got %#v", req.Selectors.Tags)
+	}
+}
+
+func TestServiceBoundedTimeoutsAndErrorRedaction(t *testing.T) {
+	rawDBErr := errors.New(`connect postgres://pigeoncare_ro:topSecretDBPass@192.0.2.55:5432/edge_ledger?sslmode=require: dial tcp 192.0.2.55:5432: host=192.0.2.55 password=libpqSecretPW (SQLSTATE 28P01)`)
+	rawMQTTErr := errors.New(`dial mqtt://operator:mqttSecretPass@192.0.2.88:1883: connection refused`)
+
+	var sawDBDeadline atomic.Bool
+	mockDB := &serviceMockSafeDB{
+		getClusterStatusFn: func(ctx context.Context, _ time.Duration) ([]db.NodeSummary, error) {
+			if _, ok := ctx.Deadline(); ok {
+				sawDBDeadline.Store(true)
+			}
+			return nil, rawDBErr
+		},
+		queryReadOnlyMapsFn: func(_ context.Context, _ string, _ ...any) ([]map[string]any, error) {
+			return nil, rawDBErr
+		},
+	}
+
+	svc := NewService(Options{
+		Store:      mockDB,
+		Permission: config.PermissionConfig{Mode: "yolo"},
+		Dispatcher: func(_ context.Context, _ core.RunnerRequestCTD) error {
+			return rawMQTTErr
+		},
+	})
+
+	secretTokens := []string{
+		"topSecretDBPass",
+		"libpqSecretPW",
+		"mqttSecretPass",
+		"postgres://",
+		"mqtt://",
+		"192.0.2.55",
+		"192.0.2.88",
+		"SQLSTATE",
+		"28P01",
+	}
+	assertNoLeak := func(label, out string) {
+		t.Helper()
+		for _, tok := range secretTokens {
+			if strings.Contains(out, tok) {
+				t.Fatalf("%s leaked sensitive token %q in output: %s", label, tok, out)
+			}
+		}
+	}
+
+	assertNoLeak("get_cluster_status", svc.Execute(context.Background(), "get_cluster_status", nil))
+	if !sawDBDeadline.Load() {
+		t.Fatal("expected bounded timeout deadline on DB call")
+	}
+	assertNoLeak("get_node_telemetry", svc.Execute(context.Background(), "get_node_telemetry", map[string]any{"node_id": "rv64-01"}))
+	assertNoLeak("analyze_latest_benchmark", svc.Execute(context.Background(), "analyze_latest_benchmark", map[string]any{"node_id": "rv64-01"}))
+	assertNoLeak("query_readonly_ledger", svc.Execute(context.Background(), "query_readonly_ledger", map[string]any{"sql": "SELECT 1"}))
+	assertNoLeak("propose_pigeonmath_view", svc.Execute(context.Background(), "propose_pigeonmath_view", map[string]any{"view_name": "test_view", "sql": "SELECT 1"}))
+	assertNoLeak("dispatch_ephemeral_runner", svc.Execute(context.Background(), "dispatch_ephemeral_runner", map[string]any{
+		"interpreter": "sh",
+		"script_body": "uname -m\n",
+		"nodes":       []string{"rv64-01"},
+	}))
 }

@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 )
 
 var _ BaseLLM = (*OpenAIAdapter)(nil)
@@ -26,8 +28,16 @@ func NewOpenAIAdapter(endpoint, apiKey, model string, tools ToolExecutor) *OpenA
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		endpoint = "https://api.openai.com/v1/chat/completions"
-	} else if !strings.HasSuffix(endpoint, "/chat/completions") {
-		endpoint = strings.TrimRight(endpoint, "/") + "/v1/chat/completions"
+	} else {
+		trimmed := strings.TrimRight(endpoint, "/")
+		switch {
+		case strings.HasSuffix(trimmed, "/chat/completions"):
+			endpoint = trimmed
+		case strings.HasSuffix(trimmed, "/v1"):
+			endpoint = trimmed + "/chat/completions"
+		default:
+			endpoint = trimmed + "/v1/chat/completions"
+		}
 	}
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-4o"
@@ -290,13 +300,15 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 
 			type partialToolCall struct {
 				id   string
-				name string
+				name strings.Builder
 				args strings.Builder
 			}
 			partials := make(map[int]*partialToolCall)
 			var fullContent strings.Builder
+			var capErr error
 
-			scanner := bufio.NewScanner(resp.Body)
+			capped := newCappedStreamReader(resp.Body, streamBodyLimit)
+			scanner := bufio.NewScanner(capped)
 			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
@@ -331,11 +343,15 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 						resp.Body.Close()
 						return true, nil
 					}
-					fullContent.WriteString(delta.Content)
+					writeBounded(&fullContent, delta.Content, streamContentLimit)
 				}
 				for _, tc := range delta.ToolCalls {
 					entry, ok := partials[tc.Index]
 					if !ok {
+						if len(partials) >= maxStreamToolCalls {
+							capErr = fmt.Errorf("stream exceeded max tool calls (%d)", maxStreamToolCalls)
+							break
+						}
 						entry = &partialToolCall{}
 						partials[tc.Index] = entry
 					}
@@ -343,17 +359,30 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 						entry.id = tc.ID
 					}
 					if tc.Function.Name != "" {
-						entry.name += tc.Function.Name
+						if !writeBounded(&entry.name, tc.Function.Name, maxStreamToolNameBytes) {
+							capErr = fmt.Errorf("stream tool name exceeded limit (%d bytes)", maxStreamToolNameBytes)
+							break
+						}
 					}
 					if tc.Function.Arguments != "" {
-						entry.args.WriteString(tc.Function.Arguments)
+						if !writeBounded(&entry.args, tc.Function.Arguments, streamToolArgLimit) {
+							capErr = fmt.Errorf("stream tool arguments exceeded limit (%d bytes)", streamToolArgLimit)
+							break
+						}
 					}
+				}
+				if capErr != nil {
+					break
 				}
 			}
 			scanErr := scanner.Err()
 			resp.Body.Close()
+			if capErr != nil && ctx.Err() == nil {
+				sendToken(ctx, tokenChan, fmt.Sprintf("\n[OpenAI stream read error: %v]", capErr))
+				return true, nil
+			}
 			if scanErr != nil && ctx.Err() == nil {
-				sendToken(ctx, tokenChan, fmt.Sprintf("\n[OpenAI stream read error: %v]", scanErr))
+				sendToken(ctx, tokenChan, fmt.Sprintf("\n[OpenAI stream read error: %v]", jsonutil.RedactError(scanErr, a.apiKey)))
 				return true, nil
 			}
 
@@ -376,7 +405,7 @@ func (a *OpenAIAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				}
 				calls = append(calls, openAIResolvedToolCall{
 					id:   callID,
-					name: p.name,
+					name: p.name.String(),
 					args: p.args.String(),
 				})
 			}
@@ -400,12 +429,18 @@ type LlamaCPPAdapter struct {
 	*OpenAIAdapter
 }
 
-func NewLlamaCPPAdapter(endpoint string, tools ToolExecutor) *LlamaCPPAdapter {
+func NewLlamaCPPAdapter(endpoint, apiKey, model string, tools ToolExecutor) *LlamaCPPAdapter {
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = "http://127.0.0.1:8080/v1/chat/completions"
 	}
+	if strings.TrimSpace(apiKey) == "" {
+		apiKey = "local-no-key"
+	}
+	if strings.TrimSpace(model) == "" {
+		model = "default"
+	}
 	return &LlamaCPPAdapter{
-		OpenAIAdapter: NewOpenAIAdapter(endpoint, "local-no-key", "default", tools),
+		OpenAIAdapter: NewOpenAIAdapter(endpoint, apiKey, model, tools),
 	}
 }
 
@@ -414,14 +449,17 @@ type VLLMAdapter struct {
 	*OpenAIAdapter
 }
 
-func NewVLLMAdapter(endpoint, model string, tools ToolExecutor) *VLLMAdapter {
+func NewVLLMAdapter(endpoint, apiKey, model string, tools ToolExecutor) *VLLMAdapter {
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = "http://127.0.0.1:8000/v1/chat/completions"
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		apiKey = "vllm-no-key"
 	}
 	if strings.TrimSpace(model) == "" {
 		model = "Qwen/Qwen2.5-Coder-32B-Instruct"
 	}
 	return &VLLMAdapter{
-		OpenAIAdapter: NewOpenAIAdapter(endpoint, "vllm-no-key", model, tools),
+		OpenAIAdapter: NewOpenAIAdapter(endpoint, apiKey, model, tools),
 	}
 }

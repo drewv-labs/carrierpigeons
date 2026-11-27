@@ -459,3 +459,64 @@ func TestBatcherExtendedOutageCircuitOpenRateLimitsShredding(t *testing.T) {
 		t.Fatalf("expected remaining queued batches to ingest after recovery, got ingested=0 (dropped=%d)", b.DroppedCount())
 	}
 }
+
+func TestBatcherConcurrentEnqueueAndCloseRace(t *testing.T) {
+	for iter := range 12 {
+		sink := &mockBatchSink{}
+		b := newBatcherWithTiming(sink, Options{
+			QueueSize:     256,
+			BatchSize:     16,
+			FlushInterval: 2 * time.Millisecond,
+		}, batcherTiming{
+			flushTimeout: time.Second,
+			closeTimeout: 2 * time.Second,
+		})
+
+		const workers = 8
+		const perWorker = 100
+		const totalSubmitted = uint64(workers * perWorker)
+
+		startGate := make(chan struct{})
+		var wg sync.WaitGroup
+		for w := range workers {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				<-startGate
+				for i := range perWorker {
+					b.Enqueue(core.NewCTDPayload("rv64-compute-01", fmt.Sprintf("race-%d-%d", workerID, i), "active"))
+				}
+			}(w)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startGate
+			if iter%2 == 0 {
+				time.Sleep(time.Millisecond)
+			}
+			b.Close()
+		}()
+
+		close(startGate)
+		wg.Wait()
+		b.Close()
+
+		// Post-Close Enqueue must deterministically increment DroppedCount without leaking QueuedBytes.
+		b.Enqueue(core.NewCTDPayload("rv64-compute-01", "post-close", "active"))
+
+		gotAccounted := b.IngestedCount() + b.DroppedCount()
+		wantAccounted := totalSubmitted + 1
+		if gotAccounted != wantAccounted {
+			t.Fatalf("iter %d: orphaned/unaccounted events: ingested=%d dropped=%d sum=%d want=%d",
+				iter, b.IngestedCount(), b.DroppedCount(), gotAccounted, wantAccounted)
+		}
+		if int(b.IngestedCount()) != sink.total {
+			t.Fatalf("iter %d: sink total (%d) != IngestedCount (%d)", iter, sink.total, b.IngestedCount())
+		}
+		if b.QueuedBytes() != 0 {
+			t.Fatalf("iter %d: expected QueuedBytes == 0 after Close, got %d", iter, b.QueuedBytes())
+		}
+	}
+}

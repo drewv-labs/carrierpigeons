@@ -3,6 +3,7 @@ package pigeonmath
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -14,15 +15,18 @@ import (
 )
 
 type fakeAgentSafeStore struct {
-	pmvs            map[string]db.PMVRecord
-	materialized    map[string]string
-	failExplain     string
-	failProbe       bool
-	failMaterialize bool
-	probeQueries    []string
-	sampleRows      []map[string]any
-	saveCalls       int
-	updateCalls     int
+	pmvs               map[string]db.PMVRecord
+	materialized       map[string]string
+	failExplain        string
+	failProbe          bool
+	failProbeSubstring string
+	failMaterialize    bool
+	failListPMVs       error
+	probeQueries       []string
+	probeArgs          [][]any
+	sampleRows         []map[string]any
+	saveCalls          int
+	updateCalls        int
 }
 
 func newFakeAgentSafeStore() *fakeAgentSafeStore {
@@ -47,12 +51,13 @@ func (f *fakeAgentSafeStore) GetLineageDAG(context.Context, string, int) (*db.DA
 func (f *fakeAgentSafeStore) GetLedgerActivity(context.Context, int) ([]db.LedgerActivity, error) {
 	return nil, nil
 }
-func (f *fakeAgentSafeStore) QueryReadOnlyMaps(_ context.Context, sql string, _ ...any) ([]map[string]any, error) {
+func (f *fakeAgentSafeStore) QueryReadOnlyMaps(_ context.Context, sql string, args ...any) ([]map[string]any, error) {
 	f.probeQueries = append(f.probeQueries, sql)
+	f.probeArgs = append(f.probeArgs, args)
 	if _, err := db.ValidateSelectOnlySQL(sql); err != nil {
 		return nil, err
 	}
-	if f.failProbe {
+	if f.failProbe || (f.failProbeSubstring != "" && strings.Contains(sql, f.failProbeSubstring)) {
 		return nil, errors.New("probe execution failed")
 	}
 	if f.sampleRows != nil {
@@ -107,6 +112,9 @@ func (f *fakeAgentSafeStore) GetPMV(_ context.Context, viewName string) (*db.PMV
 	return &cp, nil
 }
 func (f *fakeAgentSafeStore) ListPMVs(context.Context) ([]db.PMVRecord, error) {
+	if f.failListPMVs != nil {
+		return nil, f.failListPMVs
+	}
 	out := make([]db.PMVRecord, 0, len(f.pmvs))
 	for _, r := range f.pmvs {
 		out = append(out, r)
@@ -133,6 +141,40 @@ func (f *fakeAgentSafeStore) DropPMV(_ context.Context, viewName string) error {
 	return nil
 }
 func (f *fakeAgentSafeStore) Close() {}
+
+type atomicFakeAgentSafeStore struct {
+	*fakeAgentSafeStore
+	atomicCalls int
+}
+
+func (a *atomicFakeAgentSafeStore) MaterializeAndCertifyPMV(_ context.Context, rec db.PMVRecord) (*db.PMVRecord, error) {
+	a.atomicCalls++
+	if a.failMaterialize {
+		return nil, errors.New("atomic materialize failed")
+	}
+	norm, err := db.NormalizePMVName(rec.ViewName)
+	if err != nil {
+		return nil, err
+	}
+	rec.ViewName = norm
+	rec.Status = "certified"
+	if existing, ok := a.pmvs[norm]; ok {
+		rec.CreatedAt = existing.CreatedAt
+		if existing.Status == "certified" {
+			rec.Version = existing.Version + 1
+		} else {
+			rec.Version = existing.Version
+		}
+	} else {
+		rec.Version = 1
+		rec.CreatedAt = time.Now().UTC()
+	}
+	rec.UpdatedAt = time.Now().UTC()
+	a.materialized[norm] = rec.OptimizedSQL
+	a.pmvs[norm] = rec
+	cp := rec
+	return &cp, nil
+}
 
 type stubOptimizerLLM struct {
 	optimizeReply string
@@ -211,6 +253,210 @@ func TestSubmitAndCertifyPMVFallsBackToRawIntentWhenOptimizerBreaksPlanner(t *te
 	}
 	if rec.Status != "certified" || store.materialized["pmv_node_inventory"] != rawSQL {
 		t.Fatalf("expected rawSQL fallback to materialize & certify, got %+v", rec)
+	}
+}
+
+func TestSubmitAndCertifyPMVFallsBackToRawIntentWhenOptimizerFailsSampleProbe(t *testing.T) {
+	store := newFakeAgentSafeStore()
+	store.failProbeSubstring = "::numeric"
+	eng := NewEngine(store)
+
+	rawSQL := "SELECT node_id, metrics->>'cpu_temp_c' FROM telemetric_ledger"
+	badCastLLM := &stubOptimizerLLM{
+		optimizeReply: "```sql\nSELECT node_id, (metrics->>'cpu_temp_c')::numeric FROM telemetric_ledger\n```",
+		verifyReply:   "CERTIFIED: Reverted to raw SQL cleanly after probe cast failure.",
+	}
+
+	rec, err := eng.SubmitAndCertifyPMV(context.Background(), "pigeoncare", "probe_fallback", rawSQL, badCastLLM)
+	if err != nil {
+		t.Fatalf("expected graceful fallback to raw SQL on probe failure, got error: %v", err)
+	}
+	if rec.Status != "certified" || store.materialized["pmv_probe_fallback"] != rawSQL {
+		t.Fatalf("expected rawSQL fallback to materialize & certify, got %+v", rec)
+	}
+	if rec.OptimizedSQL != rawSQL {
+		t.Fatalf("expected OptimizedSQL reverted to rawSQL, got %q", rec.OptimizedSQL)
+	}
+	if !strings.Contains(rec.AgentNotes, "failed sample probe") {
+		t.Fatalf("expected fallback note in AgentNotes, got %q", rec.AgentNotes)
+	}
+}
+
+func TestSubmitAndCertifyPMVSanitizesNonFiniteSampleRowsAndFailsClosedOnMarshalError(t *testing.T) {
+	t.Run("non-finite floats sanitized to null before verifier prompt", func(t *testing.T) {
+		store := newFakeAgentSafeStore()
+		store.sampleRows = []map[string]any{
+			{"node_id": "rv64-compute-01", "temp_c": math.NaN(), "pwm": math.Inf(1), "ok": 42.5},
+		}
+		eng := NewEngine(store)
+		opt := &capturingVerifierLLM{
+			optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes\n```",
+			verifyReply:   "CERTIFIED: Non-finite values sanitized cleanly.",
+		}
+
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "nan_sample_view", "SELECT node_id FROM ctd_nodes", opt)
+		if err != nil {
+			t.Fatalf("expected sanitized sample rows to certify cleanly, got %v", err)
+		}
+		if rec.Status != "certified" || len(opt.verifyPrompts) != 1 {
+			t.Fatalf("expected 1 verify prompt and certified status, got rec=%+v prompts=%d", rec, len(opt.verifyPrompts))
+		}
+		if !strings.Contains(opt.verifyPrompts[0], `"temp_c":null`) || !strings.Contains(opt.verifyPrompts[0], `"ok":42.5`) {
+			t.Fatalf("expected sanitized JSON sample in verify prompt, got: %s", opt.verifyPrompts[0])
+		}
+	})
+
+	t.Run("unserializable sample rows fail closed before materialization", func(t *testing.T) {
+		store := newFakeAgentSafeStore()
+		store.sampleRows = []map[string]any{
+			{"bad": func() {}},
+		}
+		eng := NewEngine(store)
+		opt := &capturingVerifierLLM{
+			optimizeReply: "```sql\nSELECT node_id FROM ctd_nodes\n```",
+			verifyReply:   "CERTIFIED: should not be called",
+		}
+
+		rec, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "bad_sample_view", "SELECT node_id FROM ctd_nodes", opt)
+		if err == nil {
+			t.Fatal("expected marshal error to fail certification closed")
+		}
+		if rec == nil || rec.Status != "failed" {
+			t.Fatalf("expected failed draft, got %+v", rec)
+		}
+		if len(opt.verifyPrompts) != 0 {
+			t.Fatalf("expected verifier LLM not to be invoked on marshal error, got %d prompts", len(opt.verifyPrompts))
+		}
+		if _, exists := store.materialized["pmv_bad_sample_view"]; exists {
+			t.Fatal("view MUST NOT be materialized when sample serialization fails")
+		}
+	})
+}
+
+func TestSubmitAndCertifyPMVUsesAtomicMaterializeAndCertifyWithoutDraftDemotion(t *testing.T) {
+	store := &atomicFakeAgentSafeStore{fakeAgentSafeStore: newFakeAgentSafeStore()}
+	eng := NewEngine(store)
+
+	first, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "atomic_view", "SELECT node_id FROM ctd_nodes", nil)
+	if err != nil {
+		t.Fatalf("initial atomic certification failed: %v", err)
+	}
+	if first.Status != "certified" || first.Version != 1 || store.atomicCalls != 1 {
+		t.Fatalf("unexpected initial atomic record: rec=%+v atomicCalls=%d", first, store.atomicCalls)
+	}
+
+	savesBefore := store.saveCalls
+	updatesBefore := store.updateCalls
+	upgradedSQL := "SELECT node_id, status FROM ctd_nodes"
+	second, err := eng.SubmitAndCertifyPMV(context.Background(), "operator", "atomic_view", upgradedSQL, nil)
+	if err != nil {
+		t.Fatalf("atomic upgrade failed: %v", err)
+	}
+	if second.Status != "certified" || second.Version != 2 || second.OptimizedSQL != upgradedSQL {
+		t.Fatalf("unexpected upgraded atomic record: %+v", second)
+	}
+	if store.atomicCalls != 2 {
+		t.Fatalf("expected 2 atomic calls, got %d", store.atomicCalls)
+	}
+	if store.saveCalls != savesBefore || store.updateCalls != updatesBefore {
+		t.Fatalf("atomic upgrade must not call SavePMVDraft or UpdatePMVState (saves %d->%d, updates %d->%d)",
+			savesBefore, store.saveCalls, updatesBefore, store.updateCalls)
+	}
+}
+
+func TestEngineNilStoreGuards(t *testing.T) {
+	for _, eng := range []*Engine{nil, NewEngine(nil)} {
+		if _, err := eng.GetPMV(context.Background(), "test"); err == nil {
+			t.Fatal("expected GetPMV error on nil store")
+		}
+		if _, err := eng.ListPMVs(context.Background()); err == nil {
+			t.Fatal("expected ListPMVs error on nil store")
+		}
+		if _, err := eng.QueryPMV(context.Background(), "test", 10); err == nil {
+			t.Fatal("expected QueryPMV error on nil store")
+		}
+		if _, err := eng.FetchDashboardSnapshot(context.Background(), 30); err == nil {
+			t.Fatal("expected FetchDashboardSnapshot error on nil store")
+		}
+	}
+}
+
+func TestFetchDashboardSnapshotParameterizedUTCAndErrorPropagation(t *testing.T) {
+	store := newFakeAgentSafeStore()
+	nowBucket := time.Now().UTC().Truncate(time.Minute)
+	store.sampleRows = []map[string]any{
+		{
+			"bucket":          nowBucket,
+			"live_nodes":      int64(2),
+			"observer_events": int64(10),
+			"runner_events":   int64(3),
+			"tracer_events":   int64(1),
+			"total_events":    int64(14),
+		},
+	}
+	eng := NewEngine(store)
+
+	snap, err := eng.FetchDashboardSnapshot(context.Background(), 15)
+	if err != nil {
+		t.Fatalf("FetchDashboardSnapshot failed: %v", err)
+	}
+	if len(snap.Points) != 15 {
+		t.Fatalf("expected 15 points, got %d", len(snap.Points))
+	}
+	if len(store.probeQueries) != 1 || len(store.probeArgs) != 1 {
+		t.Fatalf("expected 1 parameterized query, got queries=%d args=%d", len(store.probeQueries), len(store.probeArgs))
+	}
+	q := store.probeQueries[0]
+	if !strings.Contains(q, "date_trunc('minute', event_timestamp, 'UTC')") ||
+		!strings.Contains(q, "event_timestamp >= $1 AND event_timestamp < $2") ||
+		!strings.Contains(q, "ORDER BY 1 DESC") {
+		t.Fatalf("unexpected rollup SQL:\n%s", q)
+	}
+	if len(store.probeArgs[0]) != 2 {
+		t.Fatalf("expected 2 UTC time bounds args, got %d", len(store.probeArgs[0]))
+	}
+	startArg, ok1 := store.probeArgs[0][0].(time.Time)
+	endArg, ok2 := store.probeArgs[0][1].(time.Time)
+	if !ok1 || !ok2 || startArg.Location() != time.UTC || endArg.Location() != time.UTC || !endArg.After(startArg) {
+		t.Fatalf("expected valid UTC start < end bounds, got %#v", store.probeArgs[0])
+	}
+
+	store.failListPMVs = errors.New("catalog unavailable")
+	if _, err := eng.FetchDashboardSnapshot(context.Background(), 15); err == nil {
+		t.Fatal("expected ListPMVs error to propagate from FetchDashboardSnapshot")
+	}
+}
+
+func TestRollupNonFiniteGuards(t *testing.T) {
+	if got := asInt(math.NaN()); got != 0 {
+		t.Fatalf("expected asInt(NaN)=0, got %d", got)
+	}
+	if got := asInt(math.Inf(1)); got != 0 {
+		t.Fatalf("expected asInt(+Inf)=0, got %d", got)
+	}
+	if got := asInt(math.Inf(-1)); got != 0 {
+		t.Fatalf("expected asInt(-Inf)=0, got %d", got)
+	}
+	if got := asInt(float32(math.NaN())); got != 0 {
+		t.Fatalf("expected asInt(float32(NaN))=0, got %d", got)
+	}
+
+	series := []float64{math.NaN(), 5, math.Inf(1), 10, math.Inf(-1)}
+	spark := Sparkline(series, 5)
+	runes := []rune(spark)
+	if len(runes) != 5 {
+		t.Fatalf("expected 5 runes, got %q", spark)
+	}
+	if runes[0] != '·' || runes[2] != '·' || runes[4] != '·' {
+		t.Fatalf("expected non-finite values rendered as '·', got %q", spark)
+	}
+	if runes[3] != '█' {
+		t.Fatalf("expected max finite value rendered as '█', got %q", spark)
+	}
+
+	graph := RenderMultiLineGraph(series, 20, 4, "/m")
+	if strings.Contains(graph, "NaN") || strings.Contains(graph, "Inf") {
+		t.Fatalf("expected finite Y-axis labels in graph, got:\n%s", graph)
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 )
 
 var _ BaseLLM = (*ClaudeAdapter)(nil)
@@ -334,8 +336,11 @@ func (a *ClaudeAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				inputJSON strings.Builder
 			}
 			blocks := make(map[int]*streamBlock)
+			totalTextBytes := 0
+			var capErr error
 
-			scanner := bufio.NewScanner(resp.Body)
+			capped := newCappedStreamReader(resp.Body, streamBodyLimit)
+			scanner := bufio.NewScanner(capped)
 			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
@@ -367,13 +372,20 @@ func (a *ClaudeAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 				}
 				switch ev.Type {
 				case "content_block_start":
+					if _, exists := blocks[ev.Index]; !exists && len(blocks) >= maxStreamToolCalls {
+						capErr = fmt.Errorf("stream exceeded max content blocks (%d)", maxStreamToolCalls)
+						break
+					}
 					b := &streamBlock{
 						blockType: ev.ContentBlock.Type,
 						id:        ev.ContentBlock.ID,
 						name:      ev.ContentBlock.Name,
 					}
 					if ev.ContentBlock.Text != "" {
-						b.text.WriteString(ev.ContentBlock.Text)
+						if totalTextBytes+len(ev.ContentBlock.Text) <= streamContentLimit {
+							b.text.WriteString(ev.ContentBlock.Text)
+							totalTextBytes += len(ev.ContentBlock.Text)
+						}
 						if !sendToken(ctx, tokenChan, ev.ContentBlock.Text) {
 							resp.Body.Close()
 							return true, nil
@@ -381,20 +393,30 @@ func (a *ClaudeAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 					}
 					if len(ev.ContentBlock.Input) > 0 {
 						if raw, mErr := json.Marshal(ev.ContentBlock.Input); mErr == nil {
-							b.inputJSON.Write(raw)
+							if !writeBounded(&b.inputJSON, string(raw), streamToolArgLimit) {
+								capErr = fmt.Errorf("stream tool input exceeded limit (%d bytes)", streamToolArgLimit)
+								break
+							}
 						}
 					}
 					blocks[ev.Index] = b
 				case "content_block_delta":
 					b, ok := blocks[ev.Index]
 					if !ok {
+						if len(blocks) >= maxStreamToolCalls {
+							capErr = fmt.Errorf("stream exceeded max content blocks (%d)", maxStreamToolCalls)
+							break
+						}
 						b = &streamBlock{blockType: "text"}
 						blocks[ev.Index] = b
 					}
 					switch ev.Delta.Type {
 					case "text_delta":
 						if ev.Delta.Text != "" {
-							b.text.WriteString(ev.Delta.Text)
+							if totalTextBytes+len(ev.Delta.Text) <= streamContentLimit {
+								b.text.WriteString(ev.Delta.Text)
+								totalTextBytes += len(ev.Delta.Text)
+							}
 							if !sendToken(ctx, tokenChan, ev.Delta.Text) {
 								resp.Body.Close()
 								return true, nil
@@ -402,15 +424,24 @@ func (a *ClaudeAdapter) StreamChat(ctx context.Context, systemPrompt string, his
 						}
 					case "input_json_delta":
 						if ev.Delta.PartialJSON != "" {
-							b.inputJSON.WriteString(ev.Delta.PartialJSON)
+							if !writeBounded(&b.inputJSON, ev.Delta.PartialJSON, streamToolArgLimit) {
+								capErr = fmt.Errorf("stream tool input exceeded limit (%d bytes)", streamToolArgLimit)
+							}
 						}
 					}
+				}
+				if capErr != nil {
+					break
 				}
 			}
 			scanErr := scanner.Err()
 			resp.Body.Close()
+			if capErr != nil && ctx.Err() == nil {
+				sendToken(ctx, tokenChan, fmt.Sprintf("\n[Claude stream read error: %v]", capErr))
+				return true, nil
+			}
 			if scanErr != nil && ctx.Err() == nil {
-				sendToken(ctx, tokenChan, fmt.Sprintf("\n[Claude stream read error: %v]", scanErr))
+				sendToken(ctx, tokenChan, fmt.Sprintf("\n[Claude stream read error: %v]", jsonutil.RedactError(scanErr, a.apiKey)))
 				return true, nil
 			}
 

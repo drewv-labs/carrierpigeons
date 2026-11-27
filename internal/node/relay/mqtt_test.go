@@ -1360,16 +1360,16 @@ func TestListenForRunnersAbortTeardownSingleFlightAndStaleRequestID(t *testing.T
 		t.Fatalf("expected req-1, got %q", got)
 	}
 
-	// 2. Stale RequestID abort must NOT cancel req-1.
-	sendEnv(runner.Envelope{RequestID: "req-stale", Action: "abort", Runner: "slow-teardown"})
+	// 2. Stale TargetRequestID abort must NOT cancel req-1.
+	sendEnv(runner.Envelope{RequestID: "abort-req-stale", TargetRequestID: "req-stale", Action: "abort", Runner: "slow-teardown"})
 	select {
 	case id := <-sawCancel:
-		t.Fatalf("stale request_id abort canceled active runner %q", id)
+		t.Fatalf("stale target_request_id abort canceled active runner %q", id)
 	case <-time.After(30 * time.Millisecond):
 	}
 
-	// 3. Matching RequestID abort cancels req-1, but slot remains occupied while tearing down.
-	sendEnv(runner.Envelope{RequestID: "req-1", Action: "abort", Runner: "slow-teardown"})
+	// 3. Matching TargetRequestID abort cancels req-1, while slot remains occupied during teardown.
+	sendEnv(runner.Envelope{RequestID: "abort-req-1", TargetRequestID: "req-1", Action: "abort", Runner: "slow-teardown"})
 	if got := <-sawCancel; got != "req-1" {
 		t.Fatalf("expected req-1 to observe cancel, got %q", got)
 	}
@@ -1391,10 +1391,10 @@ func TestListenForRunnersAbortTeardownSingleFlightAndStaleRequestID(t *testing.T
 			if got != "req-3" {
 				t.Fatalf("expected req-3 after teardown finished, got %q", got)
 			}
-			// Wildcard empty RequestID abort must also cancel req-3.
-			sendEnv(runner.Envelope{Action: "abort", Runner: "slow-teardown"})
+			// Wildcard empty TargetRequestID abort (even with a non-empty transport RequestID) must cancel req-3.
+			sendEnv(runner.Envelope{RequestID: "abort-req-wildcard", Action: "abort", Runner: "slow-teardown"})
 			if canceled := <-sawCancel; canceled != "req-3" {
-				t.Fatalf("expected empty request_id abort to cancel req-3, got %q", canceled)
+				t.Fatalf("expected empty target_request_id abort to cancel req-3, got %q", canceled)
 			}
 			return
 		case <-time.After(15 * time.Millisecond):
@@ -1444,5 +1444,56 @@ func TestListenForRunnersValidatesComponentBeforeErrorPublish(t *testing.T) {
 	}
 	if got := len(pub.snapshot()); got != 0 {
 		t.Fatalf("expected 0 invalid component events published, got %d (%+v)", got, pub.snapshot())
+	}
+}
+
+func TestMQTTClientSingleMarshalAcrossRequeueAndShutdownDrain(t *testing.T) {
+	var marshals atomic.Int32
+	inPublish := make(chan struct{})
+	releasePublish := make(chan struct{})
+
+	mc := &fakeMQTTClient{
+		publishHook: func(topic string, _ []byte) mqtt.Token {
+			if strings.Contains(topic, "/ctd/") {
+				select {
+				case <-inPublish:
+					return newCompletedToken(nil)
+				default:
+					close(inPublish)
+					<-releasePublish
+					return newStalledToken()
+				}
+			}
+			return newCompletedToken(nil)
+		},
+	}
+	mc.connected.Store(true)
+
+	c := newTestRelay(mc, 16)
+	ev := core.NewCTDPayload("rv64-test-01", "cpu", "active").
+		AddMetric("counted", countingMarshaler{calls: &marshals})
+
+	if err := c.Publish(ev); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+	if got := marshals.Load(); got != 1 {
+		t.Fatalf("expected Publish to marshal payload once, got %d", got)
+	}
+
+	go c.flushLoop()
+	<-inPublish
+
+	// Trigger Disconnect while batch 1 is stalled -> flushLoop requeues via PrependRawBatch,
+	// then drainRemainingBeforeClose publishes via CloseAndDrainRaw without re-marshaling.
+	done := make(chan struct{})
+	go func() {
+		c.Disconnect()
+		close(done)
+	}()
+	close(releasePublish)
+	<-done
+
+	if got := marshals.Load(); got != 1 {
+		t.Fatalf("expected payload to be marshaled once total across Publish, requeue, and shutdown drain, got %d", got)
 	}
 }

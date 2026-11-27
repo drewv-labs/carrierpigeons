@@ -152,15 +152,13 @@ func (p *PauseController) ContextUntilPaused(ctx context.Context) (context.Conte
 		cancel()
 		return cctx, cancel
 	}
+	if p.pauseCh == nil {
+		p.pauseCh = make(chan struct{})
+	}
 	pauseSig := p.pauseCh
 	p.mu.Unlock()
 
 	cctx, cancel := context.WithCancel(ctx)
-	if pauseSig == nil {
-		cancel()
-		return cctx, cancel
-	}
-
 	go func() {
 		select {
 		case <-cctx.Done():

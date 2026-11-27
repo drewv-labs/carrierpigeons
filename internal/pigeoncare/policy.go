@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/config"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/drewv-labs/carrierpigeons/pkg/runner"
@@ -24,13 +25,23 @@ const (
 
 // ParseMode normalizes user/config mode strings into a canonical PermissionMode.
 func ParseMode(raw string) PermissionMode {
+	if mode, err := ParseModeStrict(raw); err == nil {
+		return mode
+	}
+	return ModeDefault
+}
+
+// ParseModeStrict parses a non-empty permission mode string and rejects unrecognized values.
+func ParseModeStrict(raw string) (PermissionMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "default":
+		return ModeDefault, nil
 	case "yolo":
-		return ModeYOLO
+		return ModeYOLO, nil
 	case "auto_edit", "auto-edit", "autoedit", "auto":
-		return ModeAutoEdit
+		return ModeAutoEdit, nil
 	default:
-		return ModeDefault
+		return "", fmt.Errorf("invalid permission mode %q (expected 'default', 'auto_edit', or 'yolo')", raw)
 	}
 }
 
@@ -86,6 +97,7 @@ type ActionProposal struct {
 	ScriptBody  string              `json:"script_body,omitempty"`
 	SHA256      string              `json:"sha256,omitempty"`
 	TimeoutSec  int                 `json:"timeout_sec,omitempty"`
+	Env         map[string]string   `json:"env,omitempty"`
 	ViewName    string              `json:"view_name,omitempty"`
 	RawSQL      string              `json:"raw_sql,omitempty"`
 }
@@ -152,20 +164,18 @@ func normalizeProposalScript(proposal ActionProposal) (interp string, bodyHash s
 	if interp == "" {
 		return "", "", "", ephemeralApprovalKey{}, false
 	}
+	if strings.TrimSpace(proposal.ScriptBody) == "" {
+		return "", "", "", ephemeralApprovalKey{}, false
+	}
 
 	sha := strings.ToLower(strings.TrimSpace(proposal.SHA256))
-	if proposal.ScriptBody != "" {
-		if strings.TrimSpace(proposal.ScriptBody) == "" {
-			return "", "", "", ephemeralApprovalKey{}, false
-		}
-		computedBody := runner.ComputeScriptSHA256(proposal.ScriptBody)
-		if sha == "" {
-			sha = computedBody
-		} else if sha != computedBody {
-			return "", "", "", ephemeralApprovalKey{}, false
-		}
-		boundHash = runner.ComputeBoundScriptSHA256(interp, proposal.ScriptBody)
+	computedBody := runner.ComputeScriptSHA256(proposal.ScriptBody)
+	if sha == "" {
+		sha = computedBody
+	} else if sha != computedBody {
+		return "", "", "", ephemeralApprovalKey{}, false
 	}
+	boundHash = runner.ComputeBoundScriptSHA256(interp, proposal.ScriptBody)
 	if !isValidSHA256Hex(sha) {
 		return "", "", "", ephemeralApprovalKey{}, false
 	}
@@ -175,6 +185,17 @@ func normalizeProposalScript(proposal ActionProposal) (interp string, bodyHash s
 		sha256:      sha,
 		selectors:   canonicalizeSelectors(proposal.Selectors),
 	}, true
+}
+
+func normalizeAllowedViewKey(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if norm, err := db.NormalizePMVName(trimmed); err == nil {
+		return norm
+	}
+	return strings.ToLower(trimmed)
 }
 
 // PolicyGate enforces `[Default, Auto Edit, YOLO]` modes and session/config allowlists.
@@ -253,6 +274,12 @@ func (g *PolicyGate) isConfigScriptHashAllowedLocked(interp, bodyHash, boundHash
 
 // Authorize evaluates whether `proposal` may execute immediately or requires `[Allow / Always Allow / Deny]`.
 func (g *PolicyGate) Authorize(ctx context.Context, proposal ActionProposal) error {
+	switch proposal.Kind {
+	case ActionEphemeralRunner, ActionStandardRunner, ActionCreatePMV:
+	default:
+		return fmt.Errorf("unsupported action proposal kind %q", proposal.Kind)
+	}
+
 	var (
 		interp    string
 		bodyHash  string
@@ -267,10 +294,13 @@ func (g *PolicyGate) Authorize(ctx context.Context, proposal ActionProposal) err
 		}
 	}
 
+	runnerKey := strings.ToLower(strings.TrimSpace(proposal.Runner))
+	viewKey := normalizeAllowedViewKey(proposal.ViewName)
+
 	g.mu.RLock()
 	mode := g.mode
 	prompter := g.prompter
-	_, runnerAllowed := g.allowedRunners[strings.ToLower(strings.TrimSpace(proposal.Runner))]
+	_, runnerAllowed := g.allowedRunners[runnerKey]
 	scriptAllowed := false
 	if scriptOK {
 		if _, ok := g.alwaysAllowedScripts[scriptKey]; ok {
@@ -279,10 +309,10 @@ func (g *PolicyGate) Authorize(ctx context.Context, proposal ActionProposal) err
 			scriptAllowed = true
 		}
 	}
-	_, viewAllowed := g.allowedViews[strings.ToLower(strings.TrimSpace(proposal.ViewName))]
+	_, viewAllowed := g.allowedViews[viewKey]
 	g.mu.RUnlock()
 
-	// 1. YOLO mode grants autonomous execution for ephemeral runners, standard runners, and PMV creation.
+	// 1. YOLO mode grants autonomous execution for validated ephemeral runners, standard runners, and PMV creation.
 	if mode == ModeYOLO {
 		return nil
 	}
@@ -325,12 +355,12 @@ func (g *PolicyGate) Authorize(ctx context.Context, proposal ActionProposal) err
 				g.alwaysAllowedScripts[scriptKey] = struct{}{}
 			}
 		case ActionStandardRunner:
-			if proposal.Runner != "" {
-				g.allowedRunners[strings.ToLower(proposal.Runner)] = struct{}{}
+			if runnerKey != "" {
+				g.allowedRunners[runnerKey] = struct{}{}
 			}
 		case ActionCreatePMV:
-			if proposal.ViewName != "" {
-				g.allowedViews[strings.ToLower(proposal.ViewName)] = struct{}{}
+			if viewKey != "" {
+				g.allowedViews[viewKey] = struct{}{}
 			}
 		}
 		g.mu.Unlock()

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -9,7 +10,10 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
-var _ AgentSafeDB = (*ReadOnlyAgentStore)(nil)
+var (
+	_ AgentSafeDB = (*ReadOnlyAgentStore)(nil)
+	_ AtomicPMVDB = (*ReadOnlyAgentStore)(nil)
+)
 
 // ReadOnlyOptions customizes connection safety checks and scan limits for ReadOnlyAgentStore.
 type ReadOnlyOptions struct {
@@ -146,6 +150,13 @@ func (r *ReadOnlyAgentStore) ListPMVs(ctx context.Context) ([]PMVRecord, error) 
 
 func (r *ReadOnlyAgentStore) MaterializePMV(ctx context.Context, viewName string, selectSQL string) error {
 	return r.inner.MaterializePMV(ctx, viewName, selectSQL)
+}
+
+func (r *ReadOnlyAgentStore) MaterializeAndCertifyPMV(ctx context.Context, rec PMVRecord) (*PMVRecord, error) {
+	if r == nil || r.inner == nil {
+		return nil, fmt.Errorf("read-only agent store is not initialized")
+	}
+	return r.inner.MaterializeAndCertifyPMV(ctx, rec)
 }
 
 func (r *ReadOnlyAgentStore) DropPMV(ctx context.Context, viewName string) error {

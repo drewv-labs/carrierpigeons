@@ -216,6 +216,88 @@ func TestAgentStopJoinsObserversAndBoundsHungObserver(t *testing.T) {
 	})
 }
 
+func TestAgentPartialObserversTrackedInWaitGroupBeforeDisconnect(t *testing.T) {
+	t.Run("partial_headless_sbc_observer_waited_before_relay_disconnect", func(t *testing.T) {
+		cfg := config.DefaultEdgeConfig()
+		cfg.NodeID = "rv64-compute-01"
+		cfg.BrokerURL = closedLocalBrokerURL(t)
+		// Partial peripheral config (Net=true, GPU=false, NPU=false) bypasses the all-three "adapters" shortcut.
+		cfg.Observers = config.ObserversConfig{
+			OS:  false,
+			Net: true,
+			GPU: false,
+			NPU: false,
+		}
+		cfg.Runners.Enabled = false
+
+		agent := New(cfg)
+		started := make(chan struct{})
+		var exited atomic.Bool
+		var publishOnExitErr atomic.Value
+
+		agent.startConfigured = func(
+			ctx context.Context,
+			nodeID string,
+			pub core.TelemetryPublisher,
+			remCfg config.ObserversConfig,
+			_ time.Duration,
+			_ *observer.Registry,
+			wg *sync.WaitGroup,
+		) []string {
+			if !remCfg.Net || remCfg.GPU || remCfg.NPU {
+				t.Errorf("unexpected remCfg passed to fallback launcher: %+v", remCfg)
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				close(started)
+				<-ctx.Done()
+				time.Sleep(60 * time.Millisecond)
+				// Relay must NOT be closed/disconnected yet while obsWG is still draining.
+				if err := pub.Publish(core.NewCTDPayload(nodeID, "net-end0", "active").AddMetric("rx_bytes", 42)); err != nil {
+					publishOnExitErr.Store(err.Error())
+				}
+				exited.Store(true)
+			}()
+			return []string{"net"}
+		}
+
+		if err := agent.Start(context.Background()); err != nil {
+			t.Fatalf("Agent.Start failed: %v", err)
+		}
+		<-started
+
+		agent.Stop()
+		if !exited.Load() {
+			t.Fatal("expected Agent.Stop() to block on obsWG for partial {Net: true} observer before returning")
+		}
+		if gotErr := publishOnExitErr.Load(); gotErr != nil {
+			t.Fatalf("expected final observer publish before r.Disconnect() to succeed before spool close, got error: %v", gotErr)
+		}
+	})
+
+	t.Run("real_partial_net_observer_clean_start_stop", func(t *testing.T) {
+		cfg := config.DefaultEdgeConfig()
+		cfg.NodeID = "rv64-compute-01"
+		cfg.BrokerURL = closedLocalBrokerURL(t)
+		cfg.PollInterval = "25ms"
+		cfg.Observers = config.ObserversConfig{
+			OS:  false,
+			Net: true,
+			GPU: false,
+			NPU: false,
+		}
+		cfg.Runners.Enabled = false
+
+		agent := New(cfg)
+		if err := agent.Start(context.Background()); err != nil {
+			t.Fatalf("Agent.Start failed: %v", err)
+		}
+		time.Sleep(40 * time.Millisecond)
+		agent.Stop()
+	})
+}
+
 func TestAgentConcurrentStartPublishStopRace(t *testing.T) {
 	for iter := range 3 {
 		cfg := config.DefaultEdgeConfig()

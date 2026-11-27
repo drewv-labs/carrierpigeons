@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"weak"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/drewv-labs/carrierpigeons/pkg/observer"
@@ -23,8 +24,41 @@ var (
 	darwinSMCFanRe = regexp.MustCompile(`(?i)Fan(?:\s*(\d+))?\s*:\s*([\d\.]+)\s*rpm`)
 	darwinTempRe   = regexp.MustCompile(`(?i)(?:CPU die temperature|SMC.*temp).*?:\s*([\d\.]+)\s*C`)
 
-	defaultDarwinPM = newDarwinPMSingleflight()
+	defaultDarwinPM         = newDarwinPMSingleflight()
+	defaultDarwinPMRegistry = &darwinPMRegistry{}
 )
+
+type darwinPMRegistry struct {
+	mu   sync.Mutex
+	byPC map[weak.Pointer[observer.PauseController]]*darwinPMSingleflight
+}
+
+func (r *darwinPMRegistry) forController(pc *observer.PauseController) *darwinPMSingleflight {
+	if pc == nil {
+		return defaultDarwinPM
+	}
+	key := weak.Make(pc)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byPC == nil {
+		r.byPC = make(map[weak.Pointer[observer.PauseController]]*darwinPMSingleflight)
+	}
+	if sf, ok := r.byPC[key]; ok {
+		return sf
+	}
+	sf := newDarwinPMSingleflight()
+	r.byPC[key] = sf
+	runtime.AddCleanup(pc, func(k weak.Pointer[observer.PauseController]) {
+		r.mu.Lock()
+		delete(r.byPC, k)
+		r.mu.Unlock()
+	}, key)
+	return sf
+}
+
+func darwinPMSingleflightForContext(ctx context.Context) *darwinPMSingleflight {
+	return defaultDarwinPMRegistry.forController(observer.PauseControllerFromContext(ctx))
+}
 
 type darwinPMFlight struct {
 	mu      sync.Mutex
@@ -110,11 +144,16 @@ func (s *darwinPMSingleflight) sample(ctx context.Context, samplers string, exec
 
 	select {
 	case <-ctx.Done():
+		s.mu.Lock()
 		flight.mu.Lock()
 		flight.waiters--
 		shouldCancel := flight.waiters == 0
 		cancelFn := flight.cancel
+		if shouldCancel && s.inFlight == flight {
+			s.inFlight = nil
+		}
 		flight.mu.Unlock()
+		s.mu.Unlock()
 		if shouldCancel && cancelFn != nil {
 			cancelFn()
 		}
@@ -132,13 +171,14 @@ func runDarwinPowermetricsCmd(ctx context.Context, samplers string) (string, err
 	return string(out), nil
 }
 
-// sampleDarwinPowermetrics consolidates SMC, GPU, and ANE `powermetrics` queries into a singleflight cached subprocess call per interval.
+// sampleDarwinPowermetrics consolidates SMC, GPU, and ANE `powermetrics` queries into a singleflight cached subprocess call per interval,
+// scoped per PauseController so independent in-process SDK runtimes cannot cancel each other's sampling flights.
 func sampleDarwinPowermetrics(ctx context.Context) (string, error) {
 	samplers := "smc,gpu_power"
 	if runtime.GOARCH == "arm64" {
 		samplers = "smc,gpu_power,ane_power"
 	}
-	return defaultDarwinPM.sample(ctx, samplers, runDarwinPowermetricsCmd)
+	return darwinPMSingleflightForContext(ctx).sample(ctx, samplers, runDarwinPowermetricsCmd)
 }
 
 func readDarwinLoadAvg() (load1, load5, load15 float64, ok bool) {

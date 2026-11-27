@@ -30,7 +30,7 @@ func startPGIDAnchor() *pgidAnchor {
 	}
 	holder := exec.Command(shBin, "-c", "IFS= read -r _")
 	holder.Stdin = holdR
-	holder.Env = []string{"PATH=" + sandboxPATH}
+	holder.Env = []string{"PATH=" + posixSandboxPATH}
 	holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := holder.Start(); err != nil {
 		_ = holdR.Close()

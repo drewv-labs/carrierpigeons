@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/drewv-labs/carrierpigeons/internal/jsonutil"
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 	"github.com/jackc/pgx/v5"
@@ -60,7 +61,11 @@ func ValidateSchemaIdentifier(schema string) error {
 	return nil
 }
 
-var _ BaseDB = (*PostgresStore)(nil)
+var (
+	_ BaseDB       = (*PostgresStore)(nil)
+	_ AtomicPMVDB  = (*PostgresStore)(nil)
+	_ TraceBatchDB = (*PostgresStore)(nil)
+)
 
 // ResolveDBURL checks standard CarrierPigeons environment variables before falling back to DefaultPostgresURL.
 func ResolveDBURL() string {
@@ -419,6 +424,11 @@ type StoreOptions struct {
 	ReadOnlyMaxBytes    int
 }
 
+type pgSchemaConn interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
 type PostgresStore struct {
 	pool             *pgxpool.Pool
 	mathSchema       string
@@ -426,8 +436,29 @@ type PostgresStore struct {
 
 	// Optional unexported test seams for unit testing without a live database.
 	copyBatchFn   func(ctx context.Context, copyRows [][]any, nodeLastSeen map[string]time.Time, artifacts []*core.Artifact, traces []*core.TraceEdge) (int64, error)
+	copyTracesFn  func(ctx context.Context, copyRows [][]any) (int64, error)
 	insertEventFn func(ctx context.Context, p *core.CTDPayload) error
 	pruneExecFn   func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func redactDSNParseError(connStr string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var extra []string
+	trimmed := strings.TrimSpace(connStr)
+	if trimmed != "" && !strings.Contains(trimmed, "://") && !strings.Contains(trimmed, "=") {
+		if atIdx := strings.LastIndexByte(trimmed, '@'); atIdx > 0 {
+			if colonIdx := strings.IndexByte(trimmed[:atIdx], ':'); colonIdx >= 0 {
+				if secret := trimmed[colonIdx+1 : atIdx]; secret != "" {
+					extra = append(extra, secret)
+				}
+			}
+		} else {
+			extra = append(extra, trimmed)
+		}
+	}
+	return jsonutil.RedactError(err, extra...)
 }
 
 // NewPostgresStore initializes a connection pool to the PostgreSQL CTD Ledger.
@@ -447,7 +478,7 @@ func NewPostgresStoreWithOptions(ctx context.Context, connStr string, opts Store
 
 	cfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse pgx config: %w", err)
+		return nil, fmt.Errorf("failed to parse pgx config: %w", redactDSNParseError(connStr, err))
 	}
 	if opts.MaxConns > 0 {
 		cfg.MaxConns = opts.MaxConns
@@ -471,14 +502,19 @@ func NewPostgresStoreWithOptions(ctx context.Context, connStr string, opts Store
 		cfg.ConnConfig.RuntimeParams["statement_timeout"] = strconv.Itoa(opts.StatementTimeoutMs)
 	}
 
+	var extraSecrets []string
+	if cfg.ConnConfig != nil && cfg.ConnConfig.Password != "" {
+		extraSecrets = append(extraSecrets, cfg.ConnConfig.Password)
+	}
+
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create pgx pool: %w", err)
+		return nil, fmt.Errorf("failed to create pgx pool: %w", jsonutil.RedactError(err, extraSecrets...))
 	}
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("postgres ping failed: %w", err)
+		return nil, fmt.Errorf("postgres ping failed: %w", jsonutil.RedactError(err, extraSecrets...))
 	}
 
 	if opts.EnforceNonSuperuser {
@@ -756,18 +792,27 @@ func (s *PostgresStore) GetMeshIdentity(ctx context.Context) (*core.MeshIdentity
 	return &out, nil
 }
 
-// EnsureMathSchema creates the isolated `pigeonmath` analytical schema and `pmv_catalog` intent cache.
-func (s *PostgresStore) EnsureMathSchema(ctx context.Context) error {
+const ensureMathSchemaExistsQuery = `
+	SELECT EXISTS (
+		SELECT 1
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = 'pmv_catalog'
+	)
+`
+
+func (s *PostgresStore) ensureMathSchemaWithConn(ctx context.Context, conn pgSchemaConn) error {
 	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
 		return err
 	}
+	if conn == nil {
+		return fmt.Errorf("postgres store pool is not initialized")
+	}
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema = $1 AND table_name = 'pmv_catalog'
-		)
-	`, s.mathSchema).Scan(&exists); err == nil && exists {
+	if err := conn.QueryRow(ctx, ensureMathSchemaExistsQuery, s.mathSchema).Scan(&exists); err != nil {
+		return fmt.Errorf("check %s.pmv_catalog existence: %w", s.mathSchema, err)
+	}
+	if exists {
 		return nil
 	}
 	ddl := fmt.Sprintf(`
@@ -786,8 +831,22 @@ func (s *PostgresStore) EnsureMathSchema(ctx context.Context) error {
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	`, s.mathSchema)
-	_, err := s.pool.Exec(ctx, ddl)
+	_, err := conn.Exec(ctx, ddl)
 	return err
+}
+
+// EnsureMathSchema creates the isolated `pigeonmath` analytical schema and `pmv_catalog` intent cache.
+// Existence is checked via `pg_catalog` (world-readable) rather than `information_schema.tables` (filtered by
+// table privileges), so least-privilege `ctd_ingestor` connections return `nil` immediately when `pmv_catalog`
+// already exists without attempting `CREATE SCHEMA`.
+func (s *PostgresStore) EnsureMathSchema(ctx context.Context) error {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return err
+	}
+	if s.pool == nil {
+		return fmt.Errorf("postgres store pool is not initialized")
+	}
+	return s.ensureMathSchemaWithConn(ctx, s.pool)
 }
 
 func isLoopbackPGHost(host string) bool {
@@ -962,6 +1021,19 @@ func marshalObjectOrEmpty[K comparable, V any](m map[K]V) ([]byte, error) {
 		return []byte("{}"), nil
 	}
 	return json.Marshal(m)
+}
+
+func marshalValidationReport(report map[string]any) ([]byte, map[string]any, error) {
+	if len(report) == 0 {
+		return []byte("{}"), report, nil
+	}
+	sanitizedAny := jsonutil.SanitizeValue(report)
+	sanitizedMap, _ := sanitizedAny.(map[string]any)
+	raw, err := json.Marshal(sanitizedMap)
+	if err != nil {
+		return nil, nil, err
+	}
+	return raw, sanitizedMap, nil
 }
 
 func payloadMetricsJSON(p *core.CTDPayload) ([]byte, error) {
@@ -1422,6 +1494,73 @@ func (s *PostgresStore) InsertTrace(ctx context.Context, t core.TraceEdge) error
 		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6, $7)
 	`, t.SourceID, t.Verb, t.TargetID, t.NodeID, t.RunID, metaJSON, t.Timestamp)
 	return err
+}
+
+var ctdTracesCopyColumns = []string{
+	"source_id",
+	"verb",
+	"target_id",
+	"node_id",
+	"run_id",
+	"meta",
+	"event_timestamp",
+}
+
+// InsertTraces streams multiple TraceEdge records into `ctd_traces` using `pgx.CopyFrom`
+// so multi-node runner dispatches avoid per-edge INSERT transactions.
+func (s *PostgresStore) InsertTraces(ctx context.Context, edges []core.TraceEdge) error {
+	if len(edges) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	copyRows := make([][]any, 0, len(edges))
+	for _, t := range edges {
+		ts := t.Timestamp
+		if ts.IsZero() {
+			ts = now
+		}
+		metaJSON, err := marshalObjectOrEmpty(t.Meta)
+		if err != nil {
+			return fmt.Errorf("marshal trace meta: %w", err)
+		}
+		var nodeID any
+		if t.NodeID != "" {
+			nodeID = t.NodeID
+		}
+		var runID any
+		if t.RunID != "" {
+			runID = t.RunID
+		}
+		copyRows = append(copyRows, []any{
+			t.SourceID,
+			t.Verb,
+			t.TargetID,
+			nodeID,
+			runID,
+			metaJSON,
+			ts,
+		})
+	}
+	if s.copyTracesFn != nil {
+		_, err := s.copyTracesFn(ctx, copyRows)
+		return err
+	}
+	if s.pool == nil {
+		return fmt.Errorf("postgres store pool is not initialized")
+	}
+	_, err := s.pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"ctd_traces"},
+		ctdTracesCopyColumns,
+		pgx.CopyFromRows(copyRows),
+	)
+	if err != nil {
+		return fmt.Errorf("copy ctd_traces: %w", err)
+	}
+	return nil
 }
 
 // UpsertNodeHello registers a connecting node's hardware metadata & boot tags while preserving operator tags.
@@ -2190,57 +2329,37 @@ func (s *PostgresStore) ExplainReadOnly(ctx context.Context, selectSQL string) (
 	return planJSON, nil
 }
 
-// SavePMVDraft caches the actor's raw SQL intent in `pigeonmath.pmv_catalog` before optimization.
-func (s *PostgresStore) SavePMVDraft(ctx context.Context, rec PMVRecord) (*PMVRecord, error) {
-	normName, err := NormalizePMVName(rec.ViewName)
-	if err != nil {
-		return nil, err
-	}
-	cleanedRaw, err := ValidateSelectOnlySQL(rec.RawIntentSQL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid raw SQL intent: %w", err)
-	}
-	reportJSON, err := marshalObjectOrEmpty(rec.ValidationReport)
-	if err != nil {
-		return nil, err
-	}
+const pmvAdvisoryLockSQL = "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))"
 
-	query := fmt.Sprintf(`
-		INSERT INTO %[1]s.pmv_catalog (view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at)
-		VALUES ($1, COALESCE(NULLIF($2, ''), SESSION_USER), $3, $4, 'draft', 1, $5, $6, NOW(), NOW())
-		ON CONFLICT (view_name) DO UPDATE SET
-			submitted_by = COALESCE(NULLIF(EXCLUDED.submitted_by, ''), %[1]s.pmv_catalog.submitted_by),
-			raw_intent_sql = EXCLUDED.raw_intent_sql,
-			optimized_sql = EXCLUDED.optimized_sql,
-			status = 'draft',
-			version = %[1]s.pmv_catalog.version + 1,
-			agent_notes = EXCLUDED.agent_notes,
-			validation_report = EXCLUDED.validation_report,
-			updated_at = NOW()
-		RETURNING view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, created_at, updated_at
-	`, s.mathSchema)
-
-	var out PMVRecord
-	err = s.pool.QueryRow(ctx, query, normName, rec.SubmittedBy, cleanedRaw, rec.OptimizedSQL, rec.AgentNotes, reportJSON).
-		Scan(&out.ViewName, &out.SubmittedBy, &out.RawIntentSQL, &out.OptimizedSQL, &out.Status, &out.Version, &out.AgentNotes, &out.CreatedAt, &out.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	out.ValidationReport = rec.ValidationReport
-	return &out, nil
+func buildSavePMVDraftSQL(mathSchema string) string {
+	return fmt.Sprintf(`
+		WITH upserted AS (
+			INSERT INTO %[1]s.pmv_catalog (view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at)
+			VALUES ($1, COALESCE(NULLIF($2, ''), SESSION_USER), $3, $4, 'draft', 1, $5, $6, NOW(), NOW())
+			ON CONFLICT (view_name) DO UPDATE SET
+				submitted_by = COALESCE(NULLIF(EXCLUDED.submitted_by, ''), %[1]s.pmv_catalog.submitted_by),
+				raw_intent_sql = EXCLUDED.raw_intent_sql,
+				optimized_sql = EXCLUDED.optimized_sql,
+				status = 'draft',
+				version = %[1]s.pmv_catalog.version + 1,
+				agent_notes = EXCLUDED.agent_notes,
+				validation_report = EXCLUDED.validation_report,
+				updated_at = NOW()
+			WHERE %[1]s.pmv_catalog.status <> 'certified'
+			RETURNING view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at
+		)
+		SELECT view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at
+		FROM upserted
+		UNION ALL
+		SELECT view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at
+		FROM %[1]s.pmv_catalog
+		WHERE view_name = $1 AND NOT EXISTS (SELECT 1 FROM upserted)
+		LIMIT 1
+	`, mathSchema)
 }
 
-// UpdatePMVState updates optimization notes, status, and validation report for a cached PMV.
-func (s *PostgresStore) UpdatePMVState(ctx context.Context, rec PMVRecord) error {
-	normName, err := NormalizePMVName(rec.ViewName)
-	if err != nil {
-		return err
-	}
-	reportJSON, err := marshalObjectOrEmpty(rec.ValidationReport)
-	if err != nil {
-		return err
-	}
-	query := fmt.Sprintf(`
+func buildUpdatePMVStateSQL(mathSchema string) string {
+	return fmt.Sprintf(`
 		UPDATE %[1]s.pmv_catalog
 		SET
 			optimized_sql = $2,
@@ -2249,8 +2368,132 @@ func (s *PostgresStore) UpdatePMVState(ctx context.Context, rec PMVRecord) error
 			validation_report = $5,
 			updated_at = NOW()
 		WHERE view_name = $1
-	`, s.mathSchema)
-	_, err = s.pool.Exec(ctx, query, normName, rec.OptimizedSQL, rec.Status, rec.AgentNotes, reportJSON)
+		  AND ($3 = 'certified' OR status <> 'certified')
+	`, mathSchema)
+}
+
+func buildCertifyPMVCatalogSQL(mathSchema string) string {
+	return fmt.Sprintf(`
+		INSERT INTO %[1]s.pmv_catalog (view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at)
+		VALUES ($1, COALESCE(NULLIF($2, ''), SESSION_USER), $3, $4, 'certified', 1, $5, $6, NOW(), NOW())
+		ON CONFLICT (view_name) DO UPDATE SET
+			submitted_by = COALESCE(NULLIF(EXCLUDED.submitted_by, ''), %[1]s.pmv_catalog.submitted_by),
+			raw_intent_sql = EXCLUDED.raw_intent_sql,
+			optimized_sql = EXCLUDED.optimized_sql,
+			status = 'certified',
+			version = CASE
+				WHEN %[1]s.pmv_catalog.status = 'certified' THEN %[1]s.pmv_catalog.version + 1
+				ELSE %[1]s.pmv_catalog.version
+			END,
+			agent_notes = EXCLUDED.agent_notes,
+			validation_report = EXCLUDED.validation_report,
+			updated_at = NOW()
+		RETURNING view_name, submitted_by, raw_intent_sql, optimized_sql, status, version, agent_notes, validation_report, created_at, updated_at
+	`, mathSchema)
+}
+
+// SavePMVDraft caches the actor's raw SQL intent in `pigeonmath.pmv_catalog` before optimization.
+// Already-certified views are never demoted to `status = 'draft'` by lagging concurrent draft writers.
+func (s *PostgresStore) SavePMVDraft(ctx context.Context, rec PMVRecord) (*PMVRecord, error) {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return nil, err
+	}
+	normName, err := NormalizePMVName(rec.ViewName)
+	if err != nil {
+		return nil, err
+	}
+	cleanedRaw, err := ValidateSelectOnlySQL(rec.RawIntentSQL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid raw SQL intent: %w", err)
+	}
+	reportJSON, sanitizedReport, err := marshalValidationReport(rec.ValidationReport)
+	if err != nil {
+		return nil, err
+	}
+	if s.pool == nil {
+		return nil, fmt.Errorf("postgres store pool is not initialized")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	out, err := s.savePMVDraftWithTx(ctx, tx, normName, cleanedRaw, rec, reportJSON, sanitizedReport)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) savePMVDraftWithTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	normName, cleanedRaw string,
+	rec PMVRecord,
+	reportJSON []byte,
+	sanitizedReport map[string]any,
+) (*PMVRecord, error) {
+	if _, err := tx.Exec(ctx, pmvAdvisoryLockSQL, s.mathSchema, normName); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, buildSavePMVDraftSQL(s.mathSchema), normName, rec.SubmittedBy, cleanedRaw, rec.OptimizedSQL, rec.AgentNotes, reportJSON)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return nil, pgx.ErrNoRows
+	}
+	var out PMVRecord
+	var reportBytes []byte
+	if err := rows.Scan(
+		&out.ViewName, &out.SubmittedBy, &out.RawIntentSQL, &out.OptimizedSQL,
+		&out.Status, &out.Version, &out.AgentNotes, &reportBytes, &out.CreatedAt, &out.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(reportBytes) > 0 {
+		_ = json.Unmarshal(reportBytes, &out.ValidationReport)
+	} else {
+		out.ValidationReport = sanitizedReport
+	}
+	return &out, nil
+}
+
+// UpdatePMVState updates optimization notes, status, and validation report for a cached PMV.
+// Non-certified state updates are guarded with `WHERE status <> 'certified'` so lagging failure/draft updates
+// cannot overwrite an already-certified view.
+func (s *PostgresStore) UpdatePMVState(ctx context.Context, rec PMVRecord) error {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return err
+	}
+	normName, err := NormalizePMVName(rec.ViewName)
+	if err != nil {
+		return err
+	}
+	reportJSON, _, err := marshalValidationReport(rec.ValidationReport)
+	if err != nil {
+		return err
+	}
+	if s.pool == nil {
+		return fmt.Errorf("postgres store pool is not initialized")
+	}
+	return s.updatePMVStateWithConn(ctx, s.pool, normName, rec, reportJSON)
+}
+
+func (s *PostgresStore) updatePMVStateWithConn(ctx context.Context, conn pgSchemaConn, normName string, rec PMVRecord, reportJSON []byte) error {
+	_, err := conn.Exec(ctx, buildUpdatePMVStateSQL(s.mathSchema), normName, rec.OptimizedSQL, rec.Status, rec.AgentNotes, reportJSON)
 	return err
 }
 
@@ -2313,34 +2556,10 @@ func (s *PostgresStore) ListPMVs(ctx context.Context) ([]PMVRecord, error) {
 	return out, rows.Err()
 }
 
-// MaterializePMV atomically creates or replaces `<mathSchema>.pmv_<slug>` with `security_invoker = true`
-// inside a bounded-timeout transaction so column schema evolutions succeed without privilege hijacking or partial drops.
-func (s *PostgresStore) MaterializePMV(ctx context.Context, viewName string, selectSQL string) error {
-	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
-		return err
-	}
-	normName, err := NormalizePMVName(viewName)
-	if err != nil {
-		return err
-	}
-	cleanedSQL, err := ValidateSelectOnlySQL(selectSQL)
-	if err != nil {
-		return err
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '5000ms'"); err != nil {
-		return err
-	}
+func (s *PostgresStore) materializeViewWithTx(ctx context.Context, tx pgx.Tx, normName, cleanedSQL string) error {
 	if _, err := tx.Exec(ctx, "SAVEPOINT pmv_replace"); err != nil {
 		return err
 	}
-
 	replaceSQL := fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s WITH (security_invoker = true) AS %s", s.mathSchema, normName, cleanedSQL)
 	if _, err := tx.Exec(ctx, replaceSQL); err != nil {
 		// View signature change (e.g., SQLSTATE 42P16): roll back to savepoint and drop+recreate atomically within the same tx.
@@ -2356,7 +2575,139 @@ func (s *PostgresStore) MaterializePMV(ctx context.Context, viewName string, sel
 			return createErr
 		}
 	}
+	return nil
+}
+
+// MaterializePMV atomically creates or replaces `<mathSchema>.pmv_<slug>` with `security_invoker = true`
+// inside a bounded-timeout transaction so column schema evolutions succeed without privilege hijacking or partial drops.
+func (s *PostgresStore) MaterializePMV(ctx context.Context, viewName string, selectSQL string) error {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return err
+	}
+	normName, err := NormalizePMVName(viewName)
+	if err != nil {
+		return err
+	}
+	cleanedSQL, err := ValidateSelectOnlySQL(selectSQL)
+	if err != nil {
+		return err
+	}
+	if s.pool == nil {
+		return fmt.Errorf("postgres store pool is not initialized")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '5000ms'"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, pmvAdvisoryLockSQL, s.mathSchema, normName); err != nil {
+		return err
+	}
+	if err := s.materializeViewWithTx(ctx, tx, normName, cleanedSQL); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
+}
+
+// MaterializeAndCertifyPMV acquires a per-view transaction advisory lock, materializes `<mathSchema>.pmv_<slug>`
+// (`CREATE OR REPLACE VIEW ... WITH (security_invoker = true)`), and upserts `pmv_catalog` with `status = 'certified'`
+// inside a single atomic transaction so live certified views are never transiently demoted to `status = 'draft'`.
+func (s *PostgresStore) MaterializeAndCertifyPMV(ctx context.Context, rec PMVRecord) (*PMVRecord, error) {
+	if err := ValidateSchemaIdentifier(s.mathSchema); err != nil {
+		return nil, err
+	}
+	normName, err := NormalizePMVName(rec.ViewName)
+	if err != nil {
+		return nil, err
+	}
+	cleanedRaw, err := ValidateSelectOnlySQL(rec.RawIntentSQL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid raw SQL intent: %w", err)
+	}
+	selectCandidate := strings.TrimSpace(rec.OptimizedSQL)
+	if selectCandidate == "" {
+		selectCandidate = cleanedRaw
+	}
+	cleanedOptimized, err := ValidateSelectOnlySQL(selectCandidate)
+	if err != nil {
+		return nil, fmt.Errorf("invalid optimized SQL: %w", err)
+	}
+	reportJSON, sanitizedReport, err := marshalValidationReport(rec.ValidationReport)
+	if err != nil {
+		return nil, err
+	}
+	if s.pool == nil {
+		return nil, fmt.Errorf("postgres store pool is not initialized")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	out, err := s.materializeAndCertifyPMVWithTx(ctx, tx, normName, cleanedRaw, cleanedOptimized, rec, reportJSON, sanitizedReport)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) materializeAndCertifyPMVWithTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	normName, cleanedRaw, cleanedOptimized string,
+	rec PMVRecord,
+	reportJSON []byte,
+	sanitizedReport map[string]any,
+) (*PMVRecord, error) {
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '5000ms'"); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, pmvAdvisoryLockSQL, s.mathSchema, normName); err != nil {
+		return nil, err
+	}
+	if err := s.materializeViewWithTx(ctx, tx, normName, cleanedOptimized); err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.Query(ctx, buildCertifyPMVCatalogSQL(s.mathSchema), normName, rec.SubmittedBy, cleanedRaw, cleanedOptimized, rec.AgentNotes, reportJSON)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return nil, pgx.ErrNoRows
+	}
+
+	var out PMVRecord
+	var reportBytes []byte
+	if err := rows.Scan(
+		&out.ViewName, &out.SubmittedBy, &out.RawIntentSQL, &out.OptimizedSQL,
+		&out.Status, &out.Version, &out.AgentNotes, &reportBytes, &out.CreatedAt, &out.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(reportBytes) > 0 {
+		_ = json.Unmarshal(reportBytes, &out.ValidationReport)
+	} else {
+		out.ValidationReport = sanitizedReport
+	}
+	return &out, nil
 }
 
 // DropPMV removes a view inside the isolated `pigeonmath` schema if present.

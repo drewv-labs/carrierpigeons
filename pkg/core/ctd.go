@@ -148,13 +148,14 @@ func (s RunnerSelector) IsEmpty() bool {
 // RunnerRequestCTD is submitted by Pigeons CLI/TUI or PigeonCare to PigeonCoop
 // to resolve node/tag targets, record lineage, and fan out runner execution.
 type RunnerRequestCTD struct {
-	RequestID   string         `json:"request_id"`
-	Action      string         `json:"action"` // "start" or "abort"
-	Runner      string         `json:"runner"`
-	Selectors   RunnerSelector `json:"selectors"`
-	Params      map[string]any `json:"params,omitempty"`
-	RequestedBy string         `json:"requested_by,omitempty"`
-	RequestedAt time.Time      `json:"requested_at"`
+	RequestID       string         `json:"request_id"`
+	TargetRequestID string         `json:"target_request_id,omitempty"`
+	Action          string         `json:"action"` // "start" or "abort"
+	Runner          string         `json:"runner"`
+	Selectors       RunnerSelector `json:"selectors"`
+	Params          map[string]any `json:"params,omitempty"`
+	RequestedBy     string         `json:"requested_by,omitempty"`
+	RequestedAt     time.Time      `json:"requested_at"`
 }
 
 func (r RunnerRequestCTD) Validate() error {

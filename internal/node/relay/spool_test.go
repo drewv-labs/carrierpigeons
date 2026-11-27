@@ -1,13 +1,24 @@
 package relay
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
+
+type countingMarshaler struct {
+	calls *atomic.Int32
+}
+
+func (c countingMarshaler) MarshalJSON() ([]byte, error) {
+	c.calls.Add(1)
+	return []byte(`42`), nil
+}
 
 func TestRingSpoolEvictsOldestWhenFull(t *testing.T) {
 	spool := NewRingSpool(3)
@@ -202,5 +213,49 @@ func TestRingSpoolCloseRejectsPushesAndUnblocksPop(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("PopBatchBlocking blocked on closed spool")
+	}
+}
+
+func TestRingSpoolPreMarshaledRawItemsZeroRemarshalAcrossPrependAndDrain(t *testing.T) {
+	var marshals atomic.Int32
+	ev := core.NewCTDPayload("rv64-compute-01", "host-os", "active").
+		AddMetric("counted", countingMarshaler{calls: &marshals})
+
+	raw := []byte(`{"node_id":"rv64-compute-01","pillar":"observer","component":"host-os","status":"active"}`)
+	topic := "pigeons/ctd/observer/rv64-compute-01/host-os"
+
+	spool := NewRingSpool(8)
+	evicted, accepted := spool.PushRaw(ev, topic, raw)
+	if !accepted || evicted {
+		t.Fatalf("PushRaw failed: accepted=%v evicted=%v", accepted, evicted)
+	}
+	if got := marshals.Load(); got != 0 {
+		t.Fatalf("expected PushRaw not to invoke json.Marshal, got %d calls", got)
+	}
+
+	stopCh := make(chan struct{})
+	popped, ok := spool.PopRawBatchBlocking(4, stopCh)
+	if !ok || len(popped) != 1 {
+		t.Fatalf("expected 1 popped SpoolItem, got %d (ok=%v)", len(popped), ok)
+	}
+	if popped[0].Topic != topic || !bytes.Equal(popped[0].Raw, raw) {
+		t.Fatalf("unexpected popped SpoolItem: topic=%q raw=%s", popped[0].Topic, popped[0].Raw)
+	}
+
+	// Re-insert via PrependRawBatch and extract via CloseAndDrainRaw -> still zero marshals.
+	spool.PrependRawBatch(popped)
+	if got := marshals.Load(); got != 0 {
+		t.Fatalf("expected PrependRawBatch not to invoke json.Marshal, got %d calls", got)
+	}
+	if spool.Bytes() != int64(len(raw)) {
+		t.Fatalf("expected spool bytes=%d, got %d", len(raw), spool.Bytes())
+	}
+
+	drained := spool.CloseAndDrainRaw()
+	if len(drained) != 1 || drained[0].Topic != topic || !bytes.Equal(drained[0].Raw, raw) {
+		t.Fatalf("unexpected CloseAndDrainRaw result: %+v", drained)
+	}
+	if got := marshals.Load(); got != 0 {
+		t.Fatalf("expected zero json.Marshal calls across full PushRaw->PopRaw->PrependRaw->CloseAndDrainRaw lifecycle, got %d", got)
 	}
 }

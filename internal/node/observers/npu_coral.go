@@ -5,40 +5,55 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
+	"slices"
 
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
 )
 
 func observeNPUCoral(ctx context.Context, pub core.TelemetryPublisher, nodeID string) {
-	basePath := "/sys/class/apex"
+	observeNPUCoralWithRoot(ctx, pub, nodeID, "/sys/class/apex")
+}
 
-	runPeriodicObserver(ctx, true, func() {
-		devices, err := filepath.Glob(filepath.Join(basePath, "apex_*"))
-		if err != nil || len(devices) == 0 {
-			return
+func collectCoralSamples(basePath, nodeID string) []*core.CTDPayload {
+	if basePath == "" {
+		return nil
+	}
+	devices, err := filepath.Glob(filepath.Join(basePath, "apex_*"))
+	if err != nil || len(devices) == 0 {
+		return nil
+	}
+	slices.Sort(devices)
+
+	var out []*core.CTDPayload
+	for _, devPath := range devices {
+		devName := filepath.Base(devPath)
+		componentID := "npu-coral-" + devName
+		if core.ValidateTopicToken(componentID) != nil {
+			continue
 		}
 
-		for _, devPath := range devices {
-			devName := filepath.Base(devPath)
+		tempBytes, err := os.ReadFile(filepath.Join(devPath, "temp"))
+		if err != nil {
+			continue
+		}
 
-			tempBytes, err := os.ReadFile(filepath.Join(devPath, "temp"))
-			if err != nil {
-				continue
-			}
+		tempC, ok := parseSysfsMillidegreeTemp(tempBytes)
+		if !ok {
+			continue
+		}
 
-			tempStr := strings.TrimSpace(string(tempBytes))
-			tempMilli, err := strconv.ParseFloat(tempStr, 64)
-			if err != nil {
-				continue
-			}
+		event := core.NewCTDPayload(nodeID, componentID, "active").
+			AddMetric("temperature_c", tempC)
+		out = append(out, event)
+	}
+	return out
+}
 
-			event := core.NewCTDPayload(nodeID, "npu-coral-"+devName, "active").
-				AddMetric("temperature_c", tempMilli/1000.0)
-
+func observeNPUCoralWithRoot(ctx context.Context, pub core.TelemetryPublisher, nodeID, basePath string) {
+	runPeriodicObserver(ctx, true, func() {
+		for _, event := range collectCoralSamples(basePath, nodeID) {
 			if err := pub.Publish(event); err != nil {
-				log.Printf("[Coral NPU Observer] Publish failed for %s: %v", devName, err)
+				log.Printf("[Coral NPU Observer] Publish failed for %s: %v", event.Component, err)
 			}
 		}
 	})

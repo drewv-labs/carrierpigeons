@@ -29,6 +29,10 @@ var runnerBenchmarkCmd = &cobra.Command{
 		gpu, _ := f.GetBool("gpu")
 		npu, _ := f.GetBool("npu")
 
+		if secs <= 0 {
+			return fmt.Errorf("invalid --secs %d: benchmark duration must be > 0", secs)
+		}
+
 		if gpu || npu {
 			var unsupported []string
 			if gpu {

@@ -18,8 +18,33 @@ import (
 	"github.com/drewv-labs/carrierpigeons/pkg/adapters/db"
 	"github.com/drewv-labs/carrierpigeons/pkg/brand"
 	"github.com/drewv-labs/carrierpigeons/pkg/core"
+	"github.com/drewv-labs/carrierpigeons/pkg/runner"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
+
+type mnsTrackingLedger struct {
+	*memoryLedger
+	mu        sync.Mutex
+	upserts   []core.MeshIdentity
+	upsertErr error
+	notify    chan struct{}
+}
+
+func (m *mnsTrackingLedger) UpsertMeshIdentity(_ context.Context, id core.MeshIdentity) error {
+	m.mu.Lock()
+	err := m.upsertErr
+	if err == nil {
+		m.upserts = append(m.upserts, id)
+	}
+	m.mu.Unlock()
+	if m.notify != nil {
+		select {
+		case m.notify <- struct{}{}:
+		default:
+		}
+	}
+	return err
+}
 
 func TestSubscriberMNSHeartbeatRefreshAndCleanStop(t *testing.T) {
 	emb, err := StartEmbedded(EmbeddedOptions{ListenAddr: "127.0.0.1:0"})
@@ -70,6 +95,10 @@ func TestSubscriberMNSHeartbeatRefreshAndCleanStop(t *testing.T) {
 		t.Fatalf("observer subscribe failed: %v", tok.Error())
 	}
 
+	ledger := &mnsTrackingLedger{
+		memoryLedger: newMemoryLedger(),
+		notify:       make(chan struct{}, 16),
+	}
 	sub, err := NewSubscriberWithOptions(SubscriberOptions{
 		BrokerURL:          emb.LocalClientURL(),
 		MeshName:           "heartbeat-mesh",
@@ -81,7 +110,7 @@ func TestSubscriberMNSHeartbeatRefreshAndCleanStop(t *testing.T) {
 			BatchSize:     4,
 			FlushInterval: 20 * time.Millisecond,
 		},
-	}, newMemoryLedger())
+	}, ledger)
 	if err != nil {
 		t.Fatalf("NewSubscriberWithOptions failed: %v", err)
 	}
@@ -89,16 +118,20 @@ func TestSubscriberMNSHeartbeatRefreshAndCleanStop(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		mu.Lock()
-		count := len(updates)
+		mqttCount := len(updates)
 		mu.Unlock()
-		if count >= 3 {
+		ledger.mu.Lock()
+		dbCount := len(ledger.upserts)
+		ledger.mu.Unlock()
+		if mqttCount >= 3 && dbCount >= 2 {
 			break
 		}
 		select {
 		case <-notify:
+		case <-ledger.notify:
 		case <-deadline:
 			sub.Disconnect()
-			t.Fatalf("expected >=3 MNS heartbeat updates, got %d", count)
+			t.Fatalf("expected >=3 MQTT MNS updates and >=2 Postgres MNS refreshes, got mqtt=%d db=%d", mqttCount, dbCount)
 		}
 	}
 
@@ -109,6 +142,38 @@ func TestSubscriberMNSHeartbeatRefreshAndCleanStop(t *testing.T) {
 	if !last.UpdatedAt.After(first.UpdatedAt) {
 		sub.Disconnect()
 		t.Fatalf("expected refreshed UpdatedAt to advance: first=%s last=%s", first.UpdatedAt, last.UpdatedAt)
+	}
+
+	ledger.mu.Lock()
+	firstDB := ledger.upserts[0]
+	lastDB := ledger.upserts[len(ledger.upserts)-1]
+	ledger.mu.Unlock()
+	if firstDB.MeshName != "heartbeat-mesh" || firstDB.CoopNodeID != "coop-hb-01" || firstDB.TopicRoot != "pigeons" {
+		sub.Disconnect()
+		t.Fatalf("unexpected Postgres MNS refresh identity: %+v", firstDB)
+	}
+	if !lastDB.UpdatedAt.After(firstDB.UpdatedAt) {
+		sub.Disconnect()
+		t.Fatalf("expected Postgres MNS UpdatedAt to advance: first=%s last=%s", firstDB.UpdatedAt, lastDB.UpdatedAt)
+	}
+
+	// Non-fatal DB error during MNS refresh must not crash or block MQTT refresh.
+	ledger.mu.Lock()
+	ledger.upsertErr = errors.New("simulated transient pg error")
+	beforeErrMQTT := len(updates)
+	ledger.mu.Unlock()
+	select {
+	case <-notify:
+	case <-time.After(500 * time.Millisecond):
+		sub.Disconnect()
+		t.Fatal("expected MQTT MNS refresh to continue even when UpsertMeshIdentity fails")
+	}
+	mu.Lock()
+	afterErrMQTT := len(updates)
+	mu.Unlock()
+	if afterErrMQTT <= beforeErrMQTT {
+		sub.Disconnect()
+		t.Fatalf("expected MQTT MNS updates to advance during DB error (%d -> %d)", beforeErrMQTT, afterErrMQTT)
 	}
 
 	sub.Disconnect()
@@ -603,7 +668,7 @@ func TestProcessTelemetryValidationPoisoningAndByteBudget(t *testing.T) {
 
 	// 7. telemetryQueue byte budget enforcement (120 byte budget, no workers consuming yet).
 	topic := "pigeons/ctd/observer/edge-01/host-os" // 36 bytes
-	smallPayload := []byte(`{"node_id":"edge-01"}`)  // 21 bytes -> 57 bytes total
+	smallPayload := []byte(`{"node_id":"edge-01"}`) // 21 bytes -> 57 bytes total
 	sub.handleTelemetry(nil, &fakeMQTTMessage{topic: topic, payload: smallPayload})
 	sub.handleTelemetry(nil, &fakeMQTTMessage{topic: topic, payload: smallPayload}) // 114 <= 120
 	sub.handleTelemetry(nil, &fakeMQTTMessage{topic: topic, payload: smallPayload}) // 171 > 120 -> dropped!
@@ -698,6 +763,20 @@ func TestProcessRunnerRequestValidationDedupTargetsAndBatchedTraces(t *testing.T
 		t.Fatalf("expected invalid RequestID to publish 0 times, got %d", len(pubClient.pubs))
 	}
 
+	// Invalid TargetRequestID rejected.
+	badTargetReq, _ := json.Marshal(core.RunnerRequestCTD{
+		RequestID:       "req-abort-bad-target",
+		TargetRequestID: "bad/target#id",
+		Action:          "abort",
+		Runner:          "SyntheticComputeRnr",
+		Selectors:       core.RunnerSelector{Nodes: []string{"node-ok"}},
+	})
+	sub.processRunnerRequest(pubClient, core.RunnerRequestTopic(), badTargetReq)
+	if len(pubClient.pubs) != 0 {
+		sub.batcher.Close()
+		t.Fatalf("expected invalid TargetRequestID to publish 0 times, got %d", len(pubClient.pubs))
+	}
+
 	// Valid request sent twice -> deduplicated, and artifact/event reflect ONLY node-ok.
 	goodReq := core.RunnerRequestCTD{
 		RequestID:   "req-dedup-1",
@@ -770,6 +849,42 @@ func TestProcessRunnerRequestValidationDedupTargetsAndBatchedTraces(t *testing.T
 		t.Fatalf("expected LRU eviction to allow req-dedup-1 re-execution (3 publishes), got %d", len(pubClient.pubs))
 	}
 	pubClient.mu.Unlock()
+
+	// 1b. TargetRequestID forwarded intact on runner.Envelope for targeted aborts.
+	var (
+		abortMu sync.Mutex
+		gotEnv  runner.Envelope
+	)
+	abortPubClient := &fakePublishClient{
+		handler: func(_ string, payload []byte) mqtt.Token {
+			abortMu.Lock()
+			_ = json.Unmarshal(payload, &gotEnv)
+			abortMu.Unlock()
+			return newCompletedToken(nil)
+		},
+	}
+	abortReq, _ := json.Marshal(core.RunnerRequestCTD{
+		RequestID:       "req-abort-unique-1",
+		TargetRequestID: "req-run-active-42",
+		Action:          "abort",
+		Runner:          "SyntheticComputeRnr",
+		Selectors:       core.RunnerSelector{Nodes: []string{"node-ok"}},
+		RequestedBy:     "operator",
+		RequestedAt:     time.Now().UTC(),
+	})
+	sub.processRunnerRequest(abortPubClient, core.RunnerRequestTopic(), abortReq)
+	abortPubClient.mu.Lock()
+	pubCount := len(abortPubClient.pubs)
+	abortPubClient.mu.Unlock()
+	if pubCount != 1 {
+		t.Fatalf("expected 1 abort envelope published, got %d", pubCount)
+	}
+	abortMu.Lock()
+	capturedEnv := gotEnv
+	abortMu.Unlock()
+	if capturedEnv.RequestID != "req-abort-unique-1" || capturedEnv.TargetRequestID != "req-run-active-42" || capturedEnv.Action != "abort" {
+		t.Fatalf("expected TargetRequestID forwarded on Envelope, got %+v", capturedEnv)
+	}
 
 	// 2. Optional TraceBatchLedger uses single batch call.
 	bl := &batchTraceLedger{memoryLedger: newMemoryLedger()}
@@ -898,13 +1013,20 @@ type flakySubscribeClient struct {
 	subEntered   chan struct{}
 	subRelease   chan struct{}
 	pubPayloads  [][]byte
+	disconnected atomic.Bool
+	onDisconnect func()
 	subOnce      sync.Once
 }
 
-func (c *flakySubscribeClient) IsConnected() bool      { return true }
-func (c *flakySubscribeClient) IsConnectionOpen() bool { return true }
+func (c *flakySubscribeClient) IsConnected() bool      { return !c.disconnected.Load() }
+func (c *flakySubscribeClient) IsConnectionOpen() bool { return !c.disconnected.Load() }
 func (c *flakySubscribeClient) Connect() mqtt.Token    { return newCompletedToken(nil) }
-func (c *flakySubscribeClient) Disconnect(uint)        {}
+func (c *flakySubscribeClient) Disconnect(uint) {
+	c.disconnected.Store(true)
+	if c.onDisconnect != nil {
+		c.onDisconnect()
+	}
+}
 func (c *flakySubscribeClient) Publish(_ string, _ byte, _ bool, payload interface{}) mqtt.Token {
 	c.mu.Lock()
 	raw, _ := payload.([]byte)
@@ -931,9 +1053,11 @@ func (c *flakySubscribeClient) Subscribe(string, byte, mqtt.MessageHandler) mqtt
 func (c *flakySubscribeClient) SubscribeMultiple(map[string]byte, mqtt.MessageHandler) mqtt.Token {
 	return newCompletedToken(nil)
 }
-func (c *flakySubscribeClient) Unsubscribe(...string) mqtt.Token      { return newCompletedToken(nil) }
-func (c *flakySubscribeClient) AddRoute(string, mqtt.MessageHandler)  {}
-func (c *flakySubscribeClient) OptionsReader() mqtt.ClientOptionsReader { return mqtt.ClientOptionsReader{} }
+func (c *flakySubscribeClient) Unsubscribe(...string) mqtt.Token     { return newCompletedToken(nil) }
+func (c *flakySubscribeClient) AddRoute(string, mqtt.MessageHandler) {}
+func (c *flakySubscribeClient) OptionsReader() mqtt.ClientOptionsReader {
+	return mqtt.ClientOptionsReader{}
+}
 
 func TestSubscriberOnConnectRetryAndWaitBeforeOffline(t *testing.T) {
 	// 1. Reconnect subscription retry: fails twice, succeeds on 3rd try, then announces MNS.
@@ -1005,5 +1129,97 @@ func TestSubscriberOnConnectRetryAndWaitBeforeOffline(t *testing.T) {
 	}
 	if last.Status != "OFFLINE" {
 		t.Fatalf("expected final MNS publish to be OFFLINE (not overwritten by OnConnect), got %+v", last)
+	}
+}
+
+type orderCheckBatchLedger struct {
+	*memoryLedger
+	onBatchInsert func()
+}
+
+func (l *orderCheckBatchLedger) BatchInsertEvents(ctx context.Context, payloads []*core.CTDPayload) (int64, error) {
+	if l.onBatchInsert != nil {
+		l.onBatchInsert()
+	}
+	return l.memoryLedger.BatchInsertEvents(ctx, payloads)
+}
+
+func TestSubscriberDisconnectStopsMQTTBeforeDrainingWorkersAndCountsPostStopDrops(t *testing.T) {
+	var clientDisconnectedBeforeDrain atomic.Bool
+	cli := &flakySubscribeClient{}
+
+	ledger := &orderCheckBatchLedger{
+		memoryLedger: newMemoryLedger(),
+		onBatchInsert: func() {
+			if cli.disconnected.Load() {
+				clientDisconnectedBeforeDrain.Store(true)
+			}
+		},
+	}
+
+	var telemetryStopClosedAtDisconnect atomic.Bool
+	ctrlQueues := make([]chan func(), 1)
+	ctrlQueues[0] = make(chan func(), 8)
+	sub := &Subscriber{
+		client:         cli,
+		ledger:         ledger,
+		batcher:        ingest.NewBatcher(ledger, ingest.Options{QueueSize: 16, BatchSize: 10, FlushInterval: time.Hour}),
+		meshName:       "order-mesh",
+		coopNodeID:     "coop-order-01",
+		brand:          brand.Default(),
+		topicRoot:      "pigeons",
+		mnsStop:        make(chan struct{}),
+		telemetryQueue: make(chan rawTelemetryMsg, 16),
+		telemetryStop:  make(chan struct{}),
+		ctrlQueues:     ctrlQueues,
+		ctrlStop:       make(chan struct{}),
+		runnerReqQueue: make(chan rawRunnerReqMsg, 8),
+		runnerReqStop:  make(chan struct{}),
+	}
+	cli.onDisconnect = func() {
+		select {
+		case <-sub.telemetryStop:
+			telemetryStopClosedAtDisconnect.Store(true)
+		default:
+		}
+	}
+
+	sub.telemetryWG.Add(1)
+	go sub.telemetryWorker()
+	sub.ctrlWG.Add(1)
+	go sub.controlWorker(ctrlQueues[0])
+	sub.runnerReqWG.Add(1)
+	go sub.runnerReqWorker()
+
+	ev := core.NewCTDPayload("rv64-compute-01", "host-os", "active")
+	rawEv, _ := json.Marshal(ev)
+	sub.handleTelemetry(cli, &fakeMQTTMessage{topic: ev.RoutingTopic("pigeons/ctd"), payload: rawEv})
+
+	sub.Disconnect()
+
+	if telemetryStopClosedAtDisconnect.Load() {
+		t.Fatal("expected client.Disconnect(250) to run BEFORE closing telemetryStop")
+	}
+	if !clientDisconnectedBeforeDrain.Load() {
+		t.Fatal("expected client.Disconnect(250) to run BEFORE final batcher flush")
+	}
+	if sub.IngestedCount() != 1 {
+		t.Fatalf("expected pre-disconnect telemetry event to drain cleanly, got %d", sub.IngestedCount())
+	}
+
+	// Late callbacks arriving post-stop must increment drop counters.
+	ctrlHandler := sub.enqueueControl(sub.processRegistryUpdate)
+	sub.handleTelemetry(cli, &fakeMQTTMessage{topic: ev.RoutingTopic("pigeons/ctd"), payload: rawEv})
+	ctrlHandler(cli, &fakeMQTTMessage{topic: core.RegistryTopic("rv64-compute-01"), payload: []byte("ONLINE")})
+	sub.handleRunnerRequest(cli, &fakeMQTTMessage{topic: core.RunnerRequestTopic(), payload: []byte(`{}`)})
+
+	if got := sub.TelemetryDroppedCount(); got != 1 {
+		t.Fatalf("expected TelemetryDroppedCount == 1 for post-stop callback, got %d", got)
+	}
+	if got := sub.ControlDroppedCount(); got != 1 {
+		t.Fatalf("expected ControlDroppedCount == 1 for post-stop callback, got %d", got)
+	}
+	if got := sub.RunnerRequestDroppedCount(); got != 1 {
+		t.Fatalf("expected RunnerRequestDroppedCount == 1 for post-stop callback, got %d", got)
 	}
 }

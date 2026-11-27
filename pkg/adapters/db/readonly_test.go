@@ -1,6 +1,9 @@
 package db
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestResolveAllowSuperuserRO(t *testing.T) {
 	t.Run("explicit option always wins", func(t *testing.T) {
@@ -53,5 +56,26 @@ func TestWrapAgentSafeDBByteCeilingConfig(t *testing.T) {
 	customWrapped := WrapAgentSafeDB(&PostgresStore{readOnlyMaxBytes: 65536})
 	if customWrapped.maxBytes != 65536 {
 		t.Fatalf("expected inherited maxBytes=65536, got %d", customWrapped.maxBytes)
+	}
+}
+
+func TestReadOnlyAgentStoreAtomicPMVAndLedgerIsolation(t *testing.T) {
+	var safe any = (*ReadOnlyAgentStore)(nil)
+	if _, ok := safe.(AtomicPMVDB); !ok {
+		t.Fatal("ReadOnlyAgentStore must implement AtomicPMVDB for isolated PigeonMath certification")
+	}
+	if _, ok := safe.(TraceBatchDB); ok {
+		t.Fatal("ReadOnlyAgentStore MUST NOT implement TraceBatchDB public ledger write interface")
+	}
+	if _, ok := safe.(BaseDB); ok {
+		t.Fatal("ReadOnlyAgentStore MUST NOT implement BaseDB public ledger write interface")
+	}
+
+	var nilStore *ReadOnlyAgentStore
+	if _, err := nilStore.MaterializeAndCertifyPMV(context.Background(), PMVRecord{
+		ViewName:     "pmv_test",
+		RawIntentSQL: "SELECT node_id FROM ctd_nodes",
+	}); err == nil {
+		t.Fatal("expected uninitialized ReadOnlyAgentStore.MaterializeAndCertifyPMV to return error")
 	}
 }

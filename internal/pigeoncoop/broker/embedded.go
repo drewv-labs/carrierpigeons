@@ -248,6 +248,13 @@ type EmbeddedBroker struct {
 
 // StartEmbedded launches an embedded MQTT TCP/TLS listener with packet-size/connection limits and optional topic ACLs.
 func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
+	return startEmbeddedWithServe(opts, (*mochi.Server).Serve)
+}
+
+func startEmbeddedWithServe(opts EmbeddedOptions, serveFn func(*mochi.Server) error) (*EmbeddedBroker, error) {
+	if serveFn == nil {
+		serveFn = (*mochi.Server).Serve
+	}
 	listenAddr := strings.TrimSpace(opts.ListenAddr)
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1883"
@@ -367,11 +374,12 @@ func StartEmbedded(opts EmbeddedOptions) (*EmbeddedBroker, error) {
 		return nil, fmt.Errorf("attach embedded MQTT listener: %w", err)
 	}
 
-	go func() {
-		if serveErr := srv.Serve(); serveErr != nil {
-			warnLogger.Error("embedded MQTT server exited with error", "err", serveErr)
-		}
-	}()
+	if serveErr := serveFn(srv); serveErr != nil {
+		warnLogger.Error("embedded MQTT server failed to start", "err", serveErr)
+		_ = srv.Close()
+		_ = ln.Close()
+		return nil, fmt.Errorf("serve embedded MQTT broker: %w", serveErr)
+	}
 
 	return &EmbeddedBroker{
 		server:    srv,
